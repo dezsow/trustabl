@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Fail if the in-repo rules fixture (testdata/rules-fixture) has drifted from the
-# production rules pack (the external trustabl-rules repo).
+# production rules pack (the external agent-reliability-rules repo).
 #
-# Background: testdata/rules-fixture/ is a *test mirror* of the trustabl-rules
+# Background: testdata/rules-fixture/ is a *test mirror* of the agent-reliability-rules
 # pack the engine pulls at scan time. The two are separate copies and drift
 # unless deliberately kept in sync — a rule shipped to production but not
 # mirrored is untested by the engine, and a fixture-only rule is tested but never
@@ -10,18 +10,18 @@
 # noticed by accident. See CLAUDE.md "Two-repo rule model".
 #
 # Compares manifest.yaml + every <category>/*.yaml between the two trees, ignoring
-# line endings (the fixture is eol=lf; a Windows checkout of trustabl-rules may be
+# line endings (the fixture is eol=lf; a Windows checkout of agent-reliability-rules may be
 # CRLF). Docs (README.md, CLAUDE.md, LICENSE) are intentionally NOT compared —
 # each repo keeps its own.
 #
 # Usage:
-#   RULES_REPO=../trustabl-rules scripts/check-rules-sync.sh
-#   scripts/check-rules-sync.sh                 # defaults to ../trustabl-rules
+#   RULES_REPO=../agent-reliability-rules scripts/check-rules-sync.sh
+#   scripts/check-rules-sync.sh                 # defaults to ../agent-reliability-rules
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 fixture="$repo_root/testdata/rules-fixture"
-rules="${RULES_REPO:-$repo_root/../trustabl-rules}"
+rules="${RULES_REPO:-$repo_root/../agent-reliability-rules}"
 
 if [ ! -d "$rules" ]; then
   echo "error: rules repo not found at '$rules' (set RULES_REPO)" >&2
@@ -55,7 +55,7 @@ only_fixture="$(comm -23 <(echo "$fixture_files") <(echo "$rules_files"))"
 only_rules="$(comm -13 <(echo "$fixture_files") <(echo "$rules_files"))"
 if [ -n "$only_fixture" ]; then
   status=1
-  echo "FIXTURE-ONLY (tested but never shipped — add to trustabl-rules or remove):" >&2
+  echo "FIXTURE-ONLY (tested but never shipped — add to agent-reliability-rules or remove):" >&2
   echo "$only_fixture" | sed 's/^/  /' >&2
 fi
 if [ -n "$only_rules" ]; then
@@ -76,7 +76,7 @@ done <<< "$common"
 
 if [ "$status" -ne 0 ]; then
   echo "" >&2
-  echo "Rules fixture is out of sync with production trustabl-rules." >&2
+  echo "Rules fixture is out of sync with production agent-reliability-rules." >&2
   echo "Mirror the change into BOTH repos (see CLAUDE.md 'The sync obligation')." >&2
   exit 1
 fi
