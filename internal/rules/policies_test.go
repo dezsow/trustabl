@@ -4195,6 +4195,185 @@ var policyRepoRuleCases = []policyRepoCase{
 			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
 		},
 		false},
+	// agent-reliability-otel-labels ladder (OBS-006..008). Every rung is gated on the repo
+	// already being instrumented: the library only labels spans that exist, so
+	// recommending it to an uninstrumented repo would be advice it cannot use.
+	// The three rules are mutually exclusive — each fires at the first missing
+	// rung and stays silent on the others.
+	{"OBS-006 fires when an instrumented repo has no agent-reliability-otel-labels", "OBS-006",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalInit},
+			},
+		},
+		true},
+	{"OBS-006 silent when the repo is not instrumented", "OBS-006",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+		},
+		false},
+	{"OBS-006 silent when agent-reliability-otel-labels is declared in a manifest", "OBS-006",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}, OtelLabelsDeclaredIn: []string{"requirements.txt"}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalInit},
+			},
+		},
+		false},
+	{"OBS-006 silent when agent-reliability-otel-labels is imported in code", "OBS-006",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalInit},
+			},
+			OtelLabelsSignals: []models.OtelLabelsSignal{
+				{Kind: models.OtelLabelsImport},
+			},
+		},
+		false},
+	{"OBS-007 fires when agent-reliability-otel-labels is installed but no run is started", "OBS-007",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}, OtelLabelsDeclaredIn: []string{"requirements.txt"}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalInit},
+			},
+		},
+		true},
+	{"OBS-007 fires when spans are labelled but the run is never started", "OBS-007",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalInit},
+			},
+			OtelLabelsSignals: []models.OtelLabelsSignal{
+				{Kind: models.OtelLabelsImport},
+				{Kind: models.OtelLabelsToolSpan},
+				{Kind: models.OtelLabelsRunEnd},
+			},
+		},
+		true},
+	{"OBS-007 silent when a run is started", "OBS-007",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}, OtelLabelsDeclaredIn: []string{"requirements.txt"}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalInit},
+			},
+			OtelLabelsSignals: []models.OtelLabelsSignal{
+				{Kind: models.OtelLabelsImport},
+				{Kind: models.OtelLabelsRunStart},
+			},
+		},
+		false},
+	{"OBS-007 silent when agent-reliability-otel-labels is not installed (OBS-006 owns that case)", "OBS-007",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalInit},
+			},
+		},
+		false},
+	{"OBS-007 silent when the repo is not instrumented", "OBS-007",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}, OtelLabelsDeclaredIn: []string{"requirements.txt"}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+		},
+		false},
+	{"OBS-008 fires when a run is started but no tool span is labelled", "OBS-008",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}, OtelLabelsDeclaredIn: []string{"requirements.txt"}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalInit},
+			},
+			Tools: []models.ToolDef{{Name: "search", Kind: models.KindOpenAITool}},
+			OtelLabelsSignals: []models.OtelLabelsSignal{
+				{Kind: models.OtelLabelsImport},
+				{Kind: models.OtelLabelsRunStart},
+				{Kind: models.OtelLabelsRunEnd},
+			},
+		},
+		true},
+	{"OBS-008 fires when a run is started but its end is never recorded", "OBS-008",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}, OtelLabelsDeclaredIn: []string{"requirements.txt"}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalInit},
+			},
+			Tools: []models.ToolDef{{Name: "search", Kind: models.KindOpenAITool}},
+			OtelLabelsSignals: []models.OtelLabelsSignal{
+				{Kind: models.OtelLabelsImport},
+				{Kind: models.OtelLabelsRunStart},
+				{Kind: models.OtelLabelsToolSpan},
+			},
+		},
+		true},
+	{"OBS-008 silent when tool spans are labelled and the run end is recorded", "OBS-008",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}, OtelLabelsDeclaredIn: []string{"requirements.txt"}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalInit},
+			},
+			Tools: []models.ToolDef{{Name: "search", Kind: models.KindOpenAITool}},
+			OtelLabelsSignals: []models.OtelLabelsSignal{
+				{Kind: models.OtelLabelsImport},
+				{Kind: models.OtelLabelsRunStart},
+				{Kind: models.OtelLabelsToolSpan},
+				{Kind: models.OtelLabelsRunEnd},
+			},
+		},
+		false},
+	{"OBS-008 silent on a tool-less repo that records the run end", "OBS-008",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}, OtelLabelsDeclaredIn: []string{"requirements.txt"}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalInit},
+			},
+			OtelLabelsSignals: []models.OtelLabelsSignal{
+				{Kind: models.OtelLabelsImport},
+				{Kind: models.OtelLabelsRunStart},
+				{Kind: models.OtelLabelsRunEnd},
+			},
+		},
+		false},
+	{"OBS-008 silent when no run is started (OBS-007 owns that case)", "OBS-008",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}, OtelLabelsDeclaredIn: []string{"requirements.txt"}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalInit},
+			},
+			Tools: []models.ToolDef{{Name: "search", Kind: models.KindOpenAITool}},
+			OtelLabelsSignals: []models.OtelLabelsSignal{
+				{Kind: models.OtelLabelsImport},
+			},
+		},
+		false},
 	// Mutual exclusion with the absence rules: a declared-but-unwired dep is
 	// OBS-005 at medium, NOT "this project wires no observability" at low.
 	{"OAI-203 silent when the dep is declared (OBS-005 owns that case)", "OAI-203",

@@ -163,6 +163,15 @@ func (e MatchExpr) EvaluateRepo(p models.RepoProfile, inv models.RepoInventory) 
 	if e.RepoObservabilityCapturesContent != nil && !PredRepoObservabilityCapturesContent(*e.RepoObservabilityCapturesContent, inv) {
 		return false
 	}
+	if e.RepoOtelLabelsInstalled != nil && !PredRepoOtelLabelsInstalled(*e.RepoOtelLabelsInstalled, p, inv) {
+		return false
+	}
+	if e.RepoOtelLabelsInitialized != nil && !PredRepoOtelLabelsInitialized(*e.RepoOtelLabelsInitialized, inv) {
+		return false
+	}
+	if e.RepoOtelLabelsImplemented != nil && !PredRepoOtelLabelsImplemented(*e.RepoOtelLabelsImplemented, inv) {
+		return false
+	}
 	if len(e.RepoClaudeDefaultModeIs) > 0 && !PredRepoClaudeDefaultModeIs(e.RepoClaudeDefaultModeIs, inv) {
 		return false
 	}
@@ -496,6 +505,9 @@ var predicatesByScope = map[models.Scope]map[string]bool{
 		"repo_observability_vendor":                    true,
 		"repo_observability_console_only":              true,
 		"repo_observability_captures_content":          true,
+		"repo_otel_labels_installed":                   true,
+		"repo_otel_labels_initialized":                 true,
+		"repo_otel_labels_implemented":                 true,
 		"repo_langgraph_platform_config_present":       true,
 		"repo_raw_anthropic_tool_output_in_system":     true,
 		"repo_raw_openai_tool_output_in_system":        true,
@@ -595,6 +607,9 @@ func (e MatchExpr) setPredicateNames() []string {
 	add(len(e.RepoObservabilityVendor) > 0, "repo_observability_vendor")
 	add(e.RepoObservabilityConsoleOnly != nil, "repo_observability_console_only")
 	add(e.RepoObservabilityCapturesContent != nil, "repo_observability_captures_content")
+	add(e.RepoOtelLabelsInstalled != nil, "repo_otel_labels_installed")
+	add(e.RepoOtelLabelsInitialized != nil, "repo_otel_labels_initialized")
+	add(e.RepoOtelLabelsImplemented != nil, "repo_otel_labels_implemented")
 	return n
 }
 

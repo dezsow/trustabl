@@ -526,6 +526,43 @@ func TestDetectObsDeps_NoObservabilityDeclared(t *testing.T) {
 	}
 }
 
+// agent-reliability-otel-labels is declared under a different name per ecosystem; each manifest
+// that declares it is recorded once, sorted by manifest name.
+func TestDetectOtelLabelsDeps_FindsPythonAndNpmNames(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "requirements.txt"),
+		[]byte("opentelemetry-sdk\nagent-reliability-otel-labels==0.1.0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "package.json"),
+		[]byte(`{"dependencies": {"@trustabl/agent-reliability-otel-labels": "^0.1.0"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := detectOtelLabelsDeps(dir)
+	want := []string{"package.json", "requirements.txt"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("manifest %d: got %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// An OpenTelemetry dependency is the prerequisite for agent-reliability-otel-labels, not the
+// library itself: declaring it must not read as agent-reliability-otel-labels being installed.
+func TestDetectOtelLabelsDeps_OpenTelemetryAloneIsNotOtelLabels(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "requirements.txt"),
+		[]byte("opentelemetry-sdk\nopentelemetry-exporter-otlp\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := detectOtelLabelsDeps(dir); len(got) != 0 {
+		t.Fatalf("got %v, want no agent-reliability-otel-labels declaration", got)
+	}
+}
+
 func TestDetectSDKDeps_GoogleADKGo(t *testing.T) {
 	dir := t.TempDir()
 	gomod := "module example.com/agent\n\ngo 1.23\n\nrequire google.golang.org/adk v1.7.0\n"

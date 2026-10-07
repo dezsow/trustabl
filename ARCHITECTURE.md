@@ -383,14 +383,14 @@ flowchart TD
 
     subgraph S1["Step 1 — Recon"]
         recon["ingestion.Recon"]
-        profile[["RepoProfile<br/>Languages · SDKDeps · ObsDeps · Manifest · Components"]]
+        profile[["RepoProfile<br/>Languages · SDKDeps · ObsDeps · OtelLabelsDeclaredIn · Manifest · Components"]]
         recon --> profile
     end
 
     subgraph S2["Step 2 — Inventory (per-language AST)"]
         disc["analysis.DiscoverTools<br/>DiscoverAgents<br/>DiscoverGuardrails<br/>DiscoverSessions<br/>DiscoverSubagents<br/>DiscoverSkills<br/>DiscoverDependencies<br/>DiscoverSlashCommands<br/>DiscoverPlugins<br/>DiscoverClaudeSettings<br/>DiscoverADKAgents<br/>DiscoverADKTools<br/>DiscoverClaudeAgentOptions<br/>DiscoverAgentRunCalls<br/>DiscoverEntrypoints<br/>ApplyEntrypointReachability<br/>DiscoverLangGraphNodes<br/>DetectRawLLMToolOutputInSystem<br/>DiscoverObservability<br/>LangChain/CrewAI/AutoGen/PydanticAI (Py)<br/>TS: OpenAI/ADK/LangChain/Vercel/MCP-proper<br/>Go/CSharp/PHP/Rust MCP"]
         edges["analysis.ResolveEdges"]
-        inv[["RepoInventory<br/>Tools · Agents · Guardrails · Sessions<br/>SDKsDetected · HasShellInvocations · UsesDefaultTracing<br/>ObservabilitySignals<br/>Dependencies (BOM)<br/>MCPServers · Subagents · Skills · SlashCommands<br/>PluginManifests · ClaudeSettings · ClaudeAgentOptions<br/>AgentRunCalls · Entrypoints"]]
+        inv[["RepoInventory<br/>Tools · Agents · Guardrails · Sessions<br/>SDKsDetected · HasShellInvocations · UsesDefaultTracing<br/>ObservabilitySignals · OtelLabelsSignals<br/>Dependencies (BOM)<br/>MCPServers · Subagents · Skills · SlashCommands<br/>PluginManifests · ClaudeSettings · ClaudeAgentOptions<br/>AgentRunCalls · Entrypoints"]]
         disc --> edges --> inv
     end
 
@@ -552,6 +552,42 @@ For each language recon cleared, do the AST work and produce a `RepoInventory`:
   manifests (`pyproject.toml`, `requirements.txt`, `Pipfile`, `package.json`);
   `poetry.lock` is excluded because a lock file carries the transitive closure,
   where a match proves nobody's intent.
+
+- **DiscoverOtelLabels** (`otel_labels.go`) — one pass over the parsed
+  Python and TS/JS files emitting a typed `OtelLabelsSignal` per use of
+  `agent-reliability-otel-labels`, the library that adds process-metadata labels to spans the
+  agent already emits. `Kind` is the rung reached: `import` (`agent_reliability_otel_labels` /
+  `@trustabl/agent-reliability-otel-labels` is imported), `run_start` (`<run>.mark_start(...)` /
+  `<run>.markStart(...)` — receiver required, since it is a method on `Run`),
+  `tool_span` (`mark_tool_span` / `markToolSpan`) and `run_end` (`mark_run_end`
+  / `markRunEnd`). The call names are plausible names for a project's own
+  helpers, so they count only when the library is imported somewhere in the
+  repo. That gate is repo-wide, not per-file: a `Run` is routinely built in one
+  module and started in another that imports nothing. The Go binding is not
+  inspected. Output is sorted by (File, StartLine, Kind); like
+  `ObservabilitySignals` it is additive inventory and is **not** folded into
+  `ScanID`.
+
+  These signals are deliberately **not** `ObservabilitySignal`s.
+  `agent-reliability-otel-labels` never creates a span, so folding it in would let an import
+  satisfy `repo_has_observability` and a started `Run` satisfy
+  `repo_observability_initialized` — the library would clear its own
+  prerequisite and `OBS-001` would misfire on it. The declared half comes from
+  recon: `detectOtelLabelsDeps` (`internal/ingestion/normalizer.go`) records
+  the root manifests that name the package in
+  `RepoProfile.OtelLabelsDeclaredIn`, separate from `ObsDeps` for the same
+  reason. A lock file counts here, unlike `ObsDeps`, because nothing depends on
+  `agent-reliability-otel-labels` transitively.
+
+  Three repo-scope predicates read these facts and back the `OBS-006..008`
+  ladder, each rule gated on `repo_observability_initialized: true` and firing
+  at the first missing rung: `repo_otel_labels_installed` (declared **or**
+  imported), `repo_otel_labels_initialized` (a `run_start` signal), and
+  `repo_otel_labels_implemented` (a `run_end` signal, plus a `tool_span`
+  signal when the inventory holds at least one tool of a kind a framework emits
+  a tool span for — a bare `shell_invocation` function and a `langgraph_node`
+  do not count). The predicates prove the calls exist, not that labels land:
+  with no current span each call is a silent no-op.
 
 - **DiscoverSubagents** (`subagents.go`) — **hybrid** discovery in two passes.
   Pass 1 reads every `.claude/agents/*.md` component (matched at any path depth
@@ -1632,6 +1668,7 @@ RepoProfile {
     Languages []Language   // detected by file extension
     SDKDeps   []SDKDep     // declared deps (from manifests)
     ObsDeps   []ObsDep     // declared observability deps (from manifests)
+    OtelLabelsDeclaredIn []string // root manifests that declare agent-reliability-otel-labels, sorted
     Manifest  ScanManifest // file inventory + discovered components
 }
 
@@ -1662,6 +1699,7 @@ RepoInventory {
     RawAnthropicToolOutputInSystemPrompt bool // raw_llm_sdk: RAW-001
     RawOpenAIToolOutputInSystemMessage   bool // raw_llm_sdk: RAW-002
     ObservabilitySignals []ObservabilitySignal // vendor + Kind (import/init/exporter/content_capture/instrument_kwarg), sorted by (File, StartLine, Vendor, Kind)
+    OtelLabelsSignals  []OtelLabelsSignal  // agent-reliability-otel-labels use: Kind (import/run_start/tool_span/run_end), sorted by (File, StartLine, Kind)
 }
 
 // deriveSDKsDetected (internal/scanner/scanner.go) folds markdown subagent

@@ -147,6 +147,13 @@ type MatchExpr struct {
 	RepoObservabilityCapturesContent *bool    `yaml:"repo_observability_captures_content,omitempty"`
 	RepoObservabilityDeclared        *bool    `yaml:"repo_observability_declared,omitempty"`
 
+	// agent-reliability-otel-labels predicates: the three rungs OBS-006..008
+	// walk. They read RepoInventory.OtelLabelsSignals, which is kept apart from
+	// the observability signals above — see models.OtelLabelsSignal.
+	RepoOtelLabelsInstalled   *bool `yaml:"repo_otel_labels_installed,omitempty"`
+	RepoOtelLabelsInitialized *bool `yaml:"repo_otel_labels_initialized,omitempty"`
+	RepoOtelLabelsImplemented *bool `yaml:"repo_otel_labels_implemented,omitempty"`
+
 	// RepoLangGraphPlatformConfigPresent is ALSO valid at agent scope (dual-scope,
 	// like repo_has_observability): a langgraph.json means LangGraph Platform
 	// injects its own checkpointer.
