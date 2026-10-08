@@ -84,6 +84,7 @@ func DiscoverOtelLabels(parsed []ParsedFile) []models.OtelLabelsSignal {
 				TestOrigin: f.test,
 			})
 		}
+		out = append(out, otelLabelsAttrSignals(pf, lang, f.test)...)
 		files = append(files, f)
 	}
 	if imported {

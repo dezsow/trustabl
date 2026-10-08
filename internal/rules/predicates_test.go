@@ -1928,3 +1928,35 @@ func TestPredRepoOtelLabelsImplemented(t *testing.T) {
 		t.Error("a shell_invocation function must not create a tool-span obligation")
 	}
 }
+
+// trustabl.* keys written by hand credit the presence ladder rung by rung.
+func TestPredRepoOtelLabels_HandWrittenKeysCredit(t *testing.T) {
+	attr := func(keys ...string) models.RepoInventory {
+		var sigs []models.OtelLabelsSignal
+		for _, k := range keys {
+			sigs = append(sigs, models.OtelLabelsSignal{Kind: models.OtelLabelsAttrLiteral, Key: k})
+		}
+		return models.RepoInventory{
+			Tools:             []models.ToolDef{{Name: "search", Kind: models.KindOpenAITool}},
+			OtelLabelsSignals: sigs,
+		}
+	}
+	if !rules.PredRepoOtelLabelsInstalled(true, models.RepoProfile{}, attr("trustabl.step_index")) {
+		t.Error("any hand-written key means the labels are present")
+	}
+	if rules.PredRepoOtelLabelsInitialized(true, attr("trustabl.step_index")) {
+		t.Error("a key other than trustabl.run_id does not start a run")
+	}
+	if !rules.PredRepoOtelLabelsInitialized(true, attr("trustabl.run_id")) {
+		t.Error("trustabl.run_id written by hand starts a run")
+	}
+	if rules.PredRepoOtelLabelsImplemented(true, attr("trustabl.run_id", "trustabl.exit_reason")) {
+		t.Error("a repo with tools needs a tool-span key too")
+	}
+	if !rules.PredRepoOtelLabelsImplemented(true, attr("trustabl.run_id", "trustabl.exit_reason", "trustabl.tool.input_fp")) {
+		t.Error("run end plus a tool-span key is implemented")
+	}
+	if !rules.PredRepoOtelLabelsImplemented(true, attr("trustabl.exit_reason", "trustabl.tool.attempt")) {
+		t.Error("trustabl.tool.attempt counts as a tool-span key")
+	}
+}

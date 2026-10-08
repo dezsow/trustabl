@@ -1706,13 +1706,44 @@ func hasOtelLabelsSignal(inv models.RepoInventory, kind models.OtelLabelsSignalK
 	return false
 }
 
+// otelLabelsRungKeys are the hand-written label keys that prove each rung:
+// any key proves the labels are present; trustabl.run_id proves a run is
+// started; trustabl.exit_reason proves the run end is recorded;
+// trustabl.tool.input_fp or trustabl.tool.attempt proves a tool span is
+// labelled. A nil entry means any key.
+var otelLabelsRungKeys = map[models.OtelLabelsSignalKind]map[string]bool{
+	models.OtelLabelsImport:   nil,
+	models.OtelLabelsRunStart: {"trustabl.run_id": true},
+	models.OtelLabelsRunEnd:   {"trustabl.exit_reason": true},
+	models.OtelLabelsToolSpan: {"trustabl.tool.input_fp": true, "trustabl.tool.attempt": true},
+}
+
+// hasOtelLabelsRung reports whether the repo reached a rung, through a library
+// call or through the label keys written by hand.
+func hasOtelLabelsRung(inv models.RepoInventory, kind models.OtelLabelsSignalKind) bool {
+	if hasOtelLabelsSignal(inv, kind) {
+		return true
+	}
+	keys, ok := otelLabelsRungKeys[kind]
+	if !ok {
+		return false
+	}
+	for _, s := range inv.OtelLabelsSignals {
+		if s.Kind == models.OtelLabelsAttrLiteral && (keys == nil || keys[s.Key]) {
+			return true
+		}
+	}
+	return false
+}
+
 // PredRepoOtelLabelsInstalled reports whether agent-reliability-otel-labels is
 // present in the repo at all: declared in a root dependency manifest, or
 // imported in code. Either is enough. Recon reads only the root manifests, so a
 // monorepo that declares the library in a nested manifest is visible only
-// through its import.
+// through its import. trustabl.* keys written by hand count too (see
+// otelLabelsRungKeys).
 func PredRepoOtelLabelsInstalled(want bool, p models.RepoProfile, inv models.RepoInventory) bool {
-	installed := len(p.OtelLabelsDeclaredIn) > 0 || hasOtelLabelsSignal(inv, models.OtelLabelsImport)
+	installed := len(p.OtelLabelsDeclaredIn) > 0 || hasOtelLabelsRung(inv, models.OtelLabelsImport)
 	return installed == want
 }
 
@@ -1720,9 +1751,9 @@ func PredRepoOtelLabelsInstalled(want bool, p models.RepoProfile, inv models.Rep
 // Run.mark_start(root) is called somewhere, which is what stamps the run
 // identity on the root span. Constructing a Run, or labelling spans without
 // ever marking the start, is not initialization — the labels then belong to no
-// run.
+// run. trustabl.* keys written by hand count too (see otelLabelsRungKeys).
 func PredRepoOtelLabelsInitialized(want bool, inv models.RepoInventory) bool {
-	return hasOtelLabelsSignal(inv, models.OtelLabelsRunStart) == want
+	return hasOtelLabelsRung(inv, models.OtelLabelsRunStart) == want
 }
 
 // toolSpanKinds are the tool kinds an agent framework emits a tool-execution
@@ -1748,13 +1779,14 @@ var toolSpanKinds = map[models.ToolKind]bool{
 // to label, so recording the run end is the whole job there.
 //
 // This proves the calls exist, not that the labels land: with no current span
-// inside a tool every call is a silent no-op, which no static check can see.
+// inside a tool every call is a silent no-op, which no static check can see. trustabl.* keys written by hand count too
+// (see otelLabelsRungKeys).
 func PredRepoOtelLabelsImplemented(want bool, inv models.RepoInventory) bool {
-	implemented := hasOtelLabelsSignal(inv, models.OtelLabelsRunEnd)
+	implemented := hasOtelLabelsRung(inv, models.OtelLabelsRunEnd)
 	if implemented {
 		for _, t := range inv.Tools {
 			if toolSpanKinds[t.Kind] {
-				implemented = hasOtelLabelsSignal(inv, models.OtelLabelsToolSpan)
+				implemented = hasOtelLabelsRung(inv, models.OtelLabelsToolSpan)
 				break
 			}
 		}

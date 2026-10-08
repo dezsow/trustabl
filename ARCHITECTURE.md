@@ -567,6 +567,15 @@ For each language recon cleared, do the AST work and produce a `RepoInventory`:
   signal carries `TestOrigin` when its file classifies as a test
   (`pathclass.Classify`). That gate is repo-wide, not per-file: a `Run` is
   routinely built in one module and started in another that imports nothing.
+  `attr_literal` records a label key written to a span by hand
+  (`set_attribute` / `setAttribute` first argument, or a key of the literal
+  passed to `set_attributes` / `setAttributes`), collected whether or not the
+  library is imported; a bare string elsewhere is not a label. The key table
+  (`otel_labels_keys.go`) is tested against
+  `testdata/forge/otel/otel-spec-keys.json`. The ladder predicates credit
+  these keys rung by rung: any key → installed, `trustabl.run_id` → initialized,
+  `trustabl.exit_reason` → run end, `trustabl.tool.input_fp` /
+  `trustabl.tool.attempt` → tool span.
   The Go binding is not inspected. Output is sorted (stably) by (File,
   StartLine, Kind, Key); like `ObservabilitySignals` it is additive inventory
   and is **not** folded into `ScanID`.

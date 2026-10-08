@@ -633,17 +633,20 @@ rules:
 #       TypeScript/JavaScript only; the Go binding is not inspected. Pair it
 #       with repo_observability_initialized: true — the library only labels
 #       spans that already exist.
+#       trustabl.* keys written by hand with set_attribute(s) count too.
 #   repo_otel_labels_initialized: true | false
 #       Fires when a run is (or is not) started: a `<run>.mark_start(...)` /
 #       `<run>.markStart(...)` call appears, which stamps the run identity on
 #       the root span. Constructing a Run without it does not count. The call
 #       names count only when the library is imported somewhere in the repo.
+#       trustabl.* keys written by hand with set_attribute(s) count too.
 #   repo_otel_labels_implemented: true | false
 #       Fires when the labels are (or are not) written: `mark_run_end` /
 #       `markRunEnd` is called, AND — when the repo ships at least one tool the
 #       model calls — `mark_tool_span` / `markToolSpan` is called. A tool-less
 #       repo needs only the run end. Proves the calls exist, not that the
 #       labels land: with no current span each call is a silent no-op.
+#       trustabl.* keys written by hand with set_attribute(s) count too.
 #   repo_raw_anthropic_tool_output_in_system: true | false
 #       Fires when a function drives the bare `anthropic` client in a manual
 #       tool-use loop (.messages.create(..., tools=...)) and passes a runtime-

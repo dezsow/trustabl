@@ -1,6 +1,9 @@
 package analysis_test
 
 import (
+	"encoding/json"
+	"os"
+	"slices"
 	"testing"
 
 	"github.com/trustabl/trustabl/internal/analysis"
@@ -249,5 +252,72 @@ def end(root):
 		if s.TestOrigin != want {
 			t.Errorf("%s:%d %s: TestOrigin = %v, want %v", s.File, s.StartLine, s.Kind, s.TestOrigin, want)
 		}
+	}
+}
+
+func attrKeys(sigs []models.OtelLabelsSignal) []string {
+	var out []string
+	for _, s := range sigs {
+		if s.Kind == models.OtelLabelsAttrLiteral {
+			out = append(out, s.Key)
+		}
+	}
+	return out
+}
+
+// Labels written by hand, with no library import, are still labels.
+func TestDiscoverOtelLabels_HandWrittenKeys(t *testing.T) {
+	py := `def label(span, root):
+    span.set_attribute("trustabl.tool.input_fp", fp)
+    root.set_attributes({"trustabl.run_id": rid, "trustabl.exit_reason": "error", "other.key": 1})
+`
+	ts := `export function label(span: any, root: any) {
+  span.setAttribute("trustabl.tool.attempt", 2);
+  root.setAttributes({ "trustabl.run_id": rid });
+}
+`
+	got := attrKeys(analysis.DiscoverOtelLabels([]analysis.ParsedFile{
+		parsePyFile(t, "agent.py", py),
+		parseTSForTest(t, "agent.ts", ts),
+	}))
+	want := []string{
+		"trustabl.tool.input_fp", "trustabl.exit_reason", "trustabl.run_id",
+		"trustabl.tool.attempt", "trustabl.run_id",
+	}
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Errorf("got keys %v, want %v", got, want)
+	}
+}
+
+// A key that is never written to a span is not a label: a dashboard query, a
+// constants module, a vendored copy of the library's keys.py.
+func TestDiscoverOtelLabels_BareKeyLiteralIsNotALabel(t *testing.T) {
+	src := `RUN_ID = "trustabl.run_id"
+QUERY = "SELECT * FROM spans WHERE attributes['trustabl.exit_reason'] = 'error'"
+lookup(span.attributes["trustabl.tool.attempt"])
+`
+	if got := attrKeys(analysis.DiscoverOtelLabels([]analysis.ParsedFile{parsePyFile(t, "dash.py", src)})); len(got) != 0 {
+		t.Errorf("bare literals recorded as labels: %v", got)
+	}
+}
+
+// The engine's key table must match the vendored key manifest of the library.
+func TestOtelLabelsKeys_MatchVendoredManifest(t *testing.T) {
+	raw, err := os.ReadFile("../../testdata/forge/otel/otel-spec-keys.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest struct {
+		Attributes []string `json:"attributes"`
+	}
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	want := slices.Clone(manifest.Attributes)
+	slices.Sort(want)
+	if got := analysis.OtelLabelsAttributeKeys(); !slices.Equal(got, want) {
+		t.Errorf("engine keys %v, manifest attributes %v", got, want)
 	}
 }

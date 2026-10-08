@@ -1322,6 +1322,20 @@ def run_agent(prompt):
 			want: nil,
 		},
 		{
+			name: "labels written by hand, no library",
+			deps: `"openai-agents", "opentelemetry-sdk"`,
+			src: tracing + `
+
+def run_agent(prompt):
+    with tracer.start_as_current_span("invoke_agent") as root:
+        root.set_attribute("trustabl.run_id", "r-1")
+        with tracer.start_as_current_span("execute_tool") as span:
+            span.set_attribute("trustabl.tool.input_fp", "abc")
+        root.set_attribute("trustabl.exit_reason", "final_answer")
+`,
+			want: nil,
+		},
+		{
 			name: "no tracing at all",
 			deps: `"openai-agents"`,
 			src: `from agents import Agent

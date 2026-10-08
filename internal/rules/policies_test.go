@@ -4240,6 +4240,19 @@ var policyRepoRuleCases = []policyRepoCase{
 			},
 		},
 		false},
+	{"OBS-006 silent when the trustabl.* keys are written by hand", "OBS-006",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalInit},
+			},
+			OtelLabelsSignals: []models.OtelLabelsSignal{
+				{Kind: models.OtelLabelsAttrLiteral, Key: "trustabl.run_id"},
+			},
+		},
+		false},
 	{"OBS-007 fires when agent-reliability-otel-labels is installed but no run is started", "OBS-007",
 		models.RepoProfile{Languages: []models.Language{models.LanguagePython}, OtelLabelsDeclaredIn: []string{"requirements.txt"}},
 		models.RepoInventory{
