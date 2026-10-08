@@ -198,3 +198,56 @@ mark_run_end(root, exit_reason="error")
 		t.Errorf("signals within a file must be ordered by line: %+v", got[:2])
 	}
 }
+
+// A renamed import must still be followed: `mts(...)` is mark_tool_span.
+func TestDiscoverOtelLabels_FollowsPythonAliases(t *testing.T) {
+	src := `from agent_reliability_otel_labels import mark_tool_span as mts, mark_run_end as end_run
+
+def tool(span, root):
+    mts(span, args={}, result=None, attempt=n)
+    end_run(root, exit_reason=reason)
+`
+	got := analysis.DiscoverOtelLabels([]analysis.ParsedFile{parsePyFile(t, "agent.py", src)})
+	if !hasOtelLabelsKind(got, models.OtelLabelsToolSpan) {
+		t.Errorf("aliased mark_tool_span not recognised: %+v", got)
+	}
+	if !hasOtelLabelsKind(got, models.OtelLabelsRunEnd) {
+		t.Errorf("aliased mark_run_end not recognised: %+v", got)
+	}
+}
+
+func TestDiscoverOtelLabels_FollowsTSAliases(t *testing.T) {
+	src := `import { markToolSpan as label } from "@trustabl/agent-reliability-otel-labels";
+
+export function tool(span: any, n: number) {
+  label(span, { args: {}, result: null, attempt: n });
+}
+`
+	got := analysis.DiscoverOtelLabels([]analysis.ParsedFile{parseTSForTest(t, "agent.ts", src)})
+	if !hasOtelLabelsKind(got, models.OtelLabelsToolSpan) {
+		t.Errorf("aliased markToolSpan not recognised: %+v", got)
+	}
+}
+
+// Every signal from a test file carries TestOrigin (spec D8); production
+// files do not.
+func TestDiscoverOtelLabels_StampsTestOrigin(t *testing.T) {
+	src := `from agent_reliability_otel_labels import mark_run_end
+
+def end(root):
+    mark_run_end(root, exit_reason="error")
+`
+	got := analysis.DiscoverOtelLabels([]analysis.ParsedFile{
+		parsePyFile(t, "tests/test_agent.py", src),
+		parsePyFile(t, "app/agent.py", src),
+	})
+	if len(got) == 0 {
+		t.Fatal("no signals")
+	}
+	for _, s := range got {
+		want := s.File == "tests/test_agent.py"
+		if s.TestOrigin != want {
+			t.Errorf("%s:%d %s: TestOrigin = %v, want %v", s.File, s.StartLine, s.Kind, s.TestOrigin, want)
+		}
+	}
+}

@@ -442,6 +442,9 @@ const (
 	OtelLabelsRunStart OtelLabelsSignalKind = "run_start"
 	OtelLabelsToolSpan OtelLabelsSignalKind = "tool_span"
 	OtelLabelsRunEnd   OtelLabelsSignalKind = "run_end"
+	// OtelLabelsAttrLiteral is a trustabl.* label key written to a span by
+	// hand (set_attribute / setAttribute), without the library.
+	OtelLabelsAttrLiteral OtelLabelsSignalKind = "attr_literal"
 )
 
 // OtelLabelsSignal is one agent-reliability-otel-labels fact OBSERVED IN CODE.
@@ -451,12 +454,17 @@ const (
 // repo_has_observability and a started Run satisfy
 // repo_observability_initialized — the library would clear its own
 // prerequisite and OBS-001 would misfire on it.
+//
+// The fact fields are zero when they do not apply to the Kind.
 type OtelLabelsSignal struct {
 	Kind      OtelLabelsSignalKind `json:"kind"`
 	File      string               `json:"file"`
 	StartLine int                  `json:"start_line"`
 	EndLine   int                  `json:"end_line"`
 	Language  Language             `json:"language"`
+
+	TestOrigin bool   `json:"test_origin,omitempty"` // all kinds: File classifies as a test
+	Key        string `json:"key,omitempty"`         // attr_literal: the trustabl.* key
 }
 
 // DepRef is one dependency declared in a repo manifest — the agent-path

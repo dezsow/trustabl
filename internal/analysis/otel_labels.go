@@ -8,6 +8,7 @@ import (
 
 	"github.com/trustabl/trustabl/internal/analysis/astutil"
 	"github.com/trustabl/trustabl/internal/models"
+	"github.com/trustabl/trustabl/internal/pathclass"
 )
 
 // otelLabelsPyModule and otelLabelsTSModule are the import names of the
@@ -47,45 +48,53 @@ var otelLabelsTSCallees = []otelLabelsCallee{
 // count only when the library is imported somewhere in the repo. The gate is
 // repo-wide rather than per-file because a Run is routinely built in one module
 // and handed to another, which then calls run.mark_start(root) without
-// importing anything.
+// importing anything. Each file's own imports are still followed, so an aliased
+// name (`mark_tool_span as mts`) resolves.
 //
 // Like DiscoverObservability, this inspects Python and TypeScript/JavaScript
 // only. The Go binding is not inspected.
 func DiscoverOtelLabels(parsed []ParsedFile) []models.OtelLabelsSignal {
-	var out []models.OtelLabelsSignal
-	for _, pf := range parsed {
-		lang, ok := otelLabelsLanguage(pf)
-		if !ok || !importsOtelLabels(pf, lang) {
-			continue
-		}
-		out = append(out, models.OtelLabelsSignal{
-			Kind:      models.OtelLabelsImport,
-			File:      pf.RelPath,
-			StartLine: 1,
-			EndLine:   1,
-			Language:  lang,
-		})
+	type labelledFile struct {
+		pf      ParsedFile
+		lang    models.Language
+		test    bool
+		aliases map[string]string
 	}
-	if len(out) == 0 {
-		return nil
-	}
+	var (
+		out      []models.OtelLabelsSignal
+		files    []labelledFile
+		imported bool
+	)
 	for _, pf := range parsed {
 		lang, ok := otelLabelsLanguage(pf)
 		if !ok {
 			continue
 		}
-		out = append(out, otelLabelsCallSignals(pf, lang)...)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		switch {
-		case out[i].File != out[j].File:
-			return out[i].File < out[j].File
-		case out[i].StartLine != out[j].StartLine:
-			return out[i].StartLine < out[j].StartLine
-		default:
-			return out[i].Kind < out[j].Kind
+		f := labelledFile{pf: pf, lang: lang, test: pathclass.Classify(pf.RelPath) == models.OriginTest}
+		var imports bool
+		f.aliases, imports = otelLabelsImports(pf, lang)
+		if imports {
+			imported = true
+			out = append(out, models.OtelLabelsSignal{
+				Kind:       models.OtelLabelsImport,
+				File:       pf.RelPath,
+				StartLine:  1,
+				EndLine:    1,
+				Language:   lang,
+				TestOrigin: f.test,
+			})
 		}
-	})
+		files = append(files, f)
+	}
+	if imported {
+		for _, f := range files {
+			out = append(out, otelLabelsCallSignals(f.pf, f.lang, f.test, f.aliases)...)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	sortOtelLabels(out)
 	return out
 }
 
@@ -104,21 +113,106 @@ func otelLabelsLanguage(pf ParsedFile) (models.Language, bool) {
 	return "", false
 }
 
-func importsOtelLabels(pf ParsedFile, lang models.Language) bool {
-	if lang == models.LanguagePython {
-		return fileImportsModule(pf, func(mod string) bool {
-			return mod == otelLabelsPyModule || strings.HasPrefix(mod, otelLabelsPyModule+".")
-		})
-	}
-	aliases := astutil.TSImportAliasesMatch(pf.Tree.RootNode(), pf.Source, func(mod string) bool {
-		return mod == otelLabelsTSModule || strings.HasPrefix(mod, otelLabelsTSModule+"/")
+// sortOtelLabels orders signals by file, line, kind and key. The sort is
+// stable, so two signals equal on all four keep the deterministic order the
+// tree walk produced.
+func sortOtelLabels(out []models.OtelLabelsSignal) {
+	sort.SliceStable(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		switch {
+		case a.File != b.File:
+			return a.File < b.File
+		case a.StartLine != b.StartLine:
+			return a.StartLine < b.StartLine
+		case a.Kind != b.Kind:
+			return a.Kind < b.Kind
+		default:
+			return a.Key < b.Key
+		}
 	})
-	return len(aliases) > 0
 }
 
-// otelLabelsCallSignals collects the run-start, tool-span and run-end calls
-// in one file.
-func otelLabelsCallSignals(pf ParsedFile, lang models.Language) []models.OtelLabelsSignal {
+func isOtelLabelsPyModule(mod string) bool {
+	return mod == otelLabelsPyModule || strings.HasPrefix(mod, otelLabelsPyModule+".")
+}
+
+func isOtelLabelsTSModule(mod string) bool {
+	return mod == otelLabelsTSModule || strings.HasPrefix(mod, otelLabelsTSModule+"/")
+}
+
+// otelLabelsImports reports whether the file imports the library, and returns
+// the file's alias map: local name → library name, with "*" for a module or
+// namespace alias (`import agent_reliability_otel_labels as otl`,
+// `import * as otl from "..."`).
+func otelLabelsImports(pf ParsedFile, lang models.Language) (map[string]string, bool) {
+	if lang == models.LanguageTypeScript {
+		aliases := astutil.TSImportAliasesMatch(pf.Tree.RootNode(), pf.Source, isOtelLabelsTSModule)
+		return aliases, len(aliases) > 0
+	}
+	if !fileImportsModule(pf, isOtelLabelsPyModule) {
+		return nil, false
+	}
+	return pyOtelLabelsAliases(pf), true
+}
+
+// pyOtelLabelsAliases maps the names a Python file binds from the library.
+// `from agent_reliability_otel_labels import Run` binds Run → Run;
+// `... import mark_tool_span as mts` binds mts → mark_tool_span;
+// `import agent_reliability_otel_labels as otl` binds otl → "*".
+func pyOtelLabelsAliases(pf ParsedFile) map[string]string {
+	out := map[string]string{}
+	astutil.Walk(pf.Tree.RootNode(), func(n *sitter.Node) bool {
+		switch n.Type() {
+		case "import_from_statement":
+			if !isOtelLabelsPyModule(astutil.NodeText(n.ChildByFieldName("module_name"), pf.Source)) {
+				return true
+			}
+			for i := 0; i < int(n.ChildCount()); i++ {
+				if n.FieldNameForChild(i) != "name" {
+					continue
+				}
+				c := n.Child(i)
+				switch c.Type() {
+				case "dotted_name":
+					name := astutil.NodeText(c, pf.Source)
+					out[name] = name
+				case "aliased_import":
+					out[astutil.NodeText(c.ChildByFieldName("alias"), pf.Source)] =
+						astutil.NodeText(c.ChildByFieldName("name"), pf.Source)
+				}
+			}
+		case "import_statement":
+			for i := 0; i < int(n.NamedChildCount()); i++ {
+				c := n.NamedChild(i)
+				if c.Type() == "aliased_import" &&
+					isOtelLabelsPyModule(astutil.NodeText(c.ChildByFieldName("name"), pf.Source)) {
+					out[astutil.NodeText(c.ChildByFieldName("alias"), pf.Source)] = "*"
+				}
+			}
+		}
+		return true
+	})
+	return out
+}
+
+// otelLabelsCalleeName resolves a callee to the library name it calls, and
+// reports whether it has a receiver. A bare name goes through the file's alias
+// map, so `mts(...)` after `import mark_tool_span as mts` is mark_tool_span. A
+// dotted callee keeps its last segment: `run.mark_start` and
+// `otl.mark_tool_span` both resolve by name, as before aliases were followed.
+func otelLabelsCalleeName(callee string, aliases map[string]string) (string, bool) {
+	if i := strings.LastIndex(callee, "."); i >= 0 {
+		return callee[i+1:], true
+	}
+	if orig, ok := aliases[callee]; ok && orig != "*" && orig != "default" {
+		return orig, false
+	}
+	return callee, false
+}
+
+// otelLabelsCallSignals collects the run-start, tool-span and run-end calls in
+// one file.
+func otelLabelsCallSignals(pf ParsedFile, lang models.Language, test bool, aliases map[string]string) []models.OtelLabelsSignal {
 	callType, callees := "call", otelLabelsPyCallees
 	if lang == models.LanguageTypeScript {
 		callType, callees = "call_expression", otelLabelsTSCallees
@@ -132,21 +226,18 @@ func otelLabelsCallSignals(pf ParsedFile, lang models.Language) []models.OtelLab
 		if fn == nil {
 			return true
 		}
-		callee := strings.TrimSpace(astutil.NodeText(fn, pf.Source))
-		name, hasReceiver := callee, false
-		if i := strings.LastIndex(callee, "."); i >= 0 {
-			name, hasReceiver = callee[i+1:], true
-		}
+		name, hasReceiver := otelLabelsCalleeName(strings.TrimSpace(astutil.NodeText(fn, pf.Source)), aliases)
 		for _, c := range callees {
 			if name != c.Name || (c.NeedsReceiver && !hasReceiver) {
 				continue
 			}
 			out = append(out, models.OtelLabelsSignal{
-				Kind:      c.Kind,
-				File:      pf.RelPath,
-				StartLine: astutil.NodeLine(n),
-				EndLine:   astutil.NodeEndLine(n),
-				Language:  lang,
+				Kind:       c.Kind,
+				File:       pf.RelPath,
+				StartLine:  astutil.NodeLine(n),
+				EndLine:    astutil.NodeEndLine(n),
+				Language:   lang,
+				TestOrigin: test,
 			})
 		}
 		return true

@@ -562,11 +562,14 @@ For each language recon cleared, do the AST work and produce a `RepoInventory`:
   `tool_span` (`mark_tool_span` / `markToolSpan`) and `run_end` (`mark_run_end`
   / `markRunEnd`). The call names are plausible names for a project's own
   helpers, so they count only when the library is imported somewhere in the
-  repo. That gate is repo-wide, not per-file: a `Run` is routinely built in one
-  module and started in another that imports nothing. The Go binding is not
-  inspected. Output is sorted by (File, StartLine, Kind); like
-  `ObservabilitySignals` it is additive inventory and is **not** folded into
-  `ScanID`.
+  repo; each file's own imports are followed, so a renamed import
+  (`mark_tool_span as mts`, `markToolSpan as label`) still resolves. Every
+  signal carries `TestOrigin` when its file classifies as a test
+  (`pathclass.Classify`). That gate is repo-wide, not per-file: a `Run` is
+  routinely built in one module and started in another that imports nothing.
+  The Go binding is not inspected. Output is sorted (stably) by (File,
+  StartLine, Kind, Key); like `ObservabilitySignals` it is additive inventory
+  and is **not** folded into `ScanID`.
 
   These signals are deliberately **not** `ObservabilitySignal`s.
   `agent-reliability-otel-labels` never creates a span, so folding it in would let an import
