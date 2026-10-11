@@ -108,7 +108,7 @@ OpenAIAgentsInstrumentor().instrument(tracer_provider=provider)
 Install: `npm install @opentelemetry/api @opentelemetry/sdk-trace-base @opentelemetry/context-async-hooks @opentelemetry/exporter-trace-otlp-http`
 
 ```typescript
-import { context } from "@opentelemetry/api";
+import { context, trace } from "@opentelemetry/api";
 import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
 import { BasicTracerProvider, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
@@ -118,6 +118,8 @@ context.setGlobalContextManager(new AsyncLocalStorageContextManager().enable());
 const provider = new BasicTracerProvider({
   spanProcessors: [new SimpleSpanProcessor(new OTLPTraceExporter())],
 });
+// Framework instrumentation starts its spans on the global provider.
+trace.setGlobalTracerProvider(provider);
 const tracer = provider.getTracer("agent");
 ```
 

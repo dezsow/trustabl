@@ -266,3 +266,67 @@ func TestParseForgeLangs(t *testing.T) {
 		t.Errorf("bad = %q, want %q", bad, "rust")
 	}
 }
+
+func TestForgeTracingNote(t *testing.T) {
+	skill := []models.DetectorCategory{models.CategoryClaudeSkill}
+	agent := []models.DetectorCategory{models.CategoryMCP}
+	withLang := forge.TracingSelection{Languages: []models.Language{models.LanguagePython}}
+
+	if note := forgeTracingNote(skill, forge.TracingSelection{}); note != "" {
+		t.Errorf("claude_skill only: note = %q, want none (tracing does not apply)", note)
+	}
+	if note := forgeTracingNote(agent, forge.TracingSelection{}); !strings.Contains(note, "--lang") {
+		t.Errorf("agent SDK, no language: note = %q, want a --lang suggestion", note)
+	}
+	if note := forgeTracingNote(agent, withLang); note != "" {
+		t.Errorf("agent SDK with a language: note = %q, want none", note)
+	}
+}
+
+// runForgeIn runs `trustabl forge` against dir with extra flags and returns
+// the exit code and stderr. Only for paths that exit before rules resolve.
+func runForgeIn(t *testing.T, dir string, flags ...string) (int, string) {
+	t.Helper()
+	root := &cobra.Command{Use: "trustabl", SilenceUsage: true, SilenceErrors: true}
+	root.AddCommand(newForgeCommand(nil))
+	root.SetArgs(append([]string{"forge", dir}, flags...))
+	buf := &bytes.Buffer{}
+	root.SetErr(buf)
+	root.SetOut(&bytes.Buffer{})
+	err := root.Execute()
+	var ec exitCodeError
+	if !errors.As(err, &ec) {
+		t.Fatalf("got error %v (%T), want an exitCodeError", err, err)
+	}
+	return ec.code, buf.String()
+}
+
+func TestForgeCommand_LangWithoutPolicy_ExplainsLang(t *testing.T) {
+	code, stderr := runForgeIn(t, t.TempDir(), "--lang", "go")
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "does not select a rule pack") {
+		t.Errorf("stderr should say --lang does not select a rule pack, got: %s", stderr)
+	}
+	if !strings.Contains(stderr, "--policy") {
+		t.Errorf("stderr should point at --policy, got: %s", stderr)
+	}
+}
+
+func TestForgeCommand_NoSDKs_NoLangHint(t *testing.T) {
+	code, stderr := runForgeIn(t, t.TempDir())
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	if strings.Contains(stderr, "--lang") {
+		t.Errorf("stderr should not mention --lang when it was not passed, got: %s", stderr)
+	}
+}
+
+func TestForgeCommand_HelpText_LangNeedsPolicy(t *testing.T) {
+	cmd := newForgeCommand(nil)
+	if !strings.Contains(cmd.Long, "needs --policy as well") {
+		t.Error("help text should say a repo with no manifest needs --policy alongside --lang")
+	}
+}

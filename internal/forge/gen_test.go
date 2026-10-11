@@ -316,7 +316,7 @@ func TestGenerateCombined_GoldenFile(t *testing.T) {
 		Categories:    []models.DetectorCategory{models.CategoryClaudeSDK, models.CategoryOpenAISDK},
 		Template:      TemplateVersion,
 	}
-	got := GenerateCombined(stamp.Categories, policies, stamp, TracingSelection{})
+	got := GenerateCombined(stamp.Categories, policies, stamp, TracingSelection{}, nil)
 
 	goldenPath := filepath.Join("..", "..", "testdata", "forge", "multi_sdk", "expected", "SKILL.md")
 	if *update {
@@ -354,8 +354,8 @@ func TestGenerateCombined_Deterministic(t *testing.T) {
 		Categories:    []models.DetectorCategory{models.CategoryClaudeSDK, models.CategoryOpenAISDK},
 		Template:      TemplateVersion,
 	}
-	a := GenerateCombined(stamp.Categories, policies, stamp, TracingSelection{})
-	b := GenerateCombined(stamp.Categories, policies, stamp, TracingSelection{})
+	a := GenerateCombined(stamp.Categories, policies, stamp, TracingSelection{}, nil)
+	b := GenerateCombined(stamp.Categories, policies, stamp, TracingSelection{}, nil)
 	if a != b {
 		t.Error("GenerateCombined is not deterministic")
 	}
@@ -375,7 +375,7 @@ func TestGenerateCombined_UnknownCategorySkipped(t *testing.T) {
 		Categories:    []models.DetectorCategory{models.CategoryMCP}, // not in fixture
 		Template:      TemplateVersion,
 	}
-	got := GenerateCombined(stamp.Categories, policies, stamp, TracingSelection{})
+	got := GenerateCombined(stamp.Categories, policies, stamp, TracingSelection{}, nil)
 	// should produce valid frontmatter + header but no rule sections
 	if !strings.Contains(got, "name: trustabl-pre-coding") {
 		t.Error("expected frontmatter in output")
@@ -452,7 +452,7 @@ func TestGenerateCombined_EmitsApplyLoop(t *testing.T) {
 		Categories:    []models.DetectorCategory{models.CategoryClaudeSDK, models.CategoryOpenAISDK},
 		Template:      TemplateVersion,
 	}
-	got := GenerateCombined(stamp.Categories, policies, stamp, TracingSelection{})
+	got := GenerateCombined(stamp.Categories, policies, stamp, TracingSelection{}, nil)
 
 	if !strings.Contains(got, "## How to Apply These Constraints") {
 		t.Fatal("generated skill is missing the apply-loop section")
@@ -489,7 +489,7 @@ func TestGenerateCombined_SkillCompliant(t *testing.T) {
 		Categories:    []models.DetectorCategory{models.CategoryClaudeSDK, models.CategoryOpenAISDK},
 		Template:      TemplateVersion,
 	}
-	got := GenerateCombined(stamp.Categories, policies, stamp, allTracingSelection())
+	got := GenerateCombined(stamp.Categories, policies, stamp, allTracingSelection(), nil)
 
 	// Anchor: this test guards the hand-authored loop prose. If that prose is
 	// absent the assertions below would pass vacuously, so fail loudly rather
@@ -575,4 +575,77 @@ func fireSkillRules(t *testing.T, skill models.SkillDef) []string {
 	}
 	sort.Strings(fired)
 	return fired
+}
+
+// languagePack is a google_adk pack with one rule per language plus one with
+// no language, the shape the real pack has.
+func languagePack() []rules.PolicyFile {
+	rule := func(id string, scope models.Scope, lang models.Language) rules.RuleDef {
+		return rules.RuleDef{ID: id, Title: id + " title", Scope: scope, Severity: models.SeverityHigh,
+			Confidence: 0.9, Language: lang, Category: models.CategoryGoogleADK,
+			Explanation: id + " why.", Fix: id + " fix."}
+	}
+	return []rules.PolicyFile{{
+		Policy: rules.PolicyMeta{ID: "google_adk", Name: "ADK agent safety", Category: models.CategoryGoogleADK},
+		Rules: []rules.RuleDef{
+			rule("ADK-PY", models.ScopeTool, models.LanguagePython),
+			rule("ADK-TS", models.ScopeAgent, models.LanguageTypeScript),
+			rule("ADK-JS", models.ScopeTool, models.LanguageJavaScript),
+			rule("ADK-GO", models.ScopeTool, models.LanguageGo),
+			rule("ADK-ANY", models.ScopeRepo, ""),
+		},
+	}}
+}
+
+func TestGenerateCombined_RuleLanguagesFilter(t *testing.T) {
+	cats := []models.DetectorCategory{models.CategoryGoogleADK}
+	stamp := PolicyStamp{Categories: cats}
+	cases := []struct {
+		name       string
+		langs      RuleLanguages
+		kept, gone []string
+	}{
+		{"nil keeps every rule", nil, []string{"ADK-PY", "ADK-TS", "ADK-JS", "ADK-GO", "ADK-ANY"}, nil},
+		{"go", RuleLanguages{models.CategoryGoogleADK: {models.LanguageGo}},
+			[]string{"ADK-GO", "ADK-ANY"}, []string{"ADK-PY", "ADK-TS", "ADK-JS"}},
+		{"typescript keeps javascript", RuleLanguages{models.CategoryGoogleADK: {models.LanguageTypeScript}},
+			[]string{"ADK-TS", "ADK-JS", "ADK-ANY"}, []string{"ADK-PY", "ADK-GO"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := GenerateCombined(cats, languagePack(), stamp, TracingSelection{}, c.langs)
+			for _, id := range c.kept {
+				if !strings.Contains(got, "["+id+"]") {
+					t.Errorf("missing %s", id)
+				}
+			}
+			for _, id := range c.gone {
+				if strings.Contains(got, "["+id+"]") {
+					t.Errorf("%s must be filtered out", id)
+				}
+			}
+			if strings.Contains(got, "Trustabl has no") {
+				t.Errorf("every listed language has rules; no coverage note expected")
+			}
+		})
+	}
+}
+
+func TestGenerateCombined_NotesALanguageWithNoRules(t *testing.T) {
+	cats := []models.DetectorCategory{models.CategoryGoogleADK}
+	pack := languagePack()
+	pack[0].Rules = pack[0].Rules[:3] // drop ADK-GO and ADK-ANY: nothing targets Go
+	pack[0].Rules = append(pack[0].Rules, rules.RuleDef{ID: "ADK-ANY", Title: "t", Scope: models.ScopeRepo,
+		Severity: models.SeverityLow, Confidence: 0.5, Category: models.CategoryGoogleADK, Explanation: "w.", Fix: "f."})
+	got := GenerateCombined(cats, pack, PolicyStamp{Categories: cats}, TracingSelection{},
+		RuleLanguages{models.CategoryGoogleADK: {models.LanguageGo}})
+	if !strings.Contains(got, "Trustabl has no Go rules for this SDK yet") {
+		t.Errorf("want a coverage note naming Go, got:\n%s", got)
+	}
+	if !strings.Contains(got, "[ADK-ANY]") {
+		t.Errorf("the language-independent rule must still be listed")
+	}
+	if strings.Contains(got, "[ADK-PY]") {
+		t.Errorf("Python rule must be filtered out")
+	}
 }

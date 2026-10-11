@@ -2584,8 +2584,9 @@ writing any SDK code.
    `google-adk-go`) to produce a sorted, deduplicated
    `[]models.DetectorCategory`. Each dep's `Source` manifest is mapped through
    `ingestion.ManifestLanguage` to a language, yielding `(category, language)`
-   pairs for Python, TypeScript and Go. `DetectCategories` returns the
-   categories alone.
+   pairs for Python, TypeScript and Go. A category declared in a manifest with
+   no known language (`composer.json`, say) is also recorded in
+   `Detection.Unplaced`. `DetectCategories` returns the categories alone.
 
 2. **MergeCategories** — deduplicates and sorts the auto-detected slice with
    any categories supplied via `--policy`. Explicit additions are additive, not
@@ -2598,6 +2599,17 @@ writing any SDK code.
    not already place it: a category with no detected pair pairs with every
    selected language, and a language that was not detected pairs with every
    category. Repeating something detection already found changes nothing.
+   When `claude_skill` is the only category, `TracingApplies` is false and the
+   selection is empty, so neither the section nor the stderr "pass --lang"
+   note appears. With no category at all forge exits 1 before this step; if
+   `--lang` was given, that message says `--lang` does not select a rule pack.
+
+   **SelectRuleLanguages** decides which languages each category's rules are
+   kept for (`RuleLanguages`): the detected pairs, plus an explicit `--lang`
+   on every listed category, plus an explicit `--policy` category paired with
+   the explicit `--lang` values. It leaves a category unlisted, so all of its
+   rules are kept, when forge does not know every language the SDK is used in:
+   an `Unplaced` category, or a `--policy` category given with no `--lang`.
 
 3. **rulesource.Resolve + rules.LoadLenient** — same resolution path as
    `trustabl scan`, keyed on `--rules-ref`. All policy packs are loaded;
@@ -2618,7 +2630,12 @@ writing any SDK code.
    values, Step 4 lists checks. The text is embedded from
    `internal/forge/tracingtext/`; two small tables (`languageBlocks`,
    `frameworkRecipes`) fix what exists and in what order. The section is
-   omitted when no selected language has a block. It then routes each rule into
+   omitted when no selected language has a block. It drops each rule whose
+   `language` the category is not used in, through `RuleDef.AppliesToLanguage`
+   (the scanner's own language gate, so TypeScript keeps JavaScript rules and
+   a rule with no language is always kept), and writes a one-line note under
+   an SDK heading for a listed language that no rule of that pack targets
+   (a Go-only Google ADK repo, today). It then routes each rule into
    per-category, per-scope buckets
    (`tools`, `agents`, `subagents`, `repos`, `skills`), emitting one
    `## SDK Name` section per category in `stamp.Categories` order, with

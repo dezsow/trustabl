@@ -234,7 +234,12 @@ func emitApplyLoop(b *strings.Builder) {
 //
 // tracing selects the languages and frameworks the Runtime Tracing section
 // covers; its zero value omits the section.
-func GenerateCombined(categories []models.DetectorCategory, policies []rules.PolicyFile, stamp PolicyStamp, tracing TracingSelection) string {
+//
+// ruleLangs drops the rules whose language the SDK is not used in (see
+// RuleLanguages); nil keeps every rule. A listed language that no rule of the
+// pack targets gets a one-line note in that SDK's section, so a gap in
+// coverage reads as a gap rather than as a clean bill.
+func GenerateCombined(categories []models.DetectorCategory, policies []rules.PolicyFile, stamp PolicyStamp, tracing TracingSelection, ruleLangs RuleLanguages) string {
 	// build category set for O(1) membership check
 	catSet := make(map[models.DetectorCategory]bool, len(categories))
 	for _, c := range categories {
@@ -248,6 +253,9 @@ func GenerateCombined(categories []models.DetectorCategory, policies []rules.Pol
 		subagents []rules.RuleDef
 		repos     []rules.RuleDef
 		skills    []rules.RuleDef
+		// typed counts the pack's language-typed rules per listed language,
+		// before filtering, to find the languages the pack has no rules for.
+		typed map[models.Language]int
 	}
 	sections := make(map[models.DetectorCategory]*sdkSection)
 
@@ -255,12 +263,23 @@ func GenerateCombined(categories []models.DetectorCategory, policies []rules.Pol
 		if !catSet[pf.Policy.Category] {
 			continue
 		}
-		sec := sections[pf.Policy.Category]
+		cat := pf.Policy.Category
+		sec := sections[cat]
 		if sec == nil {
-			sec = &sdkSection{meta: pf.Policy}
-			sections[pf.Policy.Category] = sec
+			sec = &sdkSection{meta: pf.Policy, typed: make(map[models.Language]int)}
+			sections[cat] = sec
 		}
 		for _, r := range pf.Rules {
+			if r.Language != "" {
+				for _, l := range ruleLangs[cat] {
+					if r.AppliesToLanguage(l) {
+						sec.typed[l]++
+					}
+				}
+			}
+			if !ruleLangs.keeps(cat, r) {
+				continue
+			}
 			switch r.Scope {
 			case models.ScopeTool:
 				sec.tools = append(sec.tools, r)
@@ -323,6 +342,16 @@ func GenerateCombined(categories []models.DetectorCategory, policies []rules.Pol
 		}
 		fmt.Fprintf(&b, "---\n\n")
 		fmt.Fprintf(&b, "## %s\n\n", sec.meta.Name)
+		var uncovered []string
+		for _, l := range ruleLangs[cat] {
+			if sec.typed[l] == 0 {
+				uncovered = append(uncovered, languageHeading(l))
+			}
+		}
+		if len(uncovered) > 0 {
+			fmt.Fprintf(&b, "Trustabl has no %s rules for this SDK yet, so only the rules that apply in every language are listed for that code.\n\n",
+				strings.Join(uncovered, " or "))
+		}
 		emitRuleSection(&b, "Tool Rules", sec.tools, models.ScopeTool)
 		emitRuleSection(&b, "Agent Rules", sec.agents, models.ScopeAgent)
 		emitRuleSection(&b, "Subagent Rules", sec.subagents, models.ScopeSubagent)

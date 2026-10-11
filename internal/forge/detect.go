@@ -7,6 +7,7 @@ import (
 
 	"github.com/trustabl/trustabl/internal/ingestion"
 	"github.com/trustabl/trustabl/internal/models"
+	"github.com/trustabl/trustabl/internal/rules"
 )
 
 // depCategoryMap maps dep-file package names (as returned by ingestion.Recon's
@@ -44,6 +45,9 @@ type Detection struct {
 	Categories []models.DetectorCategory // sorted, deduplicated
 	Languages  []models.Language         // tracing languages only, fixed order
 	Pairs      []SDKLanguage             // language order, then category
+	// Unplaced are categories declared in a manifest whose language forge
+	// does not know (composer.json, say), so their languages are incomplete.
+	Unplaced []models.DetectorCategory // sorted, deduplicated
 }
 
 // TracingSelection is what the Runtime Tracing section is generated for. The
@@ -107,6 +111,7 @@ func Detect(ctx context.Context, target string) (Detection, error) {
 
 func detectionFromDeps(deps []models.SDKDep) Detection {
 	cats := make(map[models.DetectorCategory]bool)
+	unplaced := make(map[models.DetectorCategory]bool)
 	langs := make(map[models.Language]bool)
 	pairs := make(map[SDKLanguage]bool)
 	for _, dep := range deps {
@@ -117,18 +122,28 @@ func detectionFromDeps(deps []models.SDKDep) Detection {
 		cats[cat] = true
 		lang, ok := ingestion.ManifestLanguage(dep.Source)
 		if !ok || tracingLanguageRank(lang) < 0 {
+			unplaced[cat] = true
 			continue
 		}
 		langs[lang] = true
 		pairs[SDKLanguage{Category: cat, Language: lang}] = true
 	}
 
-	out := make([]models.DetectorCategory, 0, len(cats))
-	for cat := range cats {
-		out = append(out, cat)
+	return Detection{
+		Categories: sortedCategories(cats),
+		Languages:  orderedLanguages(langs),
+		Pairs:      orderedPairs(pairs),
+		Unplaced:   sortedCategories(unplaced),
+	}
+}
+
+func sortedCategories(set map[models.DetectorCategory]bool) []models.DetectorCategory {
+	out := make([]models.DetectorCategory, 0, len(set))
+	for c := range set {
+		out = append(out, c)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
-	return Detection{Categories: out, Languages: orderedLanguages(langs), Pairs: orderedPairs(pairs)}
+	return out
 }
 
 // DetectCategories returns only the categories from Detect. Returns a sorted,
@@ -173,14 +188,30 @@ func ParseTracingLanguage(s string) (models.Language, bool) {
 	return "", false
 }
 
+// TracingApplies reports whether any category audits agent code, which is
+// what the Runtime Tracing section instruments. Agent Skills (claude_skill)
+// are SKILL.md files, not running agents, so a skill-only selection has none.
+func TracingApplies(categories []models.DetectorCategory) bool {
+	for _, c := range categories {
+		if c != models.CategoryClaudeSkill {
+			return true
+		}
+	}
+	return false
+}
+
 // SelectTracing decides what the Runtime Tracing section covers. Detected
 // pairs are kept as detected, so a repo with SDK A in Python and SDK B in
 // TypeScript never gets A's TypeScript recipe. An explicit value widens the
 // selection only for what detection did not already place: a category with
 // no detected pair pairs with every selected language, and a language that
 // was not detected pairs with every category. Repeating on the command line
-// something detection already found changes nothing.
+// something detection already found changes nothing. When TracingApplies is
+// false the selection is empty, whatever languages were detected or given.
 func SelectTracing(det Detection, categories, explicitCats []models.DetectorCategory, explicitLangs []models.Language) TracingSelection {
+	if !TracingApplies(categories) {
+		return TracingSelection{}
+	}
 	langs := make(map[models.Language]bool)
 	detectedLang := make(map[models.Language]bool)
 	for _, l := range det.Languages {
@@ -216,4 +247,69 @@ func SelectTracing(det Detection, categories, explicitCats []models.DetectorCate
 		}
 	}
 	return TracingSelection{Languages: orderedLanguages(langs), Pairs: orderedPairs(pairs)}
+}
+
+// RuleLanguages lists, per category, every language forge knows the SDK is
+// used in. GenerateCombined drops a rule whose language is not listed, using
+// the scanner's own language gate, so a Go-only ADK repo is not handed Python
+// and TypeScript rules. A category with no entry keeps every rule, and so
+// does a nil RuleLanguages.
+type RuleLanguages map[models.DetectorCategory][]models.Language
+
+// SelectRuleLanguages decides RuleLanguages. It drops rules only when it knows
+// every language a category is used in, so it leaves a category unlisted when
+// one of its manifests has no known language, or when the category comes from
+// --policy alone with no --lang. An explicit --lang adds its language to every
+// listed category; it can only bring rules back, never remove them.
+func SelectRuleLanguages(det Detection, explicitCats []models.DetectorCategory, explicitLangs []models.Language) RuleLanguages {
+	sets := make(map[models.DetectorCategory]map[models.Language]bool)
+	add := func(c models.DetectorCategory, l models.Language) {
+		if sets[c] == nil {
+			sets[c] = make(map[models.Language]bool)
+		}
+		sets[c][l] = true
+	}
+	for _, p := range det.Pairs {
+		add(p.Category, p.Language)
+	}
+	for _, c := range det.Unplaced {
+		delete(sets, c)
+	}
+	unplaced := make(map[models.DetectorCategory]bool, len(det.Unplaced))
+	for _, c := range det.Unplaced {
+		unplaced[c] = true
+	}
+	for _, c := range explicitCats {
+		if sets[c] != nil || unplaced[c] {
+			continue
+		}
+		for _, l := range explicitLangs {
+			add(c, l)
+		}
+	}
+	for _, l := range explicitLangs {
+		for c := range sets {
+			sets[c][l] = true
+		}
+	}
+
+	out := make(RuleLanguages, len(sets))
+	for c, set := range sets {
+		out[c] = orderedLanguages(set)
+	}
+	return out
+}
+
+// keeps reports whether a rule of category cat is emitted.
+func (rl RuleLanguages) keeps(cat models.DetectorCategory, r rules.RuleDef) bool {
+	langs, ok := rl[cat]
+	if !ok {
+		return true
+	}
+	for _, l := range langs {
+		if r.AppliesToLanguage(l) {
+			return true
+		}
+	}
+	return false
 }

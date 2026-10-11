@@ -2,6 +2,9 @@ package forge
 
 import (
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -46,7 +49,7 @@ func allTracingSelection() TracingSelection {
 
 func TestGenerateCombined_NoTracingSelection_OmitsSection(t *testing.T) {
 	policies, stamp := multiSDKFixture(t)
-	got := GenerateCombined(stamp.Categories, policies, stamp, TracingSelection{})
+	got := GenerateCombined(stamp.Categories, policies, stamp, TracingSelection{}, nil)
 	if strings.Contains(got, "## Runtime Tracing") {
 		t.Error("the section must be omitted when no language is selected")
 	}
@@ -55,7 +58,7 @@ func TestGenerateCombined_NoTracingSelection_OmitsSection(t *testing.T) {
 func TestGenerateCombined_UnsupportedLanguage_OmitsSection(t *testing.T) {
 	policies, stamp := multiSDKFixture(t)
 	sel := TracingSelection{Languages: []models.Language{models.LanguageRust}}
-	got := GenerateCombined(stamp.Categories, policies, stamp, sel)
+	got := GenerateCombined(stamp.Categories, policies, stamp, sel, nil)
 	if strings.Contains(got, "## Runtime Tracing") {
 		t.Error("a language with no block must not produce the section")
 	}
@@ -64,7 +67,7 @@ func TestGenerateCombined_UnsupportedLanguage_OmitsSection(t *testing.T) {
 func TestGenerateCombined_Python_EmitsRuntimeTracing(t *testing.T) {
 	policies, stamp := multiSDKFixture(t)
 	sel := TracingSelection{Languages: []models.Language{models.LanguagePython}}
-	got := GenerateCombined(stamp.Categories, policies, stamp, sel)
+	got := GenerateCombined(stamp.Categories, policies, stamp, sel, nil)
 
 	loop := strings.Index(got, "## How to Apply These Constraints")
 	tracing := strings.Index(got, "## Runtime Tracing")
@@ -106,12 +109,12 @@ func TestGenerateCombined_Tracing_InputOrderDoesNotMatter(t *testing.T) {
 		reversed.Pairs = append(reversed.Pairs, all.Pairs[i])
 	}
 
-	a := GenerateCombined(stamp.Categories, policies, stamp, all)
-	b := GenerateCombined(stamp.Categories, policies, stamp, reversed)
+	a := GenerateCombined(stamp.Categories, policies, stamp, all, nil)
+	b := GenerateCombined(stamp.Categories, policies, stamp, reversed, nil)
 	if a != b {
 		t.Errorf("output depends on selection order:\n%s", lineDiff(a, b))
 	}
-	if c := GenerateCombined(stamp.Categories, policies, stamp, all); a != c {
+	if c := GenerateCombined(stamp.Categories, policies, stamp, all, nil); a != c {
 		t.Error("two runs over the same input differ")
 	}
 }
@@ -167,7 +170,7 @@ func TestGenerateCombined_Tracing_GoldenFiles(t *testing.T) {
 	policies, stamp := multiSDKFixture(t)
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := GenerateCombined(stamp.Categories, policies, stamp, c.sel)
+			got := GenerateCombined(stamp.Categories, policies, stamp, c.sel, nil)
 			goldenPath := filepath.Join("..", "..", "testdata", "forge", c.name, "expected", "SKILL.md")
 			if *update {
 				if err := os.MkdirAll(filepath.Dir(goldenPath), 0o755); err != nil {
@@ -214,7 +217,7 @@ func TestGenerateCombined_LanguageBlocksAreIndependent(t *testing.T) {
 	}
 	for _, c := range cases {
 		got := GenerateCombined(stamp.Categories, policies, stamp,
-			TracingSelection{Languages: []models.Language{c.lang}})
+			TracingSelection{Languages: []models.Language{c.lang}}, nil)
 		if !strings.Contains(got, c.present) {
 			t.Errorf("%s: missing %q", c.lang, c.present)
 		}
@@ -279,7 +282,7 @@ func TestGenerateCombined_RecipeOnlyForItsPair(t *testing.T) {
 			{Category: models.CategoryVercelAI, Language: models.LanguageTypeScript},
 		},
 	}
-	got := GenerateCombined(stamp.Categories, policies, stamp, sel)
+	got := GenerateCombined(stamp.Categories, policies, stamp, sel, nil)
 	for _, want := range []string{"OpenAIAgentsInstrumentor", "registerTelemetry"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("missing %q", want)
@@ -465,6 +468,101 @@ func TestTracingAPINames_Complete(t *testing.T) {
 			if !declared[name] {
 				t.Errorf("%s: Step 2 text uses %q, which is not in its APINames", blk.Language, name)
 			}
+		}
+	}
+}
+
+// TestGoogleADKGoRecipe_RunIsPerRun guards the ADK Go labels recipe against
+// teaching the shared-Run defect OBS-009 flags. ADK builds the agent, its
+// tools and its callbacks once, so a Run they close over is shared by every
+// run. The recipe must create the Run only in a per-run function that puts it
+// on a context, and hand that function's result to runner.Run.
+func TestGoogleADKGoRecipe_RunIsPerRun(t *testing.T) {
+	text := tracingText("recipes/google_adk_go_labels.md")
+	blocks := regexp.MustCompile("(?s)```go\n(.*?)```").FindAllStringSubmatch(text, -1)
+	if len(blocks) != 1 {
+		t.Fatalf("want exactly one go block, got %d", len(blocks))
+	}
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "recipe.go", "package recipe\n\n"+blocks[0][1], 0)
+	if err != nil {
+		t.Fatalf("the recipe's Go block must parse: %v", err)
+	}
+
+	isCall := func(n ast.Node, pkg, name string) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return false
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != name {
+			return false
+		}
+		id, ok := sel.X.(*ast.Ident)
+		return ok && (pkg == "" || id.Name == pkg)
+	}
+	calls := func(fn *ast.FuncDecl, pkg, name string) bool {
+		found := false
+		ast.Inspect(fn, func(n ast.Node) bool {
+			found = found || isCall(n, pkg, name)
+			return !found
+		})
+		return found
+	}
+
+	var perRun string
+	for _, d := range file.Decls {
+		fn, ok := d.(*ast.FuncDecl)
+		if !ok || !calls(fn, "otellabels", "NewRun") {
+			continue
+		}
+		if !calls(fn, "context", "WithValue") || calls(fn, "llmagent", "New") || calls(fn, "functiontool", "New") {
+			t.Errorf("%s creates a Run but is not a per-run context function: the agent is built once, so its Run would be shared", fn.Name.Name)
+			continue
+		}
+		perRun = fn.Name.Name
+	}
+	if perRun == "" {
+		t.Fatal("no per-run function creates the Run")
+	}
+
+	// runner.Run must receive the per-run context: r.Run(perRun(ctx), ...).
+	wired := false
+	ast.Inspect(file, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || !isCall(n, "", "Run") || len(call.Args) == 0 {
+			return true
+		}
+		if inner, ok := call.Args[0].(*ast.CallExpr); ok {
+			if id, ok := inner.Fun.(*ast.Ident); ok && id.Name == perRun {
+				wired = true
+			}
+		}
+		return true
+	})
+	if !wired {
+		t.Errorf("runner.Run is never given %s(ctx): the per-run state never reaches the tools and callbacks", perRun)
+	}
+}
+
+// TestLanguageSetup_RegistersProviderGlobally: framework instrumentation
+// starts its spans on the global tracer provider, so a setup that only creates
+// a provider leaves every framework span on the no-op default, and the labels
+// land nowhere.
+func TestLanguageSetup_RegistersProviderGlobally(t *testing.T) {
+	want := map[models.Language]string{
+		models.LanguagePython:     "trace.set_tracer_provider(provider)",
+		models.LanguageTypeScript: "trace.setGlobalTracerProvider(provider)",
+		models.LanguageGo:         "otel.SetTracerProvider(provider)",
+	}
+	for _, blk := range languageBlocks {
+		call, ok := want[blk.Language]
+		if !ok {
+			t.Errorf("%s: no expected global registration call; add one here", blk.Language)
+			continue
+		}
+		if !strings.Contains(tracingText(string(blk.Language)+"_setup.md"), call) {
+			t.Errorf("%s_setup.md must register its provider globally with %s", blk.Language, call)
 		}
 	}
 }

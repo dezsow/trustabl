@@ -33,9 +33,13 @@ packs to include.
 Use --policy to add categories on top of auto-detected ones — useful when a
 new SDK is being introduced to a repo before its first dependency declaration.
 
-Use --lang to add a language for the Runtime Tracing section on top of the
-ones detected from the dependency manifests — useful for a brand-new repo that
-has no manifest yet. Accepted values: python, typescript, go.
+Use --lang to add a language on top of the ones detected from the dependency
+manifests. Accepted values: python, typescript, go. The languages pick the
+Runtime Tracing blocks and filter each SDK's rules to the ones for code in
+those languages. --lang does not select a rule pack, so a brand-new repo with
+no manifest yet needs --policy as well (see the last example). The tracing
+section is left out for claude_skill alone, which covers SKILL.md files
+rather than agent code.
 
 The output is a SKILL.md written to stdout (or --output) that opens with a
 "How to Apply These Constraints" section describing the apply loop. After it
@@ -68,20 +72,14 @@ per detected SDK, with rules ordered by severity.`,
 
 			// parse --policy as comma-separated DetectorCategory values
 			var explicitCats []models.DetectorCategory
-			for _, flag := range policyFlags {
-				for _, part := range strings.Split(flag, ",") {
-					part = strings.TrimSpace(part)
-					if part == "" {
-						continue
-					}
-					if !models.ValidCategory(models.DetectorCategory(part)) {
-						fmt.Fprintf(cmd.ErrOrStderr(),
-							"trustabl forge: unknown policy category %q; accepted values: %v\n",
-							part, models.AllCategories)
-						return exitCodeError{code: 1}
-					}
-					explicitCats = append(explicitCats, models.DetectorCategory(part))
+			for _, part := range flagValues(policyFlags) {
+				if !models.ValidCategory(models.DetectorCategory(part)) {
+					fmt.Fprintf(cmd.ErrOrStderr(),
+						"trustabl forge: unknown policy category %q; accepted values: %v\n",
+						part, models.AllCategories)
+					return exitCodeError{code: 1}
 				}
+				explicitCats = append(explicitCats, models.DetectorCategory(part))
 			}
 
 			explicitLangs, bad := parseForgeLangs(langFlags)
@@ -116,21 +114,29 @@ per detected SDK, with rules ordered by severity.`,
 	return cmd
 }
 
+// flagValues flattens repeatable comma-separated flag values, trimming each
+// and dropping empties, so --policy and --lang parse their input one way.
+func flagValues(flags []string) []string {
+	var out []string
+	for _, flag := range flags {
+		for _, part := range strings.Split(flag, ",") {
+			if part = strings.TrimSpace(part); part != "" {
+				out = append(out, part)
+			}
+		}
+	}
+	return out
+}
+
 // parseForgeLangs parses --lang values. It returns the first unrecognized
 // value as bad, and the languages otherwise.
 func parseForgeLangs(flags []string) (langs []models.Language, bad string) {
-	for _, flag := range flags {
-		for _, part := range strings.Split(flag, ",") {
-			part = strings.TrimSpace(part)
-			if part == "" {
-				continue
-			}
-			lang, ok := forge.ParseTracingLanguage(part)
-			if !ok {
-				return nil, part
-			}
-			langs = append(langs, lang)
+	for _, part := range flagValues(flags) {
+		lang, ok := forge.ParseTracingLanguage(part)
+		if !ok {
+			return nil, part
 		}
+		langs = append(langs, lang)
 	}
 	return langs, ""
 }
@@ -149,19 +155,23 @@ func runForge(cmd *cobra.Command, target string, explicit []models.DetectorCateg
 	categories := forge.MergeCategories(det.Categories, explicit)
 	if len(categories) == 0 {
 		fmt.Fprintf(cmd.ErrOrStderr(),
-			"trustabl forge: no SDKs detected in %q and no --policy specified\n"+
-				"  run 'trustabl forge --policy <category>' to specify one explicitly\n"+
+			"trustabl forge: no SDKs detected in %q and no --policy specified\n", target)
+		if len(explicitLangs) > 0 {
+			fmt.Fprintf(cmd.ErrOrStderr(),
+				"  --lang adds a language; it does not select a rule pack\n")
+		}
+		fmt.Fprintf(cmd.ErrOrStderr(),
+			"  run 'trustabl forge --policy <category>' to specify one explicitly\n"+
 				"  accepted categories: %v\n",
-			target, models.AllCategories)
+			models.AllCategories)
 		return exitCodeError{code: 1}
 	}
 
 	tracing := forge.SelectTracing(det, categories, explicit, explicitLangs)
-	if len(tracing.Languages) == 0 {
+	ruleLangs := forge.SelectRuleLanguages(det, explicit, explicitLangs)
+	if note := forgeTracingNote(categories, tracing); note != "" {
 		// stderr only: stdout carries the generated skill.
-		fmt.Fprintf(cmd.ErrOrStderr(),
-			"trustabl forge: no supported language detected (python, typescript, go); "+
-				"the Runtime Tracing section is omitted — pass --lang to add one\n")
+		fmt.Fprintln(cmd.ErrOrStderr(), note)
 	}
 
 	// Step 3: resolve rules
@@ -184,12 +194,24 @@ func runForge(cmd *cobra.Command, target string, explicit []models.DetectorCateg
 	stamp := buildForgeStamp(time.Now().Format("2006-01-02"), res.SHA, res.SchemaVersion, categories)
 
 	// Step 5: generate and emit
-	content := forge.GenerateCombined(categories, policies, stamp, tracing)
+	content := forge.GenerateCombined(categories, policies, stamp, tracing, ruleLangs)
 	if output == "" {
 		fmt.Fprint(cmd.OutOrStdout(), content)
 		return nil
 	}
 	return os.WriteFile(output, []byte(content), 0o644)
+}
+
+// forgeTracingNote returns the stderr note for a Runtime Tracing section left
+// out for want of a language, or "" when there is nothing to say. A
+// skill-only selection gets no note: it has no agent code to trace, so
+// suggesting --lang would only add an unrelated section.
+func forgeTracingNote(categories []models.DetectorCategory, sel forge.TracingSelection) string {
+	if len(sel.Languages) > 0 || !forge.TracingApplies(categories) {
+		return ""
+	}
+	return "trustabl forge: no supported language detected (python, typescript, go); " +
+		"the Runtime Tracing section is omitted — pass --lang to add one"
 }
 
 // buildForgeStamp assembles the passive watermark stamped into a generated

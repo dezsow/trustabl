@@ -11,6 +11,7 @@ go	MarkToolSpan
 go	NewRun
 go	NextStep
 go	Read
+go	Run
 go	RunID
 go	Timeout
 go	ToolCall

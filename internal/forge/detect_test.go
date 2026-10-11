@@ -2,6 +2,7 @@ package forge
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -241,7 +242,8 @@ func TestSelectTracing_ExplicitCategoryAppliesToEveryLanguage(t *testing.T) {
 }
 
 func TestSelectTracing_LanguagesInFixedOrder(t *testing.T) {
-	sel := SelectTracing(Detection{}, nil, nil,
+	cats := []models.DetectorCategory{models.CategoryMCP}
+	sel := SelectTracing(Detection{}, cats, cats,
 		[]models.Language{models.LanguageGo, models.LanguagePython, models.LanguageGo})
 	want := []models.Language{models.LanguagePython, models.LanguageGo}
 	if len(sel.Languages) != 2 || sel.Languages[0] != want[0] || sel.Languages[1] != want[1] {
@@ -299,5 +301,106 @@ func TestSelectTracing_NewLangStillWidens(t *testing.T) {
 	}
 	if found != 2 || len(sel.Pairs) != 4 {
 		t.Errorf("Pairs = %v, want the two detected pairs plus both categories in go", sel.Pairs)
+	}
+}
+
+func TestSelectTracing_SkillOnlySelectsNothing(t *testing.T) {
+	// Agent Skills are SKILL.md files, not running agents: no tracing section,
+	// even when --lang names a language.
+	cats := []models.DetectorCategory{models.CategoryClaudeSkill}
+	sel := SelectTracing(Detection{}, cats, cats, []models.Language{models.LanguagePython})
+	if len(sel.Languages) != 0 || len(sel.Pairs) != 0 {
+		t.Errorf("SelectTracing = %+v, want the zero selection for claude_skill only", sel)
+	}
+}
+
+func TestTracingApplies(t *testing.T) {
+	cases := []struct {
+		cats []models.DetectorCategory
+		want bool
+	}{
+		{nil, false},
+		{[]models.DetectorCategory{models.CategoryClaudeSkill}, false},
+		{[]models.DetectorCategory{models.CategoryClaudeSkill, models.CategoryMCP}, true},
+		{[]models.DetectorCategory{models.CategoryObservability}, true},
+	}
+	for _, c := range cases {
+		if got := TracingApplies(c.cats); got != c.want {
+			t.Errorf("TracingApplies(%v) = %v, want %v", c.cats, got, c.want)
+		}
+	}
+}
+
+func TestDetect_UnknownManifestIsUnplaced(t *testing.T) {
+	dir := t.TempDir()
+	// MCP declared in Go and in PHP: placed in Go, and also unplaced.
+	writeManifest(t, dir, "go.mod", "module x\n\nrequire github.com/modelcontextprotocol/go-sdk v1.0.0\n")
+	writeManifest(t, dir, "composer.json", `{"require":{"mcp/sdk":"^1.0"}}`)
+
+	det, err := Detect(context.Background(), dir)
+	if err != nil {
+		t.Fatalf("Detect: %v", err)
+	}
+	want := SDKLanguage{Category: models.CategoryMCP, Language: models.LanguageGo}
+	if len(det.Pairs) != 1 || det.Pairs[0] != want {
+		t.Errorf("Pairs = %v, want [%v]", det.Pairs, want)
+	}
+	if len(det.Unplaced) != 1 || det.Unplaced[0] != models.CategoryMCP {
+		t.Errorf("Unplaced = %v, want [mcp]: composer.json has no known language", det.Unplaced)
+	}
+}
+
+func TestSelectRuleLanguages(t *testing.T) {
+	py, ts, golang := models.LanguagePython, models.LanguageTypeScript, models.LanguageGo
+	adk, mcp, oai := models.CategoryGoogleADK, models.CategoryMCP, models.CategoryOpenAISDK
+	cases := []struct {
+		name  string
+		det   Detection
+		cats  []models.DetectorCategory
+		langs []models.Language
+		want  RuleLanguages
+	}{
+		{
+			name: "go-only ADK repo keeps Go rules only",
+			det:  Detection{Categories: []models.DetectorCategory{adk}, Pairs: []SDKLanguage{{adk, golang}}},
+			want: RuleLanguages{adk: {golang}},
+		},
+		{
+			name: "a manifest of unknown language leaves the category unfiltered",
+			det: Detection{Categories: []models.DetectorCategory{mcp},
+				Pairs: []SDKLanguage{{mcp, py}}, Unplaced: []models.DetectorCategory{mcp}},
+			want: RuleLanguages{},
+		},
+		{
+			name: "--policy alone leaves the category unfiltered",
+			cats: []models.DetectorCategory{adk},
+			want: RuleLanguages{},
+		},
+		{
+			name:  "--policy with --lang in an empty repo filters to that language",
+			cats:  []models.DetectorCategory{adk},
+			langs: []models.Language{golang},
+			want:  RuleLanguages{adk: {golang}},
+		},
+		{
+			name:  "--lang widens every detected category",
+			det:   Detection{Categories: []models.DetectorCategory{oai}, Pairs: []SDKLanguage{{oai, py}}},
+			langs: []models.Language{ts},
+			want:  RuleLanguages{oai: {py, ts}},
+		},
+		{
+			name: "--policy repeating a detected category does not change it",
+			det:  Detection{Categories: []models.DetectorCategory{oai}, Pairs: []SDKLanguage{{oai, py}}},
+			cats: []models.DetectorCategory{oai},
+			want: RuleLanguages{oai: {py}},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := SelectRuleLanguages(c.det, c.cats, c.langs)
+			if fmt.Sprint(got) != fmt.Sprint(c.want) {
+				t.Errorf("SelectRuleLanguages = %v, want %v", got, c.want)
+			}
+		})
 	}
 }

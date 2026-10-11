@@ -1065,9 +1065,15 @@ via `--policy`.
 is declared in: `pyproject.toml`, `requirements.txt`, `Pipfile` and
 `poetry.lock` mean Python, `package.json` means TypeScript, `go.mod` means Go.
 That selects the language blocks of the Runtime Tracing section. Pass
-`--lang python,typescript,go` to add a language, for example in a brand-new
-repo with no manifest yet. A Go repo that declares Google ADK is detected, and
-the `google_adk` rule sections it gets are written for Python and TypeScript.
+`--lang python,typescript,go` to add a language. `--lang` does not select a
+rule pack, so a brand-new repo with no manifest yet needs `--policy` as well
+(see the last example below). The same languages filter
+the rule sections: an SDK declared only in `go.mod` gets only its Go rules
+and the rules that apply in every language, so a Go-only Google ADK repo gets
+the Go tracing recipe, the language-independent ADK rules, and a note that no
+Go-specific ADK rules exist yet. A category given only through `--policy`, or
+also declared in a manifest forge cannot place (such as `composer.json`), keeps
+all of its rules.
 
 ```bash
 # Auto-detect SDKs from the current directory
@@ -1135,7 +1141,8 @@ Multiple categories are comma-separated: `--policy openai_sdk,mcp`.
   LangChain / LangGraph (Python), CrewAI (Python), AutoGen (Python), and MCP
   client sessions (Python). Other frameworks get the language block only.
   Non-OpenTelemetry tracing stacks are not covered. The section is left out
-  when no supported language is found.
+  when no supported language is found, and when `claude_skill` is the only
+  category (Agent Skills are `SKILL.md` files, not agent code to trace).
 - One `## SDK Name` section per detected SDK, each containing `### Tool Rules`,
   `### Agent Rules`, `### Subagent Rules`, `### Repo Rules`, and
   `### Skill Rules` subsections (empty subsections are omitted).

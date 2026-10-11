@@ -26,8 +26,19 @@ type languageBlock struct {
 	Language models.Language
 	Heading  string
 	// APINames are the agent-reliability-otel-labels identifiers the block's text uses.
-	// scripts/check-otel-sync.sh checks each one still exists in the binding.
+	// scripts/check-otel-sync.sh checks each one is still declared in the binding.
 	APINames []string
+}
+
+// languageHeading is the display name of a language: its block heading when it
+// has one, else the bare identifier.
+func languageHeading(l models.Language) string {
+	for _, blk := range languageBlocks {
+		if blk.Language == l {
+			return blk.Heading
+		}
+	}
+	return string(l)
 }
 
 // frameworkRecipe is a verified per-framework delta on a language block. Its
@@ -61,7 +72,7 @@ var languageBlocks = []languageBlock{
 		Language: models.LanguageGo,
 		Heading:  "Go",
 		APINames: []string{
-			"NewRun", "MarkStart", "NextStep", "RunID", "CanonicalFP", "ToolCall",
+			"Run", "NewRun", "MarkStart", "NextStep", "RunID", "CanonicalFP", "ToolCall",
 			"MarkToolSpan", "MarkRunEnd", "MarkHandoff", "BindAuthority", "FinalAnswer",
 			"Read", "Error", "Timeout", "Class4xx", "Class5xx",
 		},
@@ -99,7 +110,13 @@ func recipeFile(r frameworkRecipe, part string) string {
 // writeText emits one text file followed by a blank line. A missing file
 // emits nothing.
 func writeText(b *strings.Builder, name string) {
-	if text := tracingText(name); text != "" {
+	writeLoaded(b, tracingText(name))
+}
+
+// writeLoaded emits text already read with tracingText, followed by a blank
+// line. Empty text emits nothing.
+func writeLoaded(b *strings.Builder, text string) {
+	if text != "" {
 		fmt.Fprintf(b, "%s\n\n", sanitizeEmittedText(text))
 	}
 }
@@ -120,15 +137,16 @@ func selectedBlocks(sel TracingSelection) []languageBlock {
 	return out
 }
 
-func selectedRecipes(sel TracingSelection, lang models.Language) []frameworkRecipe {
+// selectedRecipes groups the selected framework recipes by language.
+func selectedRecipes(sel TracingSelection) map[models.Language][]frameworkRecipe {
 	want := make(map[SDKLanguage]bool, len(sel.Pairs))
 	for _, p := range sel.Pairs {
 		want[p] = true
 	}
-	var out []frameworkRecipe
+	out := make(map[models.Language][]frameworkRecipe)
 	for _, r := range frameworkRecipes {
-		if r.Language == lang && want[SDKLanguage{Category: r.Category, Language: r.Language}] {
-			out = append(out, r)
+		if want[SDKLanguage{Category: r.Category, Language: r.Language}] {
+			out[r.Language] = append(out[r.Language], r)
 		}
 	}
 	return out
@@ -143,6 +161,7 @@ func emitRuntimeTracing(b *strings.Builder, sel TracingSelection) {
 	if len(blocks) == 0 {
 		return
 	}
+	recipes := selectedRecipes(sel)
 
 	fmt.Fprintf(b, "## Runtime Tracing\n\n")
 	writeText(b, "intro.md")
@@ -152,7 +171,7 @@ func emitRuntimeTracing(b *strings.Builder, sel TracingSelection) {
 	for _, blk := range blocks {
 		fmt.Fprintf(b, "#### %s\n\n", blk.Heading)
 		writeText(b, string(blk.Language)+"_setup.md")
-		for _, r := range selectedRecipes(sel, blk.Language) {
+		for _, r := range recipes[blk.Language] {
 			fmt.Fprintf(b, "##### %s\n\n", r.Heading)
 			writeText(b, recipeFile(r, "setup"))
 		}
@@ -165,12 +184,13 @@ func emitRuntimeTracing(b *strings.Builder, sel TracingSelection) {
 	for _, blk := range blocks {
 		fmt.Fprintf(b, "#### %s\n\n", blk.Heading)
 		writeText(b, string(blk.Language)+"_labels.md")
-		for _, r := range selectedRecipes(sel, blk.Language) {
-			if tracingText(recipeFile(r, "labels")) == "" {
+		for _, r := range recipes[blk.Language] {
+			text := tracingText(recipeFile(r, "labels"))
+			if text == "" {
 				continue
 			}
 			fmt.Fprintf(b, "##### %s\n\n", r.Heading)
-			writeText(b, recipeFile(r, "labels"))
+			writeLoaded(b, text)
 		}
 	}
 
@@ -182,7 +202,7 @@ func emitRuntimeTracing(b *strings.Builder, sel TracingSelection) {
 	for _, blk := range blocks {
 		fmt.Fprintf(b, "%s:\n\n", blk.Heading)
 		writeText(b, string(blk.Language)+"_traps.md")
-		for _, r := range selectedRecipes(sel, blk.Language) {
+		for _, r := range recipes[blk.Language] {
 			writeText(b, recipeFile(r, "check"))
 		}
 	}
