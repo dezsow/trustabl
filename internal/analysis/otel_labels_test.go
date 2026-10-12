@@ -1,0 +1,323 @@
+package analysis_test
+
+import (
+	"encoding/json"
+	"os"
+	"slices"
+	"testing"
+
+	"github.com/trustabl/trustabl/internal/analysis"
+	"github.com/trustabl/trustabl/internal/models"
+)
+
+// otelLabelsKinds returns the kinds of the signals in order, for compact
+// assertions.
+func otelLabelsKinds(sigs []models.OtelLabelsSignal) []models.OtelLabelsSignalKind {
+	out := make([]models.OtelLabelsSignalKind, 0, len(sigs))
+	for _, s := range sigs {
+		out = append(out, s.Kind)
+	}
+	return out
+}
+
+func hasOtelLabelsKind(sigs []models.OtelLabelsSignal, kind models.OtelLabelsSignalKind) bool {
+	for _, s := range sigs {
+		if s.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// An import proves the library is present and nothing more: it must not be
+// recorded as a started run or a labelled span. That gap is what OBS-007 fires on.
+func TestDiscoverOtelLabels_PythonImportOnly(t *testing.T) {
+	src := `from agent_reliability_otel_labels import Run
+
+def handler():
+    return 1
+`
+	pf := parsePyFile(t, "app.py", src)
+	got := analysis.DiscoverOtelLabels([]analysis.ParsedFile{pf})
+	if len(got) != 1 {
+		t.Fatalf("got %d signals %+v, want 1", len(got), got)
+	}
+	if got[0].Kind != models.OtelLabelsImport {
+		t.Errorf("kind: got %q, want import", got[0].Kind)
+	}
+	if got[0].File != "app.py" || got[0].Language != models.LanguagePython {
+		t.Errorf("got file %q language %q, want app.py python", got[0].File, got[0].Language)
+	}
+}
+
+func TestDiscoverOtelLabels_PythonFullUse(t *testing.T) {
+	src := `from opentelemetry import trace
+from agent_reliability_otel_labels import Run, mark_run_end, mark_tool_span
+
+def run_agent(prompt):
+    run = Run()
+    with tracer.start_as_current_span("invoke_agent") as root:
+        run.mark_start(root)
+        span = trace.get_current_span()
+        mark_tool_span(span, args={}, result=None, attempt=1)
+        mark_run_end(root, exit_reason="final_answer")
+`
+	pf := parsePyFile(t, "agent.py", src)
+	got := analysis.DiscoverOtelLabels([]analysis.ParsedFile{pf})
+	want := []models.OtelLabelsSignalKind{
+		models.OtelLabelsImport,
+		models.OtelLabelsRunStart,
+		models.OtelLabelsToolSpan,
+		models.OtelLabelsRunEnd,
+	}
+	kinds := otelLabelsKinds(got)
+	if len(kinds) != len(want) {
+		t.Fatalf("got kinds %v, want %v", kinds, want)
+	}
+	for i := range want {
+		if kinds[i] != want[i] {
+			t.Errorf("signal %d: got %q, want %q", i, kinds[i], want[i])
+		}
+	}
+	if got[1].StartLine != 7 {
+		t.Errorf("run_start line: got %d, want 7", got[1].StartLine)
+	}
+}
+
+// mark_run_end and mark_tool_span are plausible names for a project's own
+// helpers. With no agent_reliability_otel_labels import anywhere in the repo they are not
+// evidence of the library.
+func TestDiscoverOtelLabels_CallsWithoutAnyImportAreIgnored(t *testing.T) {
+	src := `def mark_run_end(span, exit_reason):
+    return None
+
+mark_run_end(None, exit_reason="error")
+`
+	pf := parsePyFile(t, "helpers.py", src)
+	got := analysis.DiscoverOtelLabels([]analysis.ParsedFile{pf})
+	if len(got) != 0 {
+		t.Fatalf("got %+v, want no signals without a agent_reliability_otel_labels import", got)
+	}
+}
+
+// A Run is routinely built in one module and handed to another, so the file
+// that calls run.mark_start(root) need not import agent_reliability_otel_labels itself. The
+// import gate is repo-wide for that reason.
+func TestDiscoverOtelLabels_RunStartInFileThatReceivesTheRun(t *testing.T) {
+	factory := parsePyFile(t, "factory.py", `from agent_reliability_otel_labels import Run
+
+def new_run():
+    return Run()
+`)
+	runner := parsePyFile(t, "runner.py", `def start(run, root):
+    run.mark_start(root)
+`)
+	got := analysis.DiscoverOtelLabels([]analysis.ParsedFile{runner, factory})
+	var start *models.OtelLabelsSignal
+	for i := range got {
+		if got[i].Kind == models.OtelLabelsRunStart {
+			start = &got[i]
+		}
+	}
+	if start == nil {
+		t.Fatalf("no run_start signal in %+v", got)
+	}
+	if start.File != "runner.py" {
+		t.Errorf("run_start file: got %q, want runner.py", start.File)
+	}
+}
+
+// mark_start is a method on Run. A receiver-less mark_start(...) is some other
+// function and must not read as a started run.
+func TestDiscoverOtelLabels_BareMarkStartIsNotARunStart(t *testing.T) {
+	src := `from agent_reliability_otel_labels import Run
+
+def mark_start(x):
+    return x
+
+mark_start(1)
+`
+	pf := parsePyFile(t, "app.py", src)
+	got := analysis.DiscoverOtelLabels([]analysis.ParsedFile{pf})
+	if hasOtelLabelsKind(got, models.OtelLabelsRunStart) {
+		t.Fatalf("receiver-less mark_start() must not be a run_start: %+v", got)
+	}
+}
+
+func TestDiscoverOtelLabels_TypeScriptFullUse(t *testing.T) {
+	src := `import { Run, markRunEnd, markToolSpan } from "@trustabl/agent-reliability-otel-labels";
+
+export async function runAgent() {
+  const run = new Run();
+  await tracer.startActiveSpan("invoke_agent", async (root) => {
+    run.markStart(root);
+    markToolSpan(span, { args, result, attempt: 1 });
+    markRunEnd(root, "final_answer");
+    root.end();
+  });
+}
+`
+	pf := parseTSForTest(t, "agent.ts", src)
+	got := analysis.DiscoverOtelLabels([]analysis.ParsedFile{pf})
+	for _, kind := range []models.OtelLabelsSignalKind{
+		models.OtelLabelsImport,
+		models.OtelLabelsRunStart,
+		models.OtelLabelsToolSpan,
+		models.OtelLabelsRunEnd,
+	} {
+		if !hasOtelLabelsKind(got, kind) {
+			t.Errorf("no %q signal in %+v", kind, got)
+		}
+	}
+	for _, s := range got {
+		if s.Language != models.LanguageTypeScript {
+			t.Errorf("language: got %q, want typescript (%+v)", s.Language, s)
+		}
+	}
+}
+
+// Report output must be byte-stable: signals are ordered by file then line
+// whatever order the parsed files arrive in.
+func TestDiscoverOtelLabels_SortedByFileThenLine(t *testing.T) {
+	b := parsePyFile(t, "b.py", `from agent_reliability_otel_labels import mark_run_end
+
+mark_run_end(root, exit_reason="error")
+`)
+	a := parsePyFile(t, "a.py", `from agent_reliability_otel_labels import mark_run_end
+
+mark_run_end(root, exit_reason="error")
+`)
+	got := analysis.DiscoverOtelLabels([]analysis.ParsedFile{b, a})
+	if len(got) != 4 {
+		t.Fatalf("got %d signals %+v, want 4", len(got), got)
+	}
+	wantFiles := []string{"a.py", "a.py", "b.py", "b.py"}
+	for i, f := range wantFiles {
+		if got[i].File != f {
+			t.Errorf("signal %d file: got %q, want %q", i, got[i].File, f)
+		}
+	}
+	if got[0].StartLine > got[1].StartLine {
+		t.Errorf("signals within a file must be ordered by line: %+v", got[:2])
+	}
+}
+
+// A renamed import must still be followed: `mts(...)` is mark_tool_span.
+func TestDiscoverOtelLabels_FollowsPythonAliases(t *testing.T) {
+	src := `from agent_reliability_otel_labels import mark_tool_span as mts, mark_run_end as end_run
+
+def tool(span, root):
+    mts(span, args={}, result=None, attempt=n)
+    end_run(root, exit_reason=reason)
+`
+	got := analysis.DiscoverOtelLabels([]analysis.ParsedFile{parsePyFile(t, "agent.py", src)})
+	if !hasOtelLabelsKind(got, models.OtelLabelsToolSpan) {
+		t.Errorf("aliased mark_tool_span not recognised: %+v", got)
+	}
+	if !hasOtelLabelsKind(got, models.OtelLabelsRunEnd) {
+		t.Errorf("aliased mark_run_end not recognised: %+v", got)
+	}
+}
+
+func TestDiscoverOtelLabels_FollowsTSAliases(t *testing.T) {
+	src := `import { markToolSpan as label } from "@trustabl/agent-reliability-otel-labels";
+
+export function tool(span: any, n: number) {
+  label(span, { args: {}, result: null, attempt: n });
+}
+`
+	got := analysis.DiscoverOtelLabels([]analysis.ParsedFile{parseTSForTest(t, "agent.ts", src)})
+	if !hasOtelLabelsKind(got, models.OtelLabelsToolSpan) {
+		t.Errorf("aliased markToolSpan not recognised: %+v", got)
+	}
+}
+
+// Every signal from a test file carries TestOrigin (spec D8); production
+// files do not.
+func TestDiscoverOtelLabels_StampsTestOrigin(t *testing.T) {
+	src := `from agent_reliability_otel_labels import mark_run_end
+
+def end(root):
+    mark_run_end(root, exit_reason="error")
+`
+	got := analysis.DiscoverOtelLabels([]analysis.ParsedFile{
+		parsePyFile(t, "tests/test_agent.py", src),
+		parsePyFile(t, "app/agent.py", src),
+	})
+	if len(got) == 0 {
+		t.Fatal("no signals")
+	}
+	for _, s := range got {
+		want := s.File == "tests/test_agent.py"
+		if s.TestOrigin != want {
+			t.Errorf("%s:%d %s: TestOrigin = %v, want %v", s.File, s.StartLine, s.Kind, s.TestOrigin, want)
+		}
+	}
+}
+
+func attrKeys(sigs []models.OtelLabelsSignal) []string {
+	var out []string
+	for _, s := range sigs {
+		if s.Kind == models.OtelLabelsAttrLiteral {
+			out = append(out, s.Key)
+		}
+	}
+	return out
+}
+
+// Labels written by hand, with no library import, are still labels.
+func TestDiscoverOtelLabels_HandWrittenKeys(t *testing.T) {
+	py := `def label(span, root):
+    span.set_attribute("trustabl.tool.input_fp", fp)
+    root.set_attributes({"trustabl.run_id": rid, "trustabl.exit_reason": "error", "other.key": 1})
+`
+	ts := `export function label(span: any, root: any) {
+  span.setAttribute("trustabl.tool.attempt", 2);
+  root.setAttributes({ "trustabl.run_id": rid });
+}
+`
+	got := attrKeys(analysis.DiscoverOtelLabels([]analysis.ParsedFile{
+		parsePyFile(t, "agent.py", py),
+		parseTSForTest(t, "agent.ts", ts),
+	}))
+	want := []string{
+		"trustabl.tool.input_fp", "trustabl.exit_reason", "trustabl.run_id",
+		"trustabl.tool.attempt", "trustabl.run_id",
+	}
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Errorf("got keys %v, want %v", got, want)
+	}
+}
+
+// A key that is never written to a span is not a label: a dashboard query, a
+// constants module, a vendored copy of the library's keys.py.
+func TestDiscoverOtelLabels_BareKeyLiteralIsNotALabel(t *testing.T) {
+	src := `RUN_ID = "trustabl.run_id"
+QUERY = "SELECT * FROM spans WHERE attributes['trustabl.exit_reason'] = 'error'"
+lookup(span.attributes["trustabl.tool.attempt"])
+`
+	if got := attrKeys(analysis.DiscoverOtelLabels([]analysis.ParsedFile{parsePyFile(t, "dash.py", src)})); len(got) != 0 {
+		t.Errorf("bare literals recorded as labels: %v", got)
+	}
+}
+
+// The engine's key table must match the vendored key manifest of the library.
+func TestOtelLabelsKeys_MatchVendoredManifest(t *testing.T) {
+	raw, err := os.ReadFile("../../testdata/forge/otel/otel-spec-keys.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest struct {
+		Attributes []string `json:"attributes"`
+	}
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	want := slices.Clone(manifest.Attributes)
+	slices.Sort(want)
+	if got := analysis.OtelLabelsAttributeKeys(); !slices.Equal(got, want) {
+		t.Errorf("engine keys %v, manifest attributes %v", got, want)
+	}
+}

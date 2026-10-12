@@ -350,7 +350,7 @@ When changing a rule (add / remove / edit severity, confidence, match, text):
 6. Commit and push the rules repo **and** the rulebook (the user pushes engine
    commits manually; confirm before pushing any of the three).
 
-> **In-memory LangGraph checkpointer on a server path (2026-10-08, `schema_version` 20 → 21):** one rule, **LC-116** (high, 0.6, agent
+> **In-memory LangGraph checkpointer on a server path (2026-10-08, `schema_version` 21 → 22):** one rule, **LC-116** (high, 0.6, agent
 > scope, Python; `applies_to: [langchain_state_graph, langchain_agent]`): a graph whose `checkpointer=` is `MemorySaver` / `InMemorySaver`
 > and that is run from a FastAPI / Flask / Celery / Dramatiq entrypoint, silent when the repo ships a `langgraph.json`. New predicates
 > `agent_checkpointer_in_memory` and `agent_server_reachable` (the first consumer of #244's `ServerReachable` stamp); new in-memory
@@ -379,6 +379,17 @@ When changing a rule (add / remove / edit severity, confidence, match, text):
 > **rank 2** (required span attributes — the SDK or instrumentor writes them, so a well-instrumented repo has no literals to find, and the
 > OTel GenAI semconv is still Development with renamed keys), and **rank 4** (run-level correlation id — session / `group_id` — needs a
 > run-call kwarg predicate, tracked with the HTTP-entrypoint design ticket). See `COVERAGE.md`.
+>
+> **agent-reliability-otel-labels batch (2026-10-04, `schema_version` 20 → 21):** the fixture now holds **333** rules
+> (330 + 3; re-derive, do not trust this figure). Built in parallel with the HTTPS-only batch, which had already taken
+> 19 → 20, so this batch takes 21. **OBS-006** / **OBS-007** / **OBS-008** are a mutually exclusive
+> ladder over `agent-reliability-otel-labels` (not installed → installed but no `mark_start` → run started but no labels), each gated on
+> `repo_observability_initialized: true`. They read a new `OtelLabelsSignal` inventory slice and
+> `RepoProfile.OtelLabelsDeclaredIn`, kept apart from `ObservabilitySignals` / `ObsDeps` so the library cannot satisfy
+> its own prerequisite. Deliberately **not** built: the correctness checks (a `Run` at module scope, `mark_tool_span`
+> outside `finally`, a constant `attempt`, a `side_effect` that contradicts the tool body, handoffs with no
+> `mark_handoff`, run end on the success path only) and Go-binding inspection. `OBS-004` is reserved by the observability
+> design for the first runtime rule, so these start at `OBS-006`.
 >
 > **P0 fetch HTTPS-only batch (2026-10-02, `schema_version` 19 → 20):** new tool-scope predicate `has_unpinned_scheme_url_call` and 14 rules (**CSDK-024/025**, **OAI-032/033**, **MCP-031/032**, **ADK-022/023**, **LC-026/027**, **CREW-015**, **PYD-015**, **AG2-022**, **VAI-021**), one per SSRF rule, each firing only once the SSRF sibling's allow-list credit applies and the URL scheme is neither pinned to a literal `https://` nor checked. The fixture now holds **330** rules (316 + 14; re-derive, do not trust this figure). Not built: LangGraph nodes, `raw_llm_sdk`, a Pydantic `WebFetchTool` `allowed_domains` rule (Anthropic-only option). PYD-103's fix text gained an `allowed_domains` caveat. Rulebook docs live in the nine `docs/Policy/*/ssrf.md` files plus `openai_sdk/network.md`.
 >

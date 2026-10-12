@@ -1244,3 +1244,131 @@ func TestScan_RunCallWallClock_ADKAndAutoGen(t *testing.T) {
 		})
 	}
 }
+
+// TestScan_OtelLabelsLadder runs real Python source through the full scanner
+// for the OBS-006..008 ladder. The per-rule cases in policies_test.go feed
+// hand-built inventories, so they cannot catch recon or discovery failing to
+// produce the facts these rules read; this does. Exactly one rung fires per
+// repo, and none fires once the library is fully used or when the repo has no
+// tracing to label.
+func TestScan_OtelLabelsLadder(t *testing.T) {
+	const tracing = `from agents import Agent, function_tool
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+
+trace.set_tracer_provider(TracerProvider())
+tracer = trace.get_tracer(__name__)
+
+
+@function_tool
+def search_flights(origin: str) -> str:
+    """Search flights from an airport."""
+    return origin
+
+
+agent = Agent(name="travel-booker", tools=[search_flights])
+`
+	cases := []struct {
+		name string
+		deps string
+		src  string
+		want []string
+	}{
+		{
+			name: "instrumented, no agent-reliability-otel-labels",
+			deps: `"openai-agents", "opentelemetry-sdk"`,
+			src:  tracing,
+			want: []string{"OBS-006"},
+		},
+		{
+			name: "declared but no run started",
+			deps: `"openai-agents", "opentelemetry-sdk", "agent-reliability-otel-labels"`,
+			src:  tracing,
+			want: []string{"OBS-007"},
+		},
+		{
+			name: "run started but nothing labelled",
+			deps: `"openai-agents", "opentelemetry-sdk", "agent-reliability-otel-labels"`,
+			src: tracing + `
+from agent_reliability_otel_labels import Run
+
+
+def run_agent(prompt):
+    run = Run()
+    with tracer.start_as_current_span("invoke_agent") as root:
+        run.mark_start(root)
+        return prompt
+`,
+			want: []string{"OBS-008"},
+		},
+		{
+			name: "fully labelled",
+			deps: `"openai-agents", "opentelemetry-sdk", "agent-reliability-otel-labels"`,
+			src: tracing + `
+from agent_reliability_otel_labels import Run, mark_run_end, mark_tool_span
+
+
+def run_agent(prompt):
+    run = Run()
+    with tracer.start_as_current_span("invoke_agent") as root:
+        run.mark_start(root)
+        try:
+            return prompt
+        finally:
+            mark_tool_span(trace.get_current_span(), args={}, result=None,
+                           attempt=1, step_index=run.next_step(), run_id=run.run_id)
+            mark_run_end(root, exit_reason="final_answer")
+`,
+			want: nil,
+		},
+		{
+			name: "labels written by hand, no library",
+			deps: `"openai-agents", "opentelemetry-sdk"`,
+			src: tracing + `
+
+def run_agent(prompt):
+    with tracer.start_as_current_span("invoke_agent") as root:
+        root.set_attribute("trustabl.run_id", "r-1")
+        with tracer.start_as_current_span("execute_tool") as span:
+            span.set_attribute("trustabl.tool.input_fp", "abc")
+        root.set_attribute("trustabl.exit_reason", "final_answer")
+`,
+			want: nil,
+		},
+		{
+			name: "no tracing at all",
+			deps: `"openai-agents"`,
+			src: `from agents import Agent
+
+agent = Agent(name="travel-booker")
+`,
+			want: nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			manifest := "[project]\nname = \"f\"\ndependencies = [" + tc.deps + "]\n"
+			if err := os.WriteFile(filepath.Join(dir, "pyproject.toml"), []byte(manifest), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "agent.py"), []byte(tc.src), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			res, err := scanner.Run(scanner.Config{Target: dir, RulesFS: rulesFixture(t)})
+			if err != nil {
+				t.Fatalf("scanner.Run: %v", err)
+			}
+			var got []string
+			for _, f := range res.Findings {
+				switch f.RuleID {
+				case "OBS-006", "OBS-007", "OBS-008":
+					got = append(got, f.RuleID)
+				}
+			}
+			if strings.Join(got, ",") != strings.Join(tc.want, ",") {
+				t.Errorf("agent-reliability-otel-labels findings: got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

@@ -37,6 +37,12 @@ func languageGateOK(ruleLang, defLang models.Language) bool {
 	return models.IsTSOrJS(ruleLang) && models.IsTSOrJS(defLang)
 }
 
+// AppliesToLanguage reports whether the scanner's language gate lets r fire on
+// code in lang. A rule with no language applies to every language.
+func (r RuleDef) AppliesToLanguage(lang models.Language) bool {
+	return languageGateOK(r.Language, lang)
+}
+
 // toolRuleDetector adapts a tool-scoped RuleDef into a ToolDetector.
 type toolRuleDetector struct{ rule RuleDef }
 
