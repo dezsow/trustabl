@@ -350,6 +350,12 @@ When changing a rule (add / remove / edit severity, confidence, match, text):
 6. Commit and push the rules repo **and** the rulebook (the user pushes engine
    commits manually; confirm before pushing any of the three).
 
+> **Pre-trust agent config (2026-10-12, `schema_version` 20 → 21; +5 rules):** new unconditionally-loaded category `agent_config`
+> (**AGCFG-004..007**, **MCPCFG-002**, repo scope) over five new repo predicates backed by `RepoInventory.ProjectConfig`
+> (`analysis.DiscoverProjectConfig`). The walk now enters `.gemini/`, `.vscode/`, `.cursor/`, `.codex/`. Env files are read for **key
+> names only** — never store, log or print a value. The IDs deliberately sit outside the SDK-prefix `NNN`/`1NN`/`2NN` convention (they
+> are cross-harness config rules; AGCFG-001..003 and MCPCFG-001 are unused). Rulebook docs live under `docs/Policy/agent_config/`.
+>
 > **Server-entrypoint fact (2026-10-05, no schema change, stays 20; no rules, no predicates):** `RepoInventory.Entrypoints`
 > (`models.EntrypointDef`; also `ScanResult.entrypoints`) records Python FastAPI / Flask routes (`http`) and Celery / Dramatiq
 > tasks (`worker`), and `analysis.ApplyEntrypointReachability` stamps `AgentRunCallDef.ServerReachable` (in-memory) on run calls

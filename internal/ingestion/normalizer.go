@@ -359,6 +359,11 @@ func Normalize(src *Source, onFile func(string)) (models.ScanManifest, error) {
 		// dropped from the manifest. Matching the OS-native `path` here was both
 		// case-sensitive and inconsistent with the rel that gets stored.
 		lower := strings.ToLower(rel)
+		// Harness config the pre-trust rules read: any ".env" file and the Codex
+		// project config. Kept narrow on purpose (pyproject.toml etc. are not).
+		if filepath.Base(lower) == ".env" || lower == ".codex/config.toml" || strings.HasSuffix(lower, "/.codex/config.toml") {
+			manifest.ConfigFiles = append(manifest.ConfigFiles, rel)
+		}
 		switch {
 		case strings.HasSuffix(lower, ".py"):
 			manifest.PythonFiles = append(manifest.PythonFiles, rel)
@@ -402,6 +407,7 @@ func Normalize(src *Source, onFile func(string)) (models.ScanManifest, error) {
 	} {
 		sort.Strings(*fl)
 	}
+	sort.Strings(manifest.ConfigFiles)
 
 	manifest.HasClaudeSDKDependency = detectClaudeSDKDependency(src.RootPath)
 	manifest.HasOpenShellArtifact = detectOpenShellArtifact(manifest.YAMLFiles, src.RootPath)
@@ -418,6 +424,10 @@ func shouldSkipDir(name string) bool {
 		// Agent-config directories — deliberately descend into them
 		// (.claude/ holds agents/skills/commands/settings; .claude-plugin/
 		// holds plugin.json / marketplace.json).
+		return false
+	case ".gemini", ".vscode", ".cursor", ".codex":
+		// Other harnesses' project config (settings, hooks, MCP, env) that takes
+		// effect when the folder is opened — read by the agent_config rules.
 		return false
 	}
 	// Skip other dot-prefixed dirs (build caches, editor metadata, etc.).
@@ -504,12 +514,35 @@ func discoverComponents(root string, m models.ScanManifest, onFile func(string))
 		"mcp.json":                   true,
 		"mcp_servers.json":           true,
 		"claude_desktop_config.json": true,
+		".mcp.json":                  true, // Claude Code project-scoped MCP servers
 	}
 	for _, p := range m.JSONFiles {
 		// Case-insensitive: MCP config names are conventionally lowercase, but a
 		// repo on a case-sensitive FS could ship MCP.json / Claude_Desktop_Config.json.
 		if mcpNames[strings.ToLower(filepath.Base(p))] {
 			out = append(out, models.AgentComponent{Kind: models.ComponentMCPConfig, Path: p})
+		}
+	}
+
+	// Pre-trust harness config (agent_config rules): Gemini settings, editor
+	// settings, agent env files, Codex config. Matched by directory + name.
+	for _, p := range m.JSONFiles {
+		dir, base := filepath.ToSlash(filepath.Dir(p)), filepath.Base(p)
+		switch {
+		case base == "settings.json" && (dir == ".gemini" || strings.HasSuffix(dir, "/.gemini")):
+			out = append(out, models.AgentComponent{Kind: models.ComponentGeminiSettings, Path: p})
+		case base == "settings.json" && (dir == ".vscode" || strings.HasSuffix(dir, "/.vscode")),
+			base != "mcp.json" && (dir == ".cursor" || strings.HasSuffix(dir, "/.cursor")):
+			out = append(out, models.AgentComponent{Kind: models.ComponentEditorSettings, Path: p})
+		}
+	}
+	for _, p := range m.ConfigFiles {
+		dir := filepath.ToSlash(filepath.Dir(p))
+		switch {
+		case filepath.Base(p) == ".env" && (p == ".env" || dir == ".gemini" || strings.HasSuffix(dir, "/.gemini")):
+			out = append(out, models.AgentComponent{Kind: models.ComponentAgentEnvFile, Path: p})
+		case filepath.Base(p) == "config.toml":
+			out = append(out, models.AgentComponent{Kind: models.ComponentCodexConfig, Path: p})
 		}
 	}
 
