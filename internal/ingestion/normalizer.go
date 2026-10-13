@@ -24,10 +24,11 @@ func Recon(src *Source, onFile func(string)) (models.RepoProfile, error) {
 	langs := languagesFromManifest(manifest)
 	sdks := detectSDKDeps(src.RootPath)
 	return models.RepoProfile{
-		Languages: langs,
-		SDKDeps:   sdks,
-		ObsDeps:   detectObsDeps(src.RootPath),
-		Manifest:  manifest,
+		Languages:            langs,
+		SDKDeps:              sdks,
+		ObsDeps:              detectObsDeps(src.RootPath),
+		OtelLabelsDeclaredIn: detectOtelLabelsDeps(src.RootPath),
+		Manifest:             manifest,
 	}, nil
 }
 
@@ -74,19 +75,10 @@ func detectObsDeps(root string) []models.ObsDep {
 	seen := make(map[string]bool)
 	var out []models.ObsDep
 	for _, mfile := range obsDepManifests {
-		path := filepath.Join(root, mfile)
-		// Size-cap before reading: these fixed root paths bypass the manifest
-		// walk's gate, so a hostile multi-GiB manifest would otherwise be
-		// slurped into memory.
-		fi, serr := os.Stat(path)
-		if serr != nil || fi.IsDir() || fi.Size() > maxScannedFileBytes {
+		text, ok := readRootManifestLower(root, mfile)
+		if !ok {
 			continue
 		}
-		b, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		text := strings.ToLower(string(b))
 		for _, n := range obsDepNeedles {
 			if !strings.Contains(text, n.Pattern) {
 				continue
@@ -105,6 +97,58 @@ func detectObsDeps(root string) []models.ObsDep {
 		}
 		return out[i].Source < out[j].Source
 	})
+	return out
+}
+
+// readRootManifestLower reads one fixed-name root manifest and lowercases it
+// for needle matching. Size-capped before reading: these fixed root paths
+// bypass the manifest walk's gate, so a hostile multi-GiB manifest would
+// otherwise be slurped into memory.
+func readRootManifestLower(root, mfile string) (string, bool) {
+	path := filepath.Join(root, mfile)
+	fi, serr := os.Stat(path)
+	if serr != nil || fi.IsDir() || fi.Size() > maxScannedFileBytes {
+		return "", false
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	return strings.ToLower(string(b)), true
+}
+
+// otelLabelsDepNeedles are the names agent-reliability-otel-labels is declared
+// under: the PyPI distribution and its normalized underscore spelling. The npm
+// package, @trustabl/agent-reliability-otel-labels, contains the first needle.
+// Lowercase; manifest text is lowercased before matching.
+//
+// Kept out of obsDepNeedles on purpose. The library only labels spans that
+// something else already emits, so counting it as an observability vendor
+// would let it satisfy its own prerequisite and would make OBS-005 fire on a
+// repo that declares nothing but this library.
+var otelLabelsDepNeedles = []string{"agent-reliability-otel-labels", "agent_reliability_otel_labels"}
+
+// detectOtelLabelsDeps returns the root manifests that declare
+// agent-reliability-otel-labels, sorted. A lock file counts: unlike the
+// OpenTelemetry packages, nothing pulls the library in transitively, so an
+// entry there means someone installed it. go.mod is not read — the
+// observability pass does not inspect Go, so a Go declaration could never be
+// paired with a code signal.
+func detectOtelLabelsDeps(root string) []string {
+	var out []string
+	for _, mfile := range obsDepManifests {
+		text, ok := readRootManifestLower(root, mfile)
+		if !ok {
+			continue
+		}
+		for _, n := range otelLabelsDepNeedles {
+			if strings.Contains(text, n) {
+				out = append(out, mfile)
+				break
+			}
+		}
+	}
+	sort.Strings(out)
 	return out
 }
 
@@ -132,6 +176,25 @@ func languagesFromManifest(m models.ScanManifest) []models.Language {
 		langs = append(langs, models.LanguageRust)
 	}
 	return langs
+}
+
+// depManifestLanguages maps a fixed-name root dependency manifest to the
+// language whose packages it declares. package.json is a best guess — it
+// could be plain JavaScript.
+var depManifestLanguages = map[string]models.Language{
+	"pyproject.toml":   models.LanguagePython,
+	"requirements.txt": models.LanguagePython,
+	"Pipfile":          models.LanguagePython,
+	"poetry.lock":      models.LanguagePython,
+	"package.json":     models.LanguageTypeScript,
+	"go.mod":           models.LanguageGo,
+}
+
+// ManifestLanguage returns the language a root dependency manifest declares
+// packages for, and false for a manifest this table does not know.
+func ManifestLanguage(name string) (models.Language, bool) {
+	lang, ok := depManifestLanguages[name]
+	return lang, ok
 }
 
 // detectSDKDeps scans pyproject.toml / requirements.txt / Pipfile / poetry.lock /
@@ -165,6 +228,13 @@ func detectSDKDeps(root string) []models.SDKDep {
 			Manifests: []string{"package.json"}},
 		{Name: "google-adk", Pattern: "@google/adk",
 			Manifests: []string{"package.json"}},
+		// Google ADK for Go. Recon-only, like nvidia-nat below: there is no Go
+		// ADK discovery pass, so this name is deliberately NOT in
+		// scanner.depNameToSDK (a mapped name would emit a permanent false
+		// META-002). forge maps it to the google_adk category to select the Go
+		// runtime-tracing recipe.
+		{Name: "google-adk-go", Pattern: "google.golang.org/adk",
+			Manifests: []string{"go.mod"}},
 		// MCP TypeScript SDK. The package id is unambiguous (no Python-substring
 		// hazard), so it scans package.json only. Drives the "declared but
 		// unused" drift signal; actual pack loading is driven by SDKMCP from
@@ -640,15 +710,7 @@ func discoverComponents(root string, m models.ScanManifest, onFile func(string))
 	}
 
 	// Dependency manifests at repo root only.
-	depFiles := map[string]models.Language{
-		"pyproject.toml":   models.LanguagePython,
-		"requirements.txt": models.LanguagePython,
-		"Pipfile":          models.LanguagePython,
-		"poetry.lock":      models.LanguagePython,
-		"package.json":     models.LanguageTypeScript, // best-guess; could be JS too
-		"go.mod":           models.LanguageGo,
-	}
-	for name, lang := range depFiles {
+	for name, lang := range depManifestLanguages {
 		if exists(filepath.Join(root, name)) {
 			out = append(out, models.AgentComponent{
 				Kind: models.ComponentDependencyManifest, Path: name, Language: lang,

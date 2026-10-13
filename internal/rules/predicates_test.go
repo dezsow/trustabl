@@ -1827,3 +1827,219 @@ func TestPredRepoObservabilityCapturesContent(t *testing.T) {
 		t.Error("no capture signal must not satisfy the predicate")
 	}
 }
+
+func TestPredAgentCheckpointerInMemory(t *testing.T) {
+	for class, want := range map[string]bool{
+		"MemorySaver": true, "InMemorySaver": true,
+		"PostgresSaver": false, "AsyncPostgresSaver": false, "SqliteSaver": false,
+		"RedisSaver": false, "MongoDBSaver": false, "": false,
+	} {
+		a := models.AgentDef{SDK: models.SDKLangChain, Class: "StateGraph", CheckpointerClass: class}
+		if got := rules.PredAgentCheckpointerInMemory(a); got != want {
+			t.Errorf("class %q: got %v, want %v", class, got, want)
+		}
+	}
+}
+
+func TestPredAgentServerReachable(t *testing.T) {
+	ep := func(file string) *models.EntrypointRef {
+		return &models.EntrypointRef{FilePath: file, Kind: models.EntrypointHTTP, Framework: "fastapi", Via: "direct"}
+	}
+	agent := models.AgentDef{SDK: models.SDKLangChain, Class: "StateGraph", Location: models.Location{FilePath: "graph.py"}, VarName: "builder"}
+	rc := func(file, agentFile string, ref *models.EntrypointRef) models.AgentRunCallDef {
+		return models.AgentRunCallDef{SDK: models.SDKLangChain, Location: models.Location{FilePath: file},
+			AgentVarName: "builder", AgentFilePath: agentFile, ServerReachable: ref}
+	}
+	cases := []struct {
+		name string
+		a    models.AgentDef
+		rcs  []models.AgentRunCallDef
+		want bool
+	}{
+		{"same file, reachable", agent, []models.AgentRunCallDef{rc("graph.py", "", ep("graph.py"))}, true},
+		{"cross file, reachable", agent, []models.AgentRunCallDef{rc("api.py", "graph.py", ep("api.py"))}, true},
+		{"one of two calls reachable", agent, []models.AgentRunCallDef{rc("graph.py", "", nil), rc("api.py", "graph.py", ep("api.py"))}, true},
+		{"opaque run call still counts", agent, []models.AgentRunCallDef{func() models.AgentRunCallDef {
+			r := rc("graph.py", "", ep("graph.py"))
+			r.Opaque = true
+			return r
+		}()}, true},
+		{"not reachable", agent, []models.AgentRunCallDef{rc("graph.py", "", nil)}, false},
+		{"no run calls", agent, nil, false},
+		{"cross-file call names a different defining file", agent, []models.AgentRunCallDef{rc("api.py", "other.py", ep("api.py"))}, false},
+		{"same-file correlation needs the agent's file", agent, []models.AgentRunCallDef{rc("api.py", "", ep("api.py"))}, false},
+		{"other var name", agent, []models.AgentRunCallDef{{SDK: models.SDKLangChain, Location: models.Location{FilePath: "graph.py"}, AgentVarName: "x", ServerReachable: ep("graph.py")}}, false},
+		{"other SDK", agent, []models.AgentRunCallDef{{SDK: models.SDKPydanticAI, Location: models.Location{FilePath: "graph.py"}, AgentVarName: "builder", ServerReachable: ep("graph.py")}}, false},
+		{"agent with no VarName", models.AgentDef{SDK: models.SDKLangChain, Location: models.Location{FilePath: "graph.py"}}, []models.AgentRunCallDef{rc("graph.py", "", ep("graph.py"))}, false},
+		{"run call under tests/", agent, []models.AgentRunCallDef{rc("tests/test_api.py", "graph.py", ep("tests/test_api.py"))}, false},
+		{"entrypoint in conftest.py", agent, []models.AgentRunCallDef{rc("graph.py", "", ep("conftest.py"))}, false},
+		{"agent in a test_*.py file", models.AgentDef{SDK: models.SDKLangChain, Location: models.Location{FilePath: "test_graph.py"}, VarName: "builder"},
+			[]models.AgentRunCallDef{rc("test_graph.py", "", ep("test_graph.py"))}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := rules.PredAgentServerReachable(c.a, models.RepoInventory{AgentRunCalls: c.rcs}); got != c.want {
+				t.Errorf("got %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestRunCallPredicates_IgnoreLangGraphRunCalls guards the leak path for the
+// LangGraph run-call records added for LC-116: every pre-existing run-call
+// predicate is SDK-gated, so a LangChain run call (even one sharing a same-file
+// VarName with another SDK's agent) must not change its result.
+func TestRunCallPredicates_IgnoreLangGraphRunCalls(t *testing.T) {
+	lgCall := models.AgentRunCallDef{SDK: models.SDKLangChain, Callee: "agent.invoke",
+		Location: models.Location{FilePath: "main.py"}, AgentVarName: "agent",
+		ServerReachable: &models.EntrypointRef{FilePath: "main.py", Kind: models.EntrypointHTTP, Framework: "fastapi"}}
+	inv := models.RepoInventory{AgentRunCalls: []models.AgentRunCallDef{lgCall}}
+	for _, sdk := range []models.SDK{models.SDKOpenAIAgents, models.SDKPydanticAI, models.SDKGoogleADK, models.SDKAutoGen, models.SDKLangChain} {
+		a := models.AgentDef{SDK: sdk, Location: models.Location{FilePath: "main.py"}, VarName: "agent"}
+		if rules.PredAgentRunCallMaxTurnsMissing(a, inv) {
+			t.Errorf("%s: max_turns predicate fired on a LangGraph run call", sdk)
+		}
+		if rules.PredAgentRunCallUsageLimitsMissing(a, inv) {
+			t.Errorf("%s: usage_limits predicate fired on a LangGraph run call", sdk)
+		}
+		if rules.PredAgentRunCallWallClockTimeoutMissing(a, inv) {
+			t.Errorf("%s: wall-clock predicate fired on a LangGraph run call", sdk)
+		}
+		if sdk != models.SDKLangChain && rules.PredAgentServerReachable(a, inv) {
+			t.Errorf("%s: server-reachable credited a LangGraph run call to another SDK's agent", sdk)
+		}
+	}
+}
+
+func TestPredRepoOtelLabelsInstalled(t *testing.T) {
+	declared := models.RepoProfile{OtelLabelsDeclaredIn: []string{"requirements.txt"}}
+	if !rules.PredRepoOtelLabelsInstalled(true, declared, models.RepoInventory{}) {
+		t.Error("a manifest declaration satisfies installed")
+	}
+
+	// The root manifests are all recon reads, so a monorepo that declares the
+	// library in a nested manifest is only visible through its import.
+	imported := models.RepoInventory{OtelLabelsSignals: []models.OtelLabelsSignal{
+		{Kind: models.OtelLabelsImport, File: "svc/agent.py"},
+	}}
+	if !rules.PredRepoOtelLabelsInstalled(true, models.RepoProfile{}, imported) {
+		t.Error("an import in code satisfies installed without a root-manifest declaration")
+	}
+
+	if rules.PredRepoOtelLabelsInstalled(true, models.RepoProfile{}, models.RepoInventory{}) {
+		t.Error("neither declared nor imported must not read as installed")
+	}
+	if !rules.PredRepoOtelLabelsInstalled(false, models.RepoProfile{}, models.RepoInventory{}) {
+		t.Error("installed:false must hold when the library is absent")
+	}
+}
+
+func TestPredRepoOtelLabelsInitialized(t *testing.T) {
+	started := models.RepoInventory{OtelLabelsSignals: []models.OtelLabelsSignal{
+		{Kind: models.OtelLabelsImport},
+		{Kind: models.OtelLabelsRunStart},
+	}}
+	if !rules.PredRepoOtelLabelsInitialized(true, started) {
+		t.Error("a run_start signal satisfies initialized")
+	}
+
+	// Labelling spans without ever stamping the run on the root span leaves
+	// every label unattached to a run: that is not an initialized run.
+	labelsOnly := models.RepoInventory{OtelLabelsSignals: []models.OtelLabelsSignal{
+		{Kind: models.OtelLabelsImport},
+		{Kind: models.OtelLabelsToolSpan},
+		{Kind: models.OtelLabelsRunEnd},
+	}}
+	if rules.PredRepoOtelLabelsInitialized(true, labelsOnly) {
+		t.Error("tool-span and run-end calls without mark_start must not read as initialized")
+	}
+	if !rules.PredRepoOtelLabelsInitialized(false, labelsOnly) {
+		t.Error("initialized:false must hold when no run is started")
+	}
+}
+
+func TestPredRepoOtelLabelsImplemented(t *testing.T) {
+	sig := func(kinds ...models.OtelLabelsSignalKind) []models.OtelLabelsSignal {
+		var out []models.OtelLabelsSignal
+		for _, k := range kinds {
+			out = append(out, models.OtelLabelsSignal{Kind: k})
+		}
+		return out
+	}
+	withTool := []models.ToolDef{{Name: "search", Kind: models.KindOpenAITool}}
+
+	full := models.RepoInventory{
+		Tools:             withTool,
+		OtelLabelsSignals: sig(models.OtelLabelsRunStart, models.OtelLabelsToolSpan, models.OtelLabelsRunEnd),
+	}
+	if !rules.PredRepoOtelLabelsImplemented(true, full) {
+		t.Error("tool spans labelled and the run end recorded is implemented")
+	}
+
+	noToolLabels := models.RepoInventory{
+		Tools:             withTool,
+		OtelLabelsSignals: sig(models.OtelLabelsRunStart, models.OtelLabelsRunEnd),
+	}
+	if rules.PredRepoOtelLabelsImplemented(true, noToolLabels) {
+		t.Error("a repo that ships tools and never labels a tool span is not implemented")
+	}
+
+	noRunEnd := models.RepoInventory{
+		Tools:             withTool,
+		OtelLabelsSignals: sig(models.OtelLabelsRunStart, models.OtelLabelsToolSpan),
+	}
+	if rules.PredRepoOtelLabelsImplemented(true, noRunEnd) {
+		t.Error("a run whose end is never recorded is not implemented")
+	}
+
+	// An agent with no tools has no tool span to label, so the run end is all
+	// there is to implement. Demanding mark_tool_span would be unclearable.
+	toolless := models.RepoInventory{
+		OtelLabelsSignals: sig(models.OtelLabelsRunStart, models.OtelLabelsRunEnd),
+	}
+	if !rules.PredRepoOtelLabelsImplemented(true, toolless) {
+		t.Error("a tool-less repo that records the run end is implemented")
+	}
+
+	// A bare shell-invoking function is a ToolDef but not a tool the model
+	// calls: no framework emits a tool span for it.
+	shellOnly := models.RepoInventory{
+		Tools:             []models.ToolDef{{Name: "run", Kind: models.KindShellInvocation}},
+		OtelLabelsSignals: sig(models.OtelLabelsRunStart, models.OtelLabelsRunEnd),
+	}
+	if !rules.PredRepoOtelLabelsImplemented(true, shellOnly) {
+		t.Error("a shell_invocation function must not create a tool-span obligation")
+	}
+}
+
+// trustabl.* keys written by hand credit the presence ladder rung by rung.
+func TestPredRepoOtelLabels_HandWrittenKeysCredit(t *testing.T) {
+	attr := func(keys ...string) models.RepoInventory {
+		var sigs []models.OtelLabelsSignal
+		for _, k := range keys {
+			sigs = append(sigs, models.OtelLabelsSignal{Kind: models.OtelLabelsAttrLiteral, Key: k})
+		}
+		return models.RepoInventory{
+			Tools:             []models.ToolDef{{Name: "search", Kind: models.KindOpenAITool}},
+			OtelLabelsSignals: sigs,
+		}
+	}
+	if !rules.PredRepoOtelLabelsInstalled(true, models.RepoProfile{}, attr("trustabl.step_index")) {
+		t.Error("any hand-written key means the labels are present")
+	}
+	if rules.PredRepoOtelLabelsInitialized(true, attr("trustabl.step_index")) {
+		t.Error("a key other than trustabl.run_id does not start a run")
+	}
+	if !rules.PredRepoOtelLabelsInitialized(true, attr("trustabl.run_id")) {
+		t.Error("trustabl.run_id written by hand starts a run")
+	}
+	if rules.PredRepoOtelLabelsImplemented(true, attr("trustabl.run_id", "trustabl.exit_reason")) {
+		t.Error("a repo with tools needs a tool-span key too")
+	}
+	if !rules.PredRepoOtelLabelsImplemented(true, attr("trustabl.run_id", "trustabl.exit_reason", "trustabl.tool.input_fp")) {
+		t.Error("run end plus a tool-span key is implemented")
+	}
+	if !rules.PredRepoOtelLabelsImplemented(true, attr("trustabl.exit_reason", "trustabl.tool.attempt")) {
+		t.Error("trustabl.tool.attempt counts as a tool-span key")
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"github.com/trustabl/trustabl/internal/analysis"
 	"github.com/trustabl/trustabl/internal/analysis/astutil"
 	"github.com/trustabl/trustabl/internal/models"
+	"github.com/trustabl/trustabl/internal/pathclass"
 )
 
 // ─── bool predicates ─────────────────────────────────────────────────────────
@@ -1695,6 +1696,105 @@ func PredRepoObservabilityCapturesContent(want bool, inv models.RepoInventory) b
 	return found == want
 }
 
+// hasOtelLabelsSignal reports whether any agent-reliability-otel-labels signal
+// has the kind.
+func hasOtelLabelsSignal(inv models.RepoInventory, kind models.OtelLabelsSignalKind) bool {
+	for _, s := range inv.OtelLabelsSignals {
+		if s.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// otelLabelsRungKeys are the hand-written label keys that prove each rung:
+// any key proves the labels are present; trustabl.run_id proves a run is
+// started; trustabl.exit_reason proves the run end is recorded;
+// trustabl.tool.input_fp or trustabl.tool.attempt proves a tool span is
+// labelled. A nil entry means any key.
+var otelLabelsRungKeys = map[models.OtelLabelsSignalKind]map[string]bool{
+	models.OtelLabelsImport:   nil,
+	models.OtelLabelsRunStart: {"trustabl.run_id": true},
+	models.OtelLabelsRunEnd:   {"trustabl.exit_reason": true},
+	models.OtelLabelsToolSpan: {"trustabl.tool.input_fp": true, "trustabl.tool.attempt": true},
+}
+
+// hasOtelLabelsRung reports whether the repo reached a rung, through a library
+// call or through the label keys written by hand.
+func hasOtelLabelsRung(inv models.RepoInventory, kind models.OtelLabelsSignalKind) bool {
+	if hasOtelLabelsSignal(inv, kind) {
+		return true
+	}
+	keys, ok := otelLabelsRungKeys[kind]
+	if !ok {
+		return false
+	}
+	for _, s := range inv.OtelLabelsSignals {
+		if s.Kind == models.OtelLabelsAttrLiteral && (keys == nil || keys[s.Key]) {
+			return true
+		}
+	}
+	return false
+}
+
+// PredRepoOtelLabelsInstalled reports whether agent-reliability-otel-labels is
+// present in the repo at all: declared in a root dependency manifest, or
+// imported in code. Either is enough. Recon reads only the root manifests, so a
+// monorepo that declares the library in a nested manifest is visible only
+// through its import. trustabl.* keys written by hand count too (see
+// otelLabelsRungKeys).
+func PredRepoOtelLabelsInstalled(want bool, p models.RepoProfile, inv models.RepoInventory) bool {
+	installed := len(p.OtelLabelsDeclaredIn) > 0 || hasOtelLabelsRung(inv, models.OtelLabelsImport)
+	return installed == want
+}
+
+// PredRepoOtelLabelsInitialized reports whether a run is actually started:
+// Run.mark_start(root) is called somewhere, which is what stamps the run
+// identity on the root span. Constructing a Run, or labelling spans without
+// ever marking the start, is not initialization — the labels then belong to no
+// run. trustabl.* keys written by hand count too (see otelLabelsRungKeys).
+func PredRepoOtelLabelsInitialized(want bool, inv models.RepoInventory) bool {
+	return hasOtelLabelsRung(inv, models.OtelLabelsRunStart) == want
+}
+
+// toolSpanKinds are the tool kinds an agent framework emits a tool-execution
+// span for. A bare shell-invoking function and a LangGraph node are ToolDefs
+// too, but the model does not call them as tools, so they carry no tool span
+// for agent-reliability-otel-labels to label.
+var toolSpanKinds = map[models.ToolKind]bool{
+	models.KindClaudeSDKTool:   true,
+	models.KindOpenAITool:      true,
+	models.KindMCPTool:         true,
+	models.KindADKFunctionTool: true,
+	models.KindLangChainTool:   true,
+	models.KindCrewAITool:      true,
+	models.KindPydanticAITool:  true,
+	models.KindVercelAITool:    true,
+	models.KindAutoGenTool:     true,
+}
+
+// PredRepoOtelLabelsImplemented reports whether the labels a started run
+// exists to carry are actually written: the run's end is recorded
+// (mark_run_end), and — when the repo ships at least one tool the model calls —
+// a tool span is labelled (mark_tool_span). A tool-less repo has no tool span
+// to label, so recording the run end is the whole job there.
+//
+// This proves the calls exist, not that the labels land: with no current span
+// inside a tool every call is a silent no-op, which no static check can see. trustabl.* keys written by hand count too
+// (see otelLabelsRungKeys).
+func PredRepoOtelLabelsImplemented(want bool, inv models.RepoInventory) bool {
+	implemented := hasOtelLabelsRung(inv, models.OtelLabelsRunEnd)
+	if implemented {
+		for _, t := range inv.Tools {
+			if toolSpanKinds[t.Kind] {
+				implemented = hasOtelLabelsRung(inv, models.OtelLabelsToolSpan)
+				break
+			}
+		}
+	}
+	return implemented == want
+}
+
 // PredRepoClaudeOptionsModeWithoutKwarg fires when a SINGLE discovered
 // ClaudeAgentOptions(...) construction both sets permission_mode to one of
 // e.Modes and does not set e.Kwarg. This correlates the two facts at the
@@ -1753,6 +1853,49 @@ func PredRepoClaudeOptionsModeWithoutKwarg(e ClaudeOptionsModeKwargExpr, inv mod
 // absence rule can stay silent on the latter.
 func PredAgentKwargsObserved(a models.AgentDef) bool {
 	return a.Kwargs != nil && !a.Opaque
+}
+
+// PredAgentCheckpointerInMemory is true when this agent's checkpointer= resolves
+// to an in-process LangGraph saver (MemorySaver / InMemorySaver). Any other
+// class, an unresolved name, a runtime-selected saver and no checkpointer at
+// all are false: discovery never guesses (see AgentDef.CheckpointerClass).
+func PredAgentCheckpointerInMemory(a models.AgentDef) bool {
+	return analysis.IsLangGraphInMemoryCheckpointer(a.CheckpointerClass)
+}
+
+// PredAgentServerReachable is true when at least one run call of this agent is
+// reachable from a server entrypoint (HTTP route or worker task;
+// AgentRunCallDef.ServerReachable, one hop per edge). Run calls correlate by
+// same SDK and AgentVarName, and by file: the call's AgentFilePath when it was
+// resolved across files, else the call's own file. An agent with no VarName
+// never fires.
+//
+// Test paths are excluded (pathclass.Classify): an agent defined in a test
+// file, a run call in a test file, and a run call stamped by an entrypoint in a
+// test file (a FastAPI test app) do not count. A test harness is not a
+// production server path. The exclusion is local to this predicate; entrypoint
+// and run-call discovery stay unfiltered.
+func PredAgentServerReachable(a models.AgentDef, inv models.RepoInventory) bool {
+	if a.VarName == "" || pathclass.Classify(a.FilePath) == models.OriginTest {
+		return false
+	}
+	for _, rc := range inv.AgentRunCalls {
+		if rc.SDK != a.SDK || rc.AgentVarName != a.VarName || rc.ServerReachable == nil {
+			continue
+		}
+		defining := rc.AgentFilePath
+		if defining == "" {
+			defining = rc.FilePath
+		}
+		if defining != a.FilePath {
+			continue
+		}
+		if pathclass.Classify(rc.FilePath) == models.OriginTest || pathclass.Classify(rc.ServerReachable.FilePath) == models.OriginTest {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // PredRepoLangGraphPlatformConfigPresent reports whether the repo ships a

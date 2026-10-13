@@ -445,6 +445,42 @@ type ObservabilitySignal struct {
 	Language  Language            `json:"language"`
 }
 
+// OtelLabelsSignalKind grades how far a repo has got with
+// agent-reliability-otel-labels, the library that adds process-metadata labels
+// to spans the agent already emits. The kinds are the rungs OBS-006..008 walk:
+// present, run started, spans labelled, run end recorded.
+type OtelLabelsSignalKind string
+
+const (
+	OtelLabelsImport   OtelLabelsSignalKind = "import"
+	OtelLabelsRunStart OtelLabelsSignalKind = "run_start"
+	OtelLabelsToolSpan OtelLabelsSignalKind = "tool_span"
+	OtelLabelsRunEnd   OtelLabelsSignalKind = "run_end"
+	// OtelLabelsAttrLiteral is a trustabl.* label key written to a span by
+	// hand (set_attribute / setAttribute), without the library.
+	OtelLabelsAttrLiteral OtelLabelsSignalKind = "attr_literal"
+)
+
+// OtelLabelsSignal is one agent-reliability-otel-labels fact OBSERVED IN CODE.
+//
+// It is deliberately NOT an ObservabilitySignal. The library never creates a
+// span, so folding it into that slice would let an import of it satisfy
+// repo_has_observability and a started Run satisfy
+// repo_observability_initialized — the library would clear its own
+// prerequisite and OBS-001 would misfire on it.
+//
+// The fact fields are zero when they do not apply to the Kind.
+type OtelLabelsSignal struct {
+	Kind      OtelLabelsSignalKind `json:"kind"`
+	File      string               `json:"file"`
+	StartLine int                  `json:"start_line"`
+	EndLine   int                  `json:"end_line"`
+	Language  Language             `json:"language"`
+
+	TestOrigin bool   `json:"test_origin,omitempty"` // all kinds: File classifies as a test
+	Key        string `json:"key,omitempty"`         // attr_literal: the trustabl.* key
+}
+
 // DepRef is one dependency declared in a repo manifest — the agent-path
 // supply-chain BOM (Story TR-278; supersedes the skill-only BOM of TR-221). It
 // is pure inventory: Trustabl records what the repo DECLARES, then either hands
@@ -508,8 +544,12 @@ type RepoProfile struct {
 	// Recon-only: they gate whether the AST observability pass runs, and never
 	// stand in for an observed code signal. Kept out of SDKDeps on purpose —
 	// see the ObsDep doc comment.
-	ObsDeps  []ObsDep     `json:"obs_deps,omitempty"`
-	Manifest ScanManifest `json:"manifest"`
+	ObsDeps []ObsDep `json:"obs_deps,omitempty"`
+	// OtelLabelsDeclaredIn lists the root manifests that declare
+	// agent-reliability-otel-labels, sorted. Separate from ObsDeps — see
+	// OtelLabelsSignal.
+	OtelLabelsDeclaredIn []string     `json:"otel_labels_declared_in,omitempty"`
+	Manifest             ScanManifest `json:"manifest"`
 }
 
 // RepoInventory is the output of the inventory step.
@@ -548,6 +588,9 @@ type RepoInventory struct {
 	// ObservabilitySignals are the observability facts OBSERVED IN CODE, sorted
 	// by (File, StartLine, Vendor, Kind) for determinism.
 	ObservabilitySignals []ObservabilitySignal `json:"observability_signals,omitempty"`
+	// OtelLabelsSignals are the agent-reliability-otel-labels facts OBSERVED IN
+	// CODE, sorted by (File, StartLine, Kind) for determinism.
+	OtelLabelsSignals []OtelLabelsSignal `json:"otel_labels_signals,omitempty"`
 }
 
 // Coverage records how thoroughly the scan actually parsed the repo's source.

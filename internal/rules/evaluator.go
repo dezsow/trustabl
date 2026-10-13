@@ -78,6 +78,12 @@ func (e MatchExpr) EvaluateAgent(a models.AgentDef, inv models.RepoInventory) bo
 	if e.AgentKwargsObserved != nil && PredAgentKwargsObserved(a) != *e.AgentKwargsObserved {
 		return false
 	}
+	if e.AgentCheckpointerInMemory != nil && PredAgentCheckpointerInMemory(a) != *e.AgentCheckpointerInMemory {
+		return false
+	}
+	if e.AgentServerReachable != nil && PredAgentServerReachable(a, inv) != *e.AgentServerReachable {
+		return false
+	}
 	if e.RepoLangGraphPlatformConfigPresent != nil && PredRepoLangGraphPlatformConfigPresent(inv) != *e.RepoLangGraphPlatformConfigPresent {
 		return false
 	}
@@ -176,6 +182,15 @@ func (e MatchExpr) EvaluateRepo(p models.RepoProfile, inv models.RepoInventory) 
 		return false
 	}
 	if e.RepoMCPConfigLaunchesLocalCommand != nil && (len(inv.ProjectConfig.LocalMCPLaunch) > 0) != *e.RepoMCPConfigLaunchesLocalCommand {
+		return false
+	}
+	if e.RepoOtelLabelsInstalled != nil && !PredRepoOtelLabelsInstalled(*e.RepoOtelLabelsInstalled, p, inv) {
+		return false
+	}
+	if e.RepoOtelLabelsInitialized != nil && !PredRepoOtelLabelsInitialized(*e.RepoOtelLabelsInitialized, inv) {
+		return false
+	}
+	if e.RepoOtelLabelsImplemented != nil && !PredRepoOtelLabelsImplemented(*e.RepoOtelLabelsImplemented, inv) {
 		return false
 	}
 	if len(e.RepoClaudeDefaultModeIs) > 0 && !PredRepoClaudeDefaultModeIs(e.RepoClaudeDefaultModeIs, inv) {
@@ -469,6 +484,8 @@ var predicatesByScope = map[models.Scope]map[string]bool{
 		"agent_file_url_force_download":             true,
 		"agent_run_call_wall_clock_timeout_missing": true,
 		"agent_kwargs_observed":                     true,
+		"agent_checkpointer_in_memory":              true,
+		"agent_server_reachable":                    true,
 		// Dual-scope (see EvaluateAgent): LangGraph Platform injects a checkpointer.
 		"repo_langgraph_platform_config_present": true,
 	},
@@ -511,6 +528,9 @@ var predicatesByScope = map[models.Scope]map[string]bool{
 		"repo_observability_vendor":                    true,
 		"repo_observability_console_only":              true,
 		"repo_observability_captures_content":          true,
+		"repo_otel_labels_installed":                   true,
+		"repo_otel_labels_initialized":                 true,
+		"repo_otel_labels_implemented":                 true,
 		"repo_langgraph_platform_config_present":       true,
 		"repo_raw_anthropic_tool_output_in_system":     true,
 		"repo_raw_openai_tool_output_in_system":        true,
@@ -574,6 +594,8 @@ func (e MatchExpr) setPredicateNames() []string {
 	add(e.AgentFileURLForceDownload != nil, "agent_file_url_force_download")
 	add(e.AgentRunCallWallClockTimeoutMissing != nil, "agent_run_call_wall_clock_timeout_missing")
 	add(e.AgentKwargsObserved != nil, "agent_kwargs_observed")
+	add(e.AgentCheckpointerInMemory != nil, "agent_checkpointer_in_memory")
+	add(e.AgentServerReachable != nil, "agent_server_reachable")
 	// Subagent scope
 	add(len(e.SubagentGrantsTool) > 0, "subagent_grants_tool")
 	// Skill scope
@@ -620,6 +642,9 @@ func (e MatchExpr) setPredicateNames() []string {
 	add(len(e.RepoObservabilityVendor) > 0, "repo_observability_vendor")
 	add(e.RepoObservabilityConsoleOnly != nil, "repo_observability_console_only")
 	add(e.RepoObservabilityCapturesContent != nil, "repo_observability_captures_content")
+	add(e.RepoOtelLabelsInstalled != nil, "repo_otel_labels_installed")
+	add(e.RepoOtelLabelsInitialized != nil, "repo_otel_labels_initialized")
+	add(e.RepoOtelLabelsImplemented != nil, "repo_otel_labels_implemented")
 	return n
 }
 

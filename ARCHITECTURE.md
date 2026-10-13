@@ -383,14 +383,14 @@ flowchart TD
 
     subgraph S1["Step 1 — Recon"]
         recon["ingestion.Recon"]
-        profile[["RepoProfile<br/>Languages · SDKDeps · ObsDeps · Manifest · Components"]]
+        profile[["RepoProfile<br/>Languages · SDKDeps · ObsDeps · OtelLabelsDeclaredIn · Manifest · Components"]]
         recon --> profile
     end
 
     subgraph S2["Step 2 — Inventory (per-language AST)"]
         disc["analysis.DiscoverTools<br/>DiscoverAgents<br/>DiscoverGuardrails<br/>DiscoverSessions<br/>DiscoverSubagents<br/>DiscoverSkills<br/>DiscoverDependencies<br/>DiscoverSlashCommands<br/>DiscoverPlugins<br/>DiscoverClaudeSettings<br/>DiscoverADKAgents<br/>DiscoverADKTools<br/>DiscoverClaudeAgentOptions<br/>DiscoverAgentRunCalls<br/>DiscoverEntrypoints<br/>ApplyEntrypointReachability<br/>DiscoverLangGraphNodes<br/>DetectRawLLMToolOutputInSystem<br/>DiscoverObservability<br/>LangChain/CrewAI/AutoGen/PydanticAI (Py)<br/>TS: OpenAI/ADK/LangChain/Vercel/MCP-proper<br/>Go/CSharp/PHP/Rust MCP"]
         edges["analysis.ResolveEdges"]
-        inv[["RepoInventory<br/>Tools · Agents · Guardrails · Sessions<br/>SDKsDetected · HasShellInvocations · UsesDefaultTracing<br/>ObservabilitySignals<br/>Dependencies (BOM)<br/>MCPServers · Subagents · Skills · SlashCommands<br/>PluginManifests · ClaudeSettings · ClaudeAgentOptions<br/>AgentRunCalls · Entrypoints"]]
+        inv[["RepoInventory<br/>Tools · Agents · Guardrails · Sessions<br/>SDKsDetected · HasShellInvocations · UsesDefaultTracing<br/>ObservabilitySignals · OtelLabelsSignals<br/>Dependencies (BOM)<br/>MCPServers · Subagents · Skills · SlashCommands<br/>PluginManifests · ClaudeSettings · ClaudeAgentOptions<br/>AgentRunCalls · Entrypoints"]]
         disc --> edges --> inv
     end
 
@@ -464,7 +464,7 @@ remote repos). `ingestion.Recon` then walks the source tree and returns a
 
 Recon must stay cheap. No tree-sitter parses here.
 
-**Pre-trust harness config (category `agent_config`, `schema_version` 21).**
+**Pre-trust harness config (category `agent_config`, `schema_version` 23).**
 The walk descends into `.gemini/`, `.vscode/`, `.cursor/` and `.codex/` (it
 skips every other dot-directory), keeps any file named `.env` and
 `.codex/config.toml` in `ScanManifest.ConfigFiles`, and classifies the results as
@@ -576,6 +576,54 @@ For each language recon cleared, do the AST work and produce a `RepoInventory`:
   manifests (`pyproject.toml`, `requirements.txt`, `Pipfile`, `package.json`);
   `poetry.lock` is excluded because a lock file carries the transitive closure,
   where a match proves nobody's intent.
+
+- **DiscoverOtelLabels** (`otel_labels.go`) — one pass over the parsed
+  Python and TS/JS files emitting a typed `OtelLabelsSignal` per use of
+  `agent-reliability-otel-labels`, the library that adds process-metadata labels to spans the
+  agent already emits. `Kind` is the rung reached: `import` (`agent_reliability_otel_labels` /
+  `@trustabl/agent-reliability-otel-labels` is imported), `run_start` (`<run>.mark_start(...)` /
+  `<run>.markStart(...)` — receiver required, since it is a method on `Run`),
+  `tool_span` (`mark_tool_span` / `markToolSpan`) and `run_end` (`mark_run_end`
+  / `markRunEnd`). The call names are plausible names for a project's own
+  helpers, so they count only when the library is imported somewhere in the
+  repo; each file's own imports are followed, so a renamed import
+  (`mark_tool_span as mts`, `markToolSpan as label`) still resolves. Every
+  signal carries `TestOrigin` when its file classifies as a test
+  (`pathclass.Classify`). That gate is repo-wide, not per-file: a `Run` is
+  routinely built in one module and started in another that imports nothing.
+  `attr_literal` records a label key written to a span by hand
+  (`set_attribute` / `setAttribute` first argument, or a key of the literal
+  passed to `set_attributes` / `setAttributes`), collected whether or not the
+  library is imported; a bare string elsewhere is not a label. The key table
+  (`otel_labels_keys.go`) is tested against
+  `testdata/forge/otel/otel-spec-keys.json`. The ladder predicates credit
+  these keys rung by rung: any key → installed, `trustabl.run_id` → initialized,
+  `trustabl.exit_reason` → run end, `trustabl.tool.input_fp` /
+  `trustabl.tool.attempt` → tool span.
+  The Go binding is not inspected. Output is sorted (stably) by (File,
+  StartLine, Kind, Key); like `ObservabilitySignals` it is additive inventory
+  and is **not** folded into `ScanID`.
+
+  These signals are deliberately **not** `ObservabilitySignal`s.
+  `agent-reliability-otel-labels` never creates a span, so folding it in would let an import
+  satisfy `repo_has_observability` and a started `Run` satisfy
+  `repo_observability_initialized` — the library would clear its own
+  prerequisite and `OBS-001` would misfire on it. The declared half comes from
+  recon: `detectOtelLabelsDeps` (`internal/ingestion/normalizer.go`) records
+  the root manifests that name the package in
+  `RepoProfile.OtelLabelsDeclaredIn`, separate from `ObsDeps` for the same
+  reason. A lock file counts here, unlike `ObsDeps`, because nothing depends on
+  `agent-reliability-otel-labels` transitively.
+
+  Three repo-scope predicates read these facts and back the `OBS-006..008`
+  ladder, each rule gated on `repo_observability_initialized: true` and firing
+  at the first missing rung: `repo_otel_labels_installed` (declared **or**
+  imported), `repo_otel_labels_initialized` (a `run_start` signal), and
+  `repo_otel_labels_implemented` (a `run_end` signal, plus a `tool_span`
+  signal when the inventory holds at least one tool of a kind a framework emits
+  a tool span for — a bare `shell_invocation` function and a `langgraph_node`
+  do not count). The predicates prove the calls exist, not that labels land:
+  with no current span each call is a silent no-op.
 
 - **DiscoverSubagents** (`subagents.go`) — **hybrid** discovery in two passes.
   Pass 1 reads every `.claude/agents/*.md` component (matched at any path depth
@@ -768,7 +816,24 @@ For each language recon cleared, do the AST work and produce a `RepoInventory`:
   (`same_file`), or in a top-level function it calls that was imported by name,
   absolute or relative (`import`). One hop per edge kind, no call graph, no
   `m.f()` / method calls / DI; relative imports resolve only to files in the scan
-  set (see the doc comment). Ranks 4 and 6 build on it in follow-up PRs.
+  set (see the doc comment). The stamp is read by the `agent_server_reachable`
+  predicate (LC-116); the resolver was generalized to `resolveImportedName` so
+  run-call discovery reuses it for cross-file graphs.
+- **LangGraph run calls** (`agent_run_calls.go`, `discoverLangGraphRunCalls`) —
+  SDK `langchain` `AgentRunCallDef`s for `invoke` / `ainvoke` / `stream` /
+  `astream` / `astream_events` / `batch` / `abatch`. The receiver is never an
+  arbitrary identifier: it must be a compiled-graph variable
+  (`app = builder.compile(...)`, from `discoverLangGraphGraphsInFile`'s compile
+  map), the direct chain `builder.compile(...).invoke(...)`, or the variable of a
+  prebuilt `create_react_agent` / `create_agent`. `AgentVarName` is the builder
+  variable. A module-level graph imported into another file (`from graph import
+  app`) is recorded with `AgentFilePath` (in-memory) set to the defining file.
+  `AgentDef.CheckpointerClass` (in-memory) carries the `checkpointer=` class of
+  `compile()` / the prebuilt helpers, resolved through its langgraph import;
+  unresolved names, local classes and conflicting bindings leave it empty.
+  `agent_checkpointer_in_memory` (`MemorySaver` / `InMemorySaver`) and
+  `agent_server_reachable` (a correlated run call with a `ServerReachable`
+  stamp; test paths ignored) back LC-116. Run calls are not in the JSON report.
 - **DiscoverLangGraphNodes** (`langgraph_nodes.go`) — a function registered via
   `<builder>.add_node("name", func)` / `add_node(func)` is not a `@tool` but runs
   on every graph visit. Same-file, undecorated, top-level functions are emitted
@@ -1656,6 +1721,7 @@ RepoProfile {
     Languages []Language   // detected by file extension
     SDKDeps   []SDKDep     // declared deps (from manifests)
     ObsDeps   []ObsDep     // declared observability deps (from manifests)
+    OtelLabelsDeclaredIn []string // root manifests that declare agent-reliability-otel-labels, sorted
     Manifest  ScanManifest // file inventory + discovered components
 }
 
@@ -1686,6 +1752,7 @@ RepoInventory {
     RawAnthropicToolOutputInSystemPrompt bool // raw_llm_sdk: RAW-001
     RawOpenAIToolOutputInSystemMessage   bool // raw_llm_sdk: RAW-002
     ObservabilitySignals []ObservabilitySignal // vendor + Kind (import/init/exporter/content_capture/instrument_kwarg), sorted by (File, StartLine, Vendor, Kind)
+    OtelLabelsSignals  []OtelLabelsSignal  // agent-reliability-otel-labels use: Kind (import/run_start/tool_span/run_end), sorted by (File, StartLine, Kind)
 }
 
 // deriveSDKsDetected (internal/scanner/scanner.go) folds markdown subagent
@@ -2072,8 +2139,11 @@ internal/
 │   ├── jsonrpc.go               JSON-RPC 2.0 stdio framing (no third-party SDK).
 │   └── server.go                MCP methods (initialize/tools-list/tools-call) + scan tool.
 ├── forge/                       Pre-coding SKILL.md generator (trustabl forge).
-│   ├── detect.go                DetectCategories (dep-manifest recon → DetectorCategory slice),
-│   │                            MergeCategories (dedup + sort two category slices).
+│   ├── detect.go                Detect (dep-manifest recon → categories + (category, language) pairs),
+│   │                            DetectCategories, MergeCategories (dedup + sort two category slices),
+│   │                            SelectTracing (languages + pairs for the Runtime Tracing section).
+│   ├── tracing.go               emitRuntimeTracing + the languageBlocks / frameworkRecipes tables.
+│   ├── tracingtext/             Embedded markdown text of the Runtime Tracing section.
 │   └── gen.go                   Generate (single-pack skill-scope, kept for compat),
 │                                GenerateCombined (multi-SDK all-scope output),
 │                                matchConditionForScope, Stamp.
@@ -2377,8 +2447,8 @@ trustabl scan <target> [--detectors=…] [--format=human|json|sarif]
                        [--strict] [--no-color] [--no-progress]
                        [--rules-repo=URL] [--rules-ref=REF] [--channel=NAME]
                        [--no-rules-update] [--vuln-scan] [--include-test-paths]
-trustabl forge [target] [--policy=CATEGORY,…] [--output=PATH|-o PATH]
-                        [--rules-ref=REF]
+trustabl forge [target] [--policy=CATEGORY,…] [--lang=LANG,…]
+                        [--output=PATH|-o PATH] [--rules-ref=REF]
 trustabl enrich        [-i SCAN_JSON] [-r REPO_ROOT] [-o OUTPUT_FILE]
                        [--diff] [--apply] [--only-enriched] [--rule RULE_ID]
                        [--langsmith] [--langsmith-project NAME]
@@ -2598,17 +2668,39 @@ writing any SDK code.
 
 **Pipeline** (four steps, no AST):
 
-1. **DetectCategories** (`internal/forge/detect.go`) — calls `ingestion.Resolve`
-   and `ingestion.Recon` against the target directory to obtain
+1. **Detect** (`internal/forge/detect.go`) — calls `ingestion.Resolve` and
+   `ingestion.Recon` against the target directory to obtain
    `RepoProfile.SDKDeps`, then maps each dep name through a local
-   `depCategoryMap` table (9 entries, mirrors `scanner.depNameToSDK`) to
-   produce a sorted, deduplicated `[]models.DetectorCategory`. Returns a
-   non-nil empty slice (not nil) when no SDK is found.
+   `depCategoryMap` table (mirrors `scanner.depNameToSDK`, plus the recon-only
+   `google-adk-go`) to produce a sorted, deduplicated
+   `[]models.DetectorCategory`. Each dep's `Source` manifest is mapped through
+   `ingestion.ManifestLanguage` to a language, yielding `(category, language)`
+   pairs for Python, TypeScript and Go. A category declared in a manifest with
+   no known language (`composer.json`, say) is also recorded in
+   `Detection.Unplaced`. `DetectCategories` returns the categories alone.
 
 2. **MergeCategories** — deduplicates and sorts the auto-detected slice with
    any categories supplied via `--policy`. Explicit additions are additive, not
    overrides — useful when a new SDK is being introduced before its first
    dependency declaration.
+
+   **SelectTracing** then decides what the Runtime Tracing section covers:
+   detected pairs as detected (no cross product). An explicit `--policy`
+   category or `--lang` language widens the selection only when detection did
+   not already place it: a category with no detected pair pairs with every
+   selected language, and a language that was not detected pairs with every
+   category. Repeating something detection already found changes nothing.
+   When `claude_skill` is the only category, `TracingApplies` is false and the
+   selection is empty, so neither the section nor the stderr "pass --lang"
+   note appears. With no category at all forge exits 1 before this step; if
+   `--lang` was given, that message says `--lang` does not select a rule pack.
+
+   **SelectRuleLanguages** decides which languages each category's rules are
+   kept for (`RuleLanguages`): the detected pairs, plus an explicit `--lang`
+   on every listed category, plus an explicit `--policy` category paired with
+   the explicit `--lang` values. It leaves a category unlisted, so all of its
+   rules are kept, when forge does not know every language the SDK is used in:
+   an `Unplaced` category, or a `--policy` category given with no `--lang`.
 
 3. **rulesource.Resolve + rules.LoadLenient** — same resolution path as
    `trustabl scan`, keyed on `--rules-ref`. All policy packs are loaded;
@@ -2618,12 +2710,24 @@ writing any SDK code.
    comment (`<!-- generated: DATE | rules: SHA | schema: VERSION | sdks: LIST
    | template: N -->`) in the body — not in frontmatter — so the file is
    scannable to detect staleness. `template` is `TemplateVersion` (currently
-   `2`); a stamp with no `template` field predates it and parses as `1`. Right
+   `3`); a stamp with no `template` field predates it and parses as `1`. Right
    after the stamp, GenerateCombined emits a constant `## How to Apply These
    Constraints` apply-loop section: a static four-step procedure telling the
    model to check each definition it writes against the matching constraints,
    name any violation by rule ID, apply that rule's directive, and log the
-   repair. It then routes each rule into per-category, per-scope buckets
+   repair. It then emits `## Runtime Tracing` (`internal/forge/tracing.go`) for
+   the selected languages: Step 1 sets up OpenTelemetry, Step 2 places the
+   `agent-reliability-otel-labels` labels, Step 3 says how to choose their
+   values, Step 4 lists checks. The text is embedded from
+   `internal/forge/tracingtext/`; two small tables (`languageBlocks`,
+   `frameworkRecipes`) fix what exists and in what order. The section is
+   omitted when no selected language has a block. It drops each rule whose
+   `language` the category is not used in, through `RuleDef.AppliesToLanguage`
+   (the scanner's own language gate, so TypeScript keeps JavaScript rules and
+   a rule with no language is always kept), and writes a one-line note under
+   an SDK heading for a listed language that no rule of that pack targets
+   (a Go-only Google ADK repo, today). It then routes each rule into
+   per-category, per-scope buckets
    (`tools`, `agents`, `subagents`, `repos`, `skills`), emitting one
    `## SDK Name` section per category in `stamp.Categories` order, with
    `### Tool / Agent / Subagent / Repo / Skill Rules` subsections (empty
@@ -2646,7 +2750,7 @@ generated prose accurate for all five scopes without enumerating 15+ predicates.
 
 - `0` — SKILL.md generated and written.
 - `1` — no SDKs detected and no `--policy` given; or an unrecognized `--policy`
-  value.
+  or `--lang` value.
 - `2` — rules fetch / load error (same as `scan`).
 
 The `Generate` function (single-pack, skill-scope-only) is kept for backward

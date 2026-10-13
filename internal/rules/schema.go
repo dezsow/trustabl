@@ -102,6 +102,10 @@ type MatchExpr struct {
 	// AgentKwargsObserved is true iff discovery resolved the agent's call site
 	// (kwargs captured, not opaque) — see PredAgentKwargsObserved.
 	AgentKwargsObserved *bool `yaml:"agent_kwargs_observed,omitempty"`
+	// AgentCheckpointerInMemory: see PredAgentCheckpointerInMemory.
+	AgentCheckpointerInMemory *bool `yaml:"agent_checkpointer_in_memory,omitempty"`
+	// AgentServerReachable: see PredAgentServerReachable.
+	AgentServerReachable *bool `yaml:"agent_server_reachable,omitempty"`
 
 	// Subagent-scope predicates
 	SubagentGrantsTool []string `yaml:"subagent_grants_tool,omitempty"`
@@ -154,6 +158,13 @@ type MatchExpr struct {
 	RepoObservabilityConsoleOnly     *bool    `yaml:"repo_observability_console_only,omitempty"`
 	RepoObservabilityCapturesContent *bool    `yaml:"repo_observability_captures_content,omitempty"`
 	RepoObservabilityDeclared        *bool    `yaml:"repo_observability_declared,omitempty"`
+
+	// agent-reliability-otel-labels predicates: the three rungs OBS-006..008
+	// walk. They read RepoInventory.OtelLabelsSignals, which is kept apart from
+	// the observability signals above — see models.OtelLabelsSignal.
+	RepoOtelLabelsInstalled   *bool `yaml:"repo_otel_labels_installed,omitempty"`
+	RepoOtelLabelsInitialized *bool `yaml:"repo_otel_labels_initialized,omitempty"`
+	RepoOtelLabelsImplemented *bool `yaml:"repo_otel_labels_implemented,omitempty"`
 
 	// RepoLangGraphPlatformConfigPresent is ALSO valid at agent scope (dual-scope,
 	// like repo_has_observability): a langgraph.json means LangGraph Platform

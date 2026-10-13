@@ -116,7 +116,7 @@ the engine ships the predicate before the rules repo ships rules that use it.`,
   trustabl rules validate
 
   # Validate a checkout elsewhere
-  trustabl rules validate ./trustabl-rules`,
+  trustabl rules validate ./agent-reliability-rules`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if tel != nil {
