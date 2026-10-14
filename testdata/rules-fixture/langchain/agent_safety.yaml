@@ -220,7 +220,7 @@ rules:
       config={"configurable": {"thread_id": ...}} so each conversation resumes
       from its own persisted thread.
 
-  - id: LC-112
+  - id: LC-117
     title: LangChain privileged create_agent lacks human-approval prerequisites
     severity: high
     confidence: 0.7

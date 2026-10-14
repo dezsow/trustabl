@@ -6,7 +6,7 @@ import (
 	"github.com/trustabl/trustabl/internal/models"
 )
 
-func TestLC112HumanApprovalPrerequisites(t *testing.T) {
+func TestLC117HumanApprovalPrerequisites(t *testing.T) {
 	middleware := func(items ...models.Expr) *models.KwargTree {
 		return &models.KwargTree{
 			Value: &models.Expr{
@@ -78,23 +78,23 @@ func TestLC112HumanApprovalPrerequisites(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			d := loadAgentRule(t, "LC-112")
+			d := loadAgentRule(t, "LC-117")
 			if !d.Applies(tc.agent) {
 				if tc.wantFires {
-					t.Fatalf("LC-112 does not apply to %s/%s", tc.agent.SDK, tc.agent.Class)
+					t.Fatalf("LC-117 does not apply to %s/%s", tc.agent.SDK, tc.agent.Class)
 				}
 				return
 			}
 
 			fired := false
 			for _, f := range d.Detect(tc.agent, models.RepoInventory{}) {
-				if f.RuleID == "LC-112" {
+				if f.RuleID == "LC-117" {
 					fired = true
 					break
 				}
 			}
 			if fired != tc.wantFires {
-				t.Fatalf("LC-112 fired=%v, want %v", fired, tc.wantFires)
+				t.Fatalf("LC-117 fired=%v, want %v", fired, tc.wantFires)
 			}
 		})
 	}
