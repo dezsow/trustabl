@@ -350,6 +350,13 @@ When changing a rule (add / remove / edit severity, confidence, match, text):
 6. Commit and push the rules repo **and** the rulebook (the user pushes engine
    commits manually; confirm before pushing any of the three).
 
+> **Pre-trust agent config (2026-10-12, `schema_version` 22 → 23; +5 rules):** new unconditionally-loaded category `agent_config`
+> (**AGCFG-004..007**, **MCPCFG-002**, repo scope) over five new repo predicates backed by `RepoInventory.ProjectConfig`
+> (`analysis.DiscoverProjectConfig`). The walk now enters `.gemini/`, `.vscode/`, `.cursor/`, `.codex/`. Env files are read for **key
+> names only** — never store, log or print a value. The IDs deliberately sit outside the SDK-prefix `NNN`/`1NN`/`2NN` convention (they
+> are cross-harness config rules; AGCFG-001..003 and MCPCFG-001 are unused). Rulebook docs live under `docs/Policy/agent_config/`. Built in parallel with LC-116, which took
+> 21 → 22, so this batch takes 23. The fixture holds **339** rules (334 + 5; re-derive, do not trust this figure).
+>
 > **In-memory LangGraph checkpointer on a server path (2026-10-08, `schema_version` 21 → 22):** one rule, **LC-116** (high, 0.6, agent
 > scope, Python; `applies_to: [langchain_state_graph, langchain_agent]`): a graph whose `checkpointer=` is `MemorySaver` / `InMemorySaver`
 > and that is run from a FastAPI / Flask / Celery / Dramatiq entrypoint, silent when the repo ships a `langgraph.json`. New predicates

@@ -1115,6 +1115,7 @@ trustabl forge --policy google_adk --lang go
 | `autogen` | AutoGen / AG2 (Python) |
 | `claude_skill` | Claude Code skills (`SKILL.md`) |
 | `raw_llm_sdk` | Bare `anthropic` / `openai` client tool loops (not an agent framework) |
+| `agent_config` | Harness config committed to a repo that runs code or grants authority before the folder is trusted (`.claude/settings.json`, `.mcp.json`, `.gemini/.env`, `.vscode/settings.json`, `.codex/config.toml`) |
 | `openshell` | Shell-invocation tools (no rules in the current pack) |
 
 Multiple categories are comma-separated: `--policy openai_sdk,mcp`.
