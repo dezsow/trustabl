@@ -37,6 +37,12 @@ func languageGateOK(ruleLang, defLang models.Language) bool {
 	return models.IsTSOrJS(ruleLang) && models.IsTSOrJS(defLang)
 }
 
+// AppliesToLanguage reports whether the scanner's language gate lets r fire on
+// code in lang. A rule with no language applies to every language.
+func (r RuleDef) AppliesToLanguage(lang models.Language) bool {
+	return languageGateOK(r.Language, lang)
+}
+
 // toolRuleDetector adapts a tool-scoped RuleDef into a ToolDetector.
 type toolRuleDetector struct{ rule RuleDef }
 
@@ -117,6 +123,10 @@ func (d repoRuleDetector) Applies(p models.RepoProfile, inv models.RepoInventory
 			}
 			continue
 		}
+		// "raw_llm_sdk" is likewise not an SDK; the rule's own predicate gates.
+		if k == "raw_llm_sdk" || k == "agent_config" {
+			return true
+		}
 		// The repo-scope applies_to tokens are category labels, which equal
 		// their SDK enum string for every SDK EXCEPT Claude: the token is
 		// `claude_sdk` while the enum is `claude_agent_sdk`. Bridge that one
@@ -140,7 +150,32 @@ func (d repoRuleDetector) Detect(p models.RepoProfile, inv models.RepoInventory)
 	if !d.rule.Match.EvaluateRepo(p, inv) {
 		return nil
 	}
-	return []models.Finding{findingFromRule(d.rule, models.ScopeRepo, "", 0, 0, "")}
+	file, line := configHitLocation(d.rule.Match, inv.ProjectConfig)
+	return []models.Finding{findingFromRule(d.rule, models.ScopeRepo, file, line, line, "")}
+}
+
+// configHitLocation attributes an agent_config repo finding to the first
+// (path-sorted) config file behind the predicate that matched, so the finding
+// carries a file/line and pathclass can tag a vendored fixture as test-origin.
+// Every other repo rule returns "", 0 — their facts have no single site.
+func configHitLocation(m MatchExpr, pc models.ProjectConfigFacts) (string, int) {
+	var hits []models.ConfigHit
+	switch {
+	case m.RepoProjectMCPAutoenable != nil:
+		hits = pc.MCPAutoEnable
+	case m.RepoProjectHookRunsUntrustedCmd != nil:
+		hits = pc.RiskyHooks
+	case m.RepoWorkspaceEnvOverridesTrust != nil:
+		hits = pc.TrustOverrideEnv
+	case m.RepoEditorAgentAutoApprove != nil:
+		hits = pc.EditorAutoApprove
+	case m.RepoMCPConfigLaunchesLocalCommand != nil:
+		hits = pc.LocalMCPLaunch
+	}
+	if len(hits) == 0 {
+		return "", 0
+	}
+	return hits[0].FilePath, hits[0].Line
 }
 
 func agentKindMatches(kind string, a models.AgentDef) bool {
@@ -285,8 +320,8 @@ func findingFromRule(r RuleDef, scope models.Scope, filePath string, startLine, 
 }
 
 // LoadFor returns a Registry containing only policy packs whose category matches
-// one of the observed SDKs. openshell rules are always loaded.
-// If sdks is empty, only openshell rules are returned.
+// one of the observed SDKs, plus the categories that are not SDK-gated at all.
+// If sdks is empty, only those ungated categories are returned.
 func LoadFor(fsys fs.FS, sdks []models.SDK) (*detectors.Registry, []string, error) {
 	wanted := map[string]bool{
 		"openshell": true,
@@ -294,6 +329,19 @@ func LoadFor(fsys fs.FS, sdks []models.SDK) (*detectors.Registry, []string, erro
 		// claude_skill pack loads unconditionally (like openshell). Its rules
 		// only fire when the repo actually declares skills.
 		"claude_skill": true,
+		// Observability is a cross-SDK category, not an SDK: its rules are
+		// vendor-framed (Langfuse, OpenTelemetry) and list every SDK token in
+		// applies_to. Gating it on SDKsDetected would drop the pack entirely and
+		// OBS-001..003 could never fire. Loading it unconditionally is safe —
+		// each rule still gates on its own applies_to and on observability
+		// predicates that are false in a repo with no signals.
+		"observability": true,
+		// raw_llm_sdk has no SDK enum entry (bare anthropic/openai client usage is
+		// not an agent framework); its rules gate on their own predicates.
+		"raw_llm_sdk": true,
+		// agent_config (pre-trust harness config) is not an SDK either: the files
+		// it reads exist with no SDK code in the repo. Predicates do the gating.
+		"agent_config": true,
 	}
 	for _, sdk := range sdks {
 		switch sdk {

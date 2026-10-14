@@ -1,8 +1,8 @@
 # Instructions for Claude — detection policies
 
 These instructions apply to any work on the detection rule packs. Production
-rules live in the external `trustabl-rules` repository
-(`https://github.com/trustabl/trustabl-rules`); `testdata/rules-fixture/`
+rules live in the external `agent-reliability-rules` repository
+(`https://github.com/trustabl/agent-reliability-rules`); `testdata/rules-fixture/`
 (this directory) is an in-engine **test mirror** of those packs, and **must be
 kept in sync with the live repo** — see the "Two-repo rule model" section in
 the top-level [`CLAUDE.md`](../../CLAUDE.md) for the full change workflow. The
@@ -75,6 +75,7 @@ against. Pick values from the table for the scope you're targeting.
 | `mcp_tool`           | `@server.tool`, `@mcp.tool`, `.register_tool` |
 | `shell_invocation`   | Bare function that calls `subprocess.*` etc. (no rules currently target this — OSH-* moved to a closed-source project) |
 | `adk_function_tool`  | `FunctionTool(fn)` wrapping a Python function (Google ADK) |
+| `langgraph_node`     | Plain function registered via `<builder>.add_node(...)` in a LangGraph graph (not a `@tool`) |
 
 **`scope: agent`** — receives an `AgentDef`; `applies_to` is matched against
 `AgentDef.Class` + `AgentDef.SDK`:
@@ -103,6 +104,13 @@ SDK enum values used by the `repo_has_sdk_in_code` predicate:
 | `openshell`        | NVIDIA OpenShell SDK (no rules currently target this — OSH-* moved to a closed-source project) |
 | `mcp`              | Model Context Protocol               |
 | `google_adk`       | Google ADK (Python)                  |
+| `langchain`        | LangChain / LangGraph                |
+| `crewai`           | CrewAI                               |
+| `pydantic_ai`      | Pydantic AI                          |
+| `vercel_ai`        | Vercel AI SDK (TypeScript)           |
+| `autogen`          | AutoGen / AG2                        |
+| `raw_llm_sdk`      | Bare `anthropic` / `openai` client usage (no agent framework); category `raw_llm_sdk` loads unconditionally, the rule's own predicate gates |
+| `agent_config`     | Pre-trust harness config committed to the repo (`.claude/settings.json`, `.mcp.json`, `.gemini/.env`, `.vscode/settings.json`, `.codex/config.toml`); category `agent_config` loads unconditionally, the rule's own `repo_*` predicate gates. Findings carry the offending file and line |
 
 Repo-scope rules typically combine `applies_to` with a `repo_has_sdk_in_code`
 predicate to narrow firing to repos that actually use the SDK in code (e.g.
@@ -221,12 +229,19 @@ production-grade, in priority order:
   `buildTool`, TS in `tsHandlerFacts`) and `PredAgentUsesToolKind` honors it
   for `shell_invocation`. Residual: the agent rules still only key on shell
   reach, not the broader "filesystem-touching" half their titles also name.
-- **(d) Source-level fire/silent fixtures.** Per-rule cases in
-  `policies_test.go` feed hand-constructed typed inputs, so they prove
-  predicate logic but not discovery → detection end-to-end. Add fixtures
-  that run real `.py` snippets through the full scanner, so a discovery
-  change that stops producing a shape a rule depends on fails a test
-  instead of silently killing the rule.
+- **(d) Source-level fire/silent fixtures — started, not general.** Per-rule
+  cases in `policies_test.go` feed hand-constructed typed inputs, so they
+  prove predicate logic but not discovery → detection end-to-end. OAI-201
+  (`internal/scanner/scanner_test.go`,
+  `TestScan_OAI201_TracingDisabled`) now has a fire/silent pair that runs
+  real `.py` source through the full scanner rather than a hand-built
+  `RepoInventory` — it fires on a plain `Agent(...)` repo and goes silent on
+  `Runner.run(agent, run_config=RunConfig(tracing_disabled=True))`. The rest
+  of the pack still uses hand-constructed inputs; add more fixtures of this
+  shape as rules whose detection lives inside computed-fact logic (like
+  `disablesDefaultTracing`) are touched, so a discovery change that stops
+  producing a shape a rule depends on fails a test instead of silently
+  killing the rule.
 
 ## Output discipline for explanation/fix text
 

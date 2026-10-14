@@ -15,7 +15,7 @@ import (
 
 // fixtureFS returns the rule packs from the repo-root testdata/rules-fixture
 // directory — the Phase-1 interim home of the packs (they move to the
-// trustabl-rules repo in Phase 2).
+// agent-reliability-rules repo in Phase 2).
 func fixtureFS(t *testing.T) fs.FS {
 	t.Helper()
 	_, thisFile, _, _ := runtime.Caller(0)
@@ -230,6 +230,50 @@ def f(x: str) -> str:
     return x
 `, toolConfig: map[string]string{}, wantFires: false},
 
+	// ─── LC-007 LangChain tool network call without timeout ──────────────────
+	{name: "LC-007 fires on requests.get without timeout", ruleID: "LC-007", kind: models.KindLangChainTool, src: `
+def fetch(q: str) -> str:
+    """Fetch."""
+    import requests
+    return requests.get("https://api.example.com/data").text
+`, wantFires: true},
+	{name: "LC-007 fires on requests.post without timeout", ruleID: "LC-007", kind: models.KindLangChainTool, src: `
+def create(q: str) -> str:
+    """Create."""
+    import requests
+    return requests.post("https://api.example.com/data", json={"q": q}).text
+`, wantFires: true},
+	{name: "LC-007 silent with timeout", ruleID: "LC-007", kind: models.KindLangChainTool, src: `
+def fetch(q: str) -> str:
+    """Fetch."""
+    import requests
+    return requests.get("https://api.example.com/data", timeout=10).text
+`, wantFires: false},
+	{name: "LC-007 fires on timeout=None", ruleID: "LC-007", kind: models.KindLangChainTool, src: `
+import requests
+def fetch(url: str) -> str:
+    """Fetch."""
+    return requests.get(url, timeout=None).text
+`, wantFires: true},
+	{name: "LC-007 silent on httpx.get without timeout", ruleID: "LC-007", kind: models.KindLangChainTool, src: `
+def fetch(q: str) -> str:
+    """Fetch."""
+    import httpx
+    return httpx.get("https://api.example.com/data").text
+`, wantFires: false},
+	{name: "LC-007 silent on non-network tool", ruleID: "LC-007", kind: models.KindLangChainTool, src: `
+def echo(q: str) -> str:
+    """Echo."""
+    return q
+`, wantFires: false},
+	{name: "LC-007 fires on session-alias get without timeout", ruleID: "LC-007", kind: models.KindLangChainTool, src: `
+import requests
+def fetch(url: str) -> str:
+    """Fetch."""
+    s = requests.Session()
+    return s.get(url).text
+`, wantFires: true},
+
 	// LangChain TypeScript tool rules — parseTSTool runs DiscoverTSLangChainTools,
 	// so each snippet must import from the langchain ecosystem to be discovered.
 	{name: "LC-010 fires on TS tool with no description", ruleID: "LC-010", kind: models.KindLangChainTool, lang: models.LanguageTypeScript, wantFires: true, src: `
@@ -360,6 +404,67 @@ export const t = tool({ description: "x", inputSchema: z.object({}), execute: as
 import { tool } from "ai";
 import { z } from "zod";
 export const t = tool({ description: "x", inputSchema: z.object({ city: z.string() }), execute: async ({ city }) => city });
+`},
+
+	// VAI-017: TS stdout diagnostics (prints_stdout → has_print_call)
+	{name: "VAI-017 fires on console.log", ruleID: "VAI-017", kind: models.KindVercelAITool, lang: models.LanguageTypeScript, wantFires: true, src: `
+import { tool } from "ai";
+import { z } from "zod";
+export const t = tool({ description: "lookup", inputSchema: z.object({ id: z.string() }), execute: async ({ id }) => {
+  console.log("looking up", id);
+  return id;
+} });
+`},
+	{name: "VAI-017 silent without stdout write", ruleID: "VAI-017", kind: models.KindVercelAITool, lang: models.LanguageTypeScript, wantFires: false, src: `
+import { tool } from "ai";
+import { z } from "zod";
+export const t = tool({ description: "lookup", inputSchema: z.object({ id: z.string() }), execute: async ({ id }) => id });
+`},
+	{name: "VAI-017 silent on console.error (stderr)", ruleID: "VAI-017", kind: models.KindVercelAITool, lang: models.LanguageTypeScript, wantFires: false, src: `
+import { tool } from "ai";
+import { z } from "zod";
+export const t = tool({ description: "lookup", inputSchema: z.object({ id: z.string() }), execute: async ({ id }) => {
+  console.error("looking up", id);
+  return id;
+} });
+`},
+	// VAI-016: ambiguous binding name (VarName) — Name is empty for Vercel tools.
+	{name: "VAI-016 fires on process binding", ruleID: "VAI-016", kind: models.KindVercelAITool, lang: models.LanguageTypeScript, wantFires: true, src: `
+import { tool } from "ai";
+import { z } from "zod";
+export const process = tool({ description: "x", inputSchema: z.object({ q: z.string() }), execute: async ({ q }) => q });
+`},
+	{name: "VAI-016 silent on descriptive binding", ruleID: "VAI-016", kind: models.KindVercelAITool, lang: models.LanguageTypeScript, wantFires: false, src: `
+import { tool } from "ai";
+import { z } from "zod";
+export const fetchWeather = tool({ description: "x", inputSchema: z.object({ city: z.string() }), execute: async ({ city }) => city });
+`},
+	// VAI-018: privileged Vercel tools need an explicit human approval gate.
+	{name: "VAI-018 fires on shell tool with no needsApproval", ruleID: "VAI-018", kind: models.KindVercelAITool, lang: models.LanguageTypeScript, wantFires: true, src: `
+import { tool } from "ai";
+import { z } from "zod";
+import { execSync } from "child_process";
+export const t = tool({ description: "run", inputSchema: z.object({ cmd: z.string() }), execute: async ({ cmd }) => execSync(cmd).toString() });
+`},
+	{name: "VAI-018 fires on eval tool with needsApproval false", ruleID: "VAI-018", kind: models.KindVercelAITool, lang: models.LanguageTypeScript, wantFires: true, src: `
+import { tool } from "ai";
+import { z } from "zod";
+export const t = tool({ description: "calc", inputSchema: z.object({ expr: z.string() }), needsApproval: false, execute: async ({ expr }) => eval(expr) });
+`},
+	{name: "VAI-018 silent on approved dynamic shell tool", ruleID: "VAI-018", kind: models.KindVercelAITool, lang: models.LanguageTypeScript, wantFires: false, src: `
+import { dynamicTool } from "ai";
+import { execSync } from "child_process";
+export const t = dynamicTool({ description: "run", needsApproval: true, execute: async ({ cmd }) => execSync(cmd).toString() });
+`},
+	{name: "VAI-018 silent when approval is a callback", ruleID: "VAI-018", kind: models.KindVercelAITool, lang: models.LanguageTypeScript, wantFires: false, src: `
+import { tool } from "ai";
+import { z } from "zod";
+export const t = tool({ description: "calc", inputSchema: z.object({ expr: z.string() }), needsApproval: async ({ expr }) => expr.length > 0, execute: async ({ expr }) => eval(expr) });
+`},
+	{name: "VAI-018 silent on non-privileged tool without approval", ruleID: "VAI-018", kind: models.KindVercelAITool, lang: models.LanguageTypeScript, wantFires: false, src: `
+import { tool } from "ai";
+import { z } from "zod";
+export const t = tool({ description: "add", inputSchema: z.object({ a: z.number() }), execute: async ({ a }) => a + 1 });
 `},
 
 	// ─── CrewAI tool rules (CREW-*) ─────────────────────────────────────────
@@ -510,6 +615,17 @@ def fetch(q: str) -> str:
     return requests.get("https://api.example.com/data").text
 `, wantFires: false},
 
+	{name: "AG2-015 fires on mutating tool without key", ruleID: "AG2-015", kind: models.KindAutoGenTool, src: `
+def refund_payment(payment_id: str, amount: int) -> str:
+    """Refund a payment."""
+    return billing.refund(payment_id, amount)
+`, wantFires: true},
+	{name: "AG2-015 silent with idempotency key", ruleID: "AG2-015", kind: models.KindAutoGenTool, src: `
+def refund_payment(payment_id: str, amount: int, idempotency_key: str) -> str:
+    """Refund a payment."""
+    return billing.refund(payment_id, amount, idempotency_key=idempotency_key)
+`, wantFires: false},
+
 	{name: "AG2-012 fires on network call without timeout", ruleID: "AG2-012", kind: models.KindAutoGenTool, src: `
 def fetch(q: str) -> str:
     """Fetch."""
@@ -609,6 +725,40 @@ def create_order(customer_id: str, amount: float, idempotency_key: str) -> dict:
     """Create an order."""
     return {"ok": True}
 `, wantFires: false},
+
+	// ─── PYD-014 side-effect bounds (recipient / amount, no visible cap) ────
+	{name: "PYD-014 fires on send tool with free-form recipient", ruleID: "PYD-014", kind: models.KindPydanticAITool, src: `
+def send_email(to: str, body: str) -> str:
+    """Send an email."""
+    return "ok"
+`, wantFires: true},
+	{name: "PYD-014 fires on charge tool with free-form amount", ruleID: "PYD-014", kind: models.KindPydanticAITool, src: `
+def charge_card(customer_id: str, amount: float) -> str:
+    """Charge a card."""
+    return "ok"
+`, wantFires: true},
+	{name: "PYD-014 silent when amount has a conint bound", ruleID: "PYD-014", kind: models.KindPydanticAITool, src: `
+def charge_card(customer_id: str, amount: conint(le=50000)) -> str:
+    """Charge a card."""
+    return "ok"
+`, wantFires: false},
+	{name: "PYD-014 silent when the name matches but the param does not", ruleID: "PYD-014", kind: models.KindPydanticAITool, src: `
+def charge_customer(customer_id: str) -> str:
+    """Charge, amount decided server-side."""
+    return "ok"
+`, wantFires: false},
+	{name: "PYD-014 silent when requires_approval=True gates the call", ruleID: "PYD-014", kind: models.KindPydanticAITool, toolConfig: map[string]string{"requires_approval": "True"}, src: `
+def send_email(to: str, body: str) -> str:
+    """Send an email."""
+    return "ok"
+`, wantFires: false},
+	// Explicit requires_approval=False is exactly as un-gated as omitting the
+	// kwarg.
+	{name: "PYD-014 fires when requires_approval=False explicitly", ruleID: "PYD-014", kind: models.KindPydanticAITool, toolConfig: map[string]string{"requires_approval": "False"}, src: `
+def send_email(to: str, body: str) -> str:
+    """Send an email."""
+    return "ok"
+`, wantFires: true},
 
 	// ─── CSDK-001 missing docstring ─────────────────────────────────────────
 	{name: "CSDK-001 fires on missing docstring", ruleID: "CSDK-001", kind: models.KindClaudeSDKTool, src: `
@@ -987,6 +1137,68 @@ def create_order(customer_id: str, amount: float, idempotency_key: str) -> dict:
 `,
 		toolConfig: nil, wantFires: false},
 
+	// ─── OAI-030 side-effect bounds (recipient / amount, no visible cap) ────
+	{name: "OAI-030 fires on send tool with free-form recipient", ruleID: "OAI-030", kind: models.KindOpenAITool, src: `
+def send_email(to: str, subject: str, body: str) -> str:
+    """Send an email."""
+    return "ok"
+`,
+		toolConfig: nil, wantFires: true},
+	{name: "OAI-030 fires on refund tool with free-form amount", ruleID: "OAI-030", kind: models.KindOpenAITool, src: `
+def refund_payment(charge_id: str, amount: int) -> str:
+    """Refund a payment."""
+    return "ok"
+`,
+		toolConfig: nil, wantFires: true},
+	{name: "OAI-030 silent when amount has a Field(le=) bound", ruleID: "OAI-030", kind: models.KindOpenAITool, src: `
+def refund_payment(charge_id: str, amount: int = Field(le=50000)) -> str:
+    """Refund a payment."""
+    return "ok"
+`,
+		toolConfig: nil, wantFires: false},
+	{name: "OAI-030 silent when body enforces a MAX_ constant", ruleID: "OAI-030", kind: models.KindOpenAITool, src: `
+def refund_payment(charge_id: str, amount: int) -> str:
+    """Refund a payment."""
+    if amount > MAX_REFUND_CENTS:
+        raise ValueError("too much")
+    return "ok"
+`,
+		toolConfig: nil, wantFires: false},
+	{name: "OAI-030 silent when amount is not a model-supplied param", ruleID: "OAI-030", kind: models.KindOpenAITool, src: `
+def charge_customer(customer_id: str) -> str:
+    """Charge, amount decided server-side."""
+    return "ok"
+`,
+		toolConfig: nil, wantFires: false},
+	{name: "OAI-030 silent on a non-mutating tool name", ruleID: "OAI-030", kind: models.KindOpenAITool, src: `
+def get_user_data(user_id: str) -> dict:
+    """Get user data."""
+    return {}
+`,
+		toolConfig: nil, wantFires: false},
+	{name: "OAI-030 silent with an allow-list check in the body", ruleID: "OAI-030", kind: models.KindOpenAITool, src: `
+def notify_channel(recipient: str, message: str) -> str:
+    """Notify a channel."""
+    if recipient not in ALLOWED_CHANNELS:
+        raise ValueError("bad recipient")
+    return "ok"
+`,
+		toolConfig: nil, wantFires: false},
+	{name: "OAI-030 silent when needs_approval=True gates the call", ruleID: "OAI-030", kind: models.KindOpenAITool, src: `
+def send_email(to: str, subject: str, body: str) -> str:
+    """Send an email."""
+    return "ok"
+`,
+		toolConfig: map[string]string{"needs_approval": "True"}, wantFires: false},
+	// Explicit needs_approval=False is exactly as un-gated as omitting the
+	// kwarg, mirroring OAI-014's treatment of the same kwarg.
+	{name: "OAI-030 fires when needs_approval=False explicitly", ruleID: "OAI-030", kind: models.KindOpenAITool, src: `
+def send_email(to: str, subject: str, body: str) -> str:
+    """Send an email."""
+    return "ok"
+`,
+		toolConfig: map[string]string{"needs_approval": "False"}, wantFires: true},
+
 	// ─── OAI-010 print to stdout ─────────────────────────────────────────────
 	{name: "OAI-010 fires on print()", ruleID: "OAI-010", kind: models.KindOpenAITool, src: `
 def fetch(x: str) -> dict:
@@ -1237,6 +1449,41 @@ def create_order(customer_id: str, amount: float) -> dict:
 def create_order(customer_id: str, amount: float, idempotency_key: str) -> dict:
     """Create an order."""
     return {"ok": True}
+`,
+		toolConfig: nil, wantFires: false},
+
+	// ─── MCP-030 side-effect bounds (recipient / amount, no visible cap) ────
+	{name: "MCP-030 fires on notify tool with free-form recipient", ruleID: "MCP-030", kind: models.KindMCPTool, src: `
+def notify_user(recipient: str, message: str) -> str:
+    """Notify a user."""
+    return "ok"
+`,
+		toolConfig: nil, wantFires: true},
+	{name: "MCP-030 fires on refund tool with free-form amount", ruleID: "MCP-030", kind: models.KindMCPTool, src: `
+def refund_payment(charge_id: str, amount: int) -> str:
+    """Refund a payment."""
+    return "ok"
+`,
+		toolConfig: nil, wantFires: true},
+	{name: "MCP-030 silent when amount has an allow-list bound", ruleID: "MCP-030", kind: models.KindMCPTool, src: `
+def refund_payment(charge_id: str, amount: int) -> str:
+    """Refund a payment."""
+    if amount > MAX_REFUND_CENTS:
+        raise ValueError("too much")
+    return "ok"
+`,
+		toolConfig: nil, wantFires: false},
+	{name: "MCP-030 silent when the handler elicits confirmation", ruleID: "MCP-030", kind: models.KindMCPTool, src: `
+def refund_payment(charge_id: str, amount: int) -> str:
+    """Refund a payment."""
+    ctx.elicit("confirm this refund?")
+    return "ok"
+`,
+		toolConfig: nil, wantFires: false},
+	{name: "MCP-030 silent when the name matches but the param does not", ruleID: "MCP-030", kind: models.KindMCPTool, src: `
+def charge_customer(customer_id: str) -> str:
+    """Charge, amount decided server-side."""
+    return "ok"
 `,
 		toolConfig: nil, wantFires: false},
 
@@ -1688,6 +1935,30 @@ def calc(expr: str) -> int:
 			"} });\n",
 	},
 
+	// ── VAI-010: mutating Vercel tool VarName without idempotency marker ──
+	// Name is empty for Vercel tools; name_has_prefix matches VarName.
+	{
+		name: "VAI-010 fires on createCharge binding", ruleID: "VAI-010",
+		kind: models.KindVercelAITool, lang: models.LanguageTypeScript, wantFires: true,
+		src: "import { tool } from \"ai\";\n" +
+			"import { z } from \"zod\";\n" +
+			"export const createCharge = tool({ description: \"bill\", inputSchema: z.object({ cents: z.number() }), execute: async ({ cents }) => cents });\n",
+	},
+	{
+		name: "VAI-010 silent on read binding", ruleID: "VAI-010",
+		kind: models.KindVercelAITool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { tool } from \"ai\";\n" +
+			"import { z } from \"zod\";\n" +
+			"export const getStatus = tool({ description: \"status\", inputSchema: z.object({ id: z.string() }), execute: async ({ id }) => id });\n",
+	},
+	{
+		name: "VAI-010 silent when idempotencyKey in schema", ruleID: "VAI-010",
+		kind: models.KindVercelAITool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { tool } from \"ai\";\n" +
+			"import { z } from \"zod\";\n" +
+			"export const createCharge = tool({ description: \"bill\", inputSchema: z.object({ cents: z.number(), idempotencyKey: z.string() }), execute: async ({ cents, idempotencyKey }) => cents });\n",
+	},
+
 	// ── OAI-017: TS eval / new Function (has_body_text) ──
 	{
 		name: "OAI-017 fires on TS eval", ruleID: "OAI-017",
@@ -1722,6 +1993,45 @@ def calc(expr: str) -> int:
 			"export const t = tool({ name: \"get_status\", description: \"f\", parameters: {}, execute: async () => {\n" +
 			"  return 1;\n" +
 			"} });\n",
+	},
+
+	// ── OAI-031: TS side-effect bounds (recipient / amount, no visible cap) ──
+	{
+		name: "OAI-031 fires on send tool with free-form recipient", ruleID: "OAI-031",
+		kind: models.KindOpenAITool, lang: models.LanguageTypeScript, wantFires: true,
+		src: "import { tool } from \"@openai/agents\";\nimport { z } from \"zod\";\n" +
+			"export const t = tool({ name: \"send_email\", description: \"Send\", parameters: z.object({ to: z.string(), body: z.string() }), execute: async ({ to, body }) => \"ok\" });\n",
+	},
+	{
+		name: "OAI-031 fires on charge tool with free-form amount", ruleID: "OAI-031",
+		kind: models.KindOpenAITool, lang: models.LanguageTypeScript, wantFires: true,
+		src: "import { tool } from \"@openai/agents\";\nimport { z } from \"zod\";\n" +
+			"export const t = tool({ name: \"charge_customer\", description: \"Charge\", parameters: z.object({ amount: z.number() }), execute: async ({ amount }) => \"ok\" });\n",
+	},
+	{
+		name: "OAI-031 silent when the amount has a zod .max() bound", ruleID: "OAI-031",
+		kind: models.KindOpenAITool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { tool } from \"@openai/agents\";\nimport { z } from \"zod\";\n" +
+			"export const t = tool({ name: \"charge_customer\", description: \"Charge\", parameters: z.object({ amount: z.number().max(500) }), execute: async ({ amount }) => \"ok\" });\n",
+	},
+	{
+		name: "OAI-031 silent when the name matches but the param does not (payload, not a money verb)", ruleID: "OAI-031",
+		kind: models.KindOpenAITool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { tool } from \"@openai/agents\";\nimport { z } from \"zod\";\n" +
+			"export const t = tool({ name: \"payload_transform\", description: \"x\", parameters: z.object({ amount: z.number() }), execute: async ({ amount }) => \"ok\" });\n",
+	},
+	{
+		name: "OAI-031 silent when needsApproval: true gates the call", ruleID: "OAI-031",
+		kind: models.KindOpenAITool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { tool } from \"@openai/agents\";\nimport { z } from \"zod\";\n" +
+			"export const t = tool({ name: \"send_email\", description: \"Send\", parameters: z.object({ to: z.string(), body: z.string() }), needsApproval: true, execute: async ({ to, body }) => \"ok\" });\n",
+	},
+	// Explicit needsApproval: false is exactly as un-gated as omitting it.
+	{
+		name: "OAI-031 fires when needsApproval: false explicitly", ruleID: "OAI-031",
+		kind: models.KindOpenAITool, lang: models.LanguageTypeScript, wantFires: true,
+		src: "import { tool } from \"@openai/agents\";\nimport { z } from \"zod\";\n" +
+			"export const t = tool({ name: \"send_email\", description: \"Send\", parameters: z.object({ to: z.string(), body: z.string() }), needsApproval: false, execute: async ({ to, body }) => \"ok\" });\n",
 	},
 
 	// ── OAI-022: TS tool has no description ──
@@ -1986,6 +2296,1273 @@ def fetch_data(x: str) -> dict:
     return {}
 `,
 		toolConfig: nil, wantFires: false},
+
+	// ─── VAI-013 / VAI-014: Vercel AI description quality (typescript) ──────
+	// has_description_text and description_length_lt both read
+	// ToolDef.Description, which for TS is the explicit `description` field.
+	{
+		name: "VAI-013 fires on placeholder description", ruleID: "VAI-013",
+		kind: models.KindVercelAITool, lang: models.LanguageTypeScript, wantFires: true,
+		src: "import { tool } from \"ai\";\n" +
+			"export const t = tool({ description: \"TODO: describe this tool.\", inputSchema: {}, execute: async () => \"x\" });\n",
+	},
+	{
+		name: "VAI-013 silent on a real description", ruleID: "VAI-013",
+		kind: models.KindVercelAITool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { tool } from \"ai\";\n" +
+			"export const t = tool({ description: \"Look up a single order by its identifier and return its status.\", inputSchema: {}, execute: async () => \"x\" });\n",
+	},
+	{
+		name: "VAI-014 fires on a too-short description", ruleID: "VAI-014",
+		kind: models.KindVercelAITool, lang: models.LanguageTypeScript, wantFires: true,
+		src: "import { tool } from \"ai\";\n" +
+			"export const t = tool({ description: \"Gets data.\", inputSchema: {}, execute: async () => \"x\" });\n",
+	},
+	{
+		name: "VAI-014 silent on a full description", ruleID: "VAI-014",
+		kind: models.KindVercelAITool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { tool } from \"ai\";\n" +
+			"export const t = tool({ description: \"List every order belonging to one customer, most recent first.\", inputSchema: {}, execute: async () => \"x\" });\n",
+	},
+	{
+		name: "VAI-014 silent when the description is absent (VAI-004's case)", ruleID: "VAI-014",
+		kind: models.KindVercelAITool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { tool } from \"ai\";\n" +
+			"export const t = tool({ inputSchema: {}, execute: async () => \"x\" });\n",
+	},
+	// ─── PYD-008: Pydantic AI tool raises with no ModelRetry path ───────────
+	// has_raise + no try/except, minus a has_body_text suppressor for
+	// ModelRetry. Three cases: the raise, and BOTH silencing routes — catching
+	// the failure, and raising ModelRetry (the SDK's own recovery channel,
+	// which must not be reported as a defect).
+	{name: "PYD-008 fires on uncaught raise", ruleID: "PYD-008", kind: models.KindPydanticAITool, src: `
+def lookup_order(order_id: str) -> str:
+    """Look up an order."""
+    if not order_id:
+        raise ValueError("order_id is required")
+    return order_id
+`, wantFires: true},
+	{name: "PYD-008 silent when the failure is caught", ruleID: "PYD-008", kind: models.KindPydanticAITool, src: `
+def lookup_order(order_id: str) -> dict:
+    """Look up an order."""
+    try:
+        if not order_id:
+            raise ValueError("order_id is required")
+        return {"order_id": order_id}
+    except ValueError as exc:
+        return {"error": str(exc), "retryable": False}
+`, wantFires: false},
+	{name: "PYD-008 silent on raise ModelRetry", ruleID: "PYD-008", kind: models.KindPydanticAITool, src: `
+def lookup_order(order_id: str) -> str:
+    """Look up an order."""
+    if not order_id:
+        raise ModelRetry("order_id was empty; supply the customer's order number")
+    return order_id
+`, wantFires: false},
+
+	// ─── LC-009 / LC-023: LangChain path safety (python + typescript) ───────
+	// LC-009 is the per-param Python flow check; LC-023 is the coarse TS
+	// filesystem-write signal, mirroring CSDK-012 until TS path normalization
+	// analysis exists.
+	{name: "LC-009 fires on path param in open()", ruleID: "LC-009", kind: models.KindLangChainTool, src: `
+def read_note(note_path: str) -> str:
+    """Read a note."""
+    with open(note_path, "r") as f:
+        return f.read()
+`, wantFires: true},
+	{name: "LC-009 silent with .resolve()", ruleID: "LC-009", kind: models.KindLangChainTool, src: `
+from pathlib import Path
+def read_note(note_path: str) -> str:
+    """Read a note."""
+    p = Path(note_path).resolve()
+    with open(p, "r") as f:
+        return f.read()
+`, wantFires: false},
+	{name: "LC-009 silent on non-pathish param", ruleID: "LC-009", kind: models.KindLangChainTool, src: `
+def get_note_meta(note_id: str) -> dict:
+    """Get note metadata."""
+    return {"id": note_id}
+`, wantFires: false},
+	{
+		name: "LC-023 fires on TS filesystem write", ruleID: "LC-023",
+		kind: models.KindLangChainTool, lang: models.LanguageTypeScript, wantFires: true,
+		src: "import { tool } from \"@langchain/core/tools\";\n" +
+			"import { writeFileSync } from \"node:fs\";\n" +
+			"export const t = tool(async ({ p, body }: { p: string; body: string }) => {\n" +
+			"  writeFileSync(p, body);\n" +
+			"  return \"saved\";\n" +
+			"}, { name: \"save_note\", description: \"Save a note.\", schema: {} });\n",
+	},
+	{
+		name: "LC-023 silent with no filesystem write", ruleID: "LC-023",
+		kind: models.KindLangChainTool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { tool } from \"@langchain/core/tools\";\n" +
+			"const notes = new Map<string, string>();\n" +
+			"export const t = tool(async ({ body }: { body: string }) => {\n" +
+			"  notes.set(\"n1\", body);\n" +
+			"  return \"n1\";\n" +
+			"}, { name: \"save_note\", description: \"Save a note.\", schema: {} });\n",
+	},
+
+	// ─── CREW-007: CrewAI tool network call without a timeout ───────────────
+	// Same call_without_kwarg callee list as PYD-006.
+	{name: "CREW-007 fires on network call without timeout", ruleID: "CREW-007", kind: models.KindCrewAITool, src: `
+def fetch_report(url: str) -> str:
+    """Fetch a report."""
+    import requests
+    return requests.get(url).text
+`, wantFires: true},
+	{name: "CREW-007 silent with timeout", ruleID: "CREW-007", kind: models.KindCrewAITool, src: `
+def fetch_report(url: str) -> str:
+    """Fetch a report."""
+    import requests
+    return requests.get(url, timeout=10).text
+`, wantFires: false},
+
+	// ─── LC-008: LangChain tool raises with no structured error contract ────
+	{name: "LC-008 fires on uncaught raise", ruleID: "LC-008", kind: models.KindLangChainTool, src: `
+def lookup_order(order_id: str) -> str:
+    """Look up an order."""
+    if not order_id:
+        raise ValueError("order_id is required")
+    return order_id
+`, wantFires: true},
+	{name: "LC-008 silent when the failure is caught", ruleID: "LC-008", kind: models.KindLangChainTool, src: `
+def lookup_order(order_id: str) -> dict:
+    """Look up an order."""
+    try:
+        if not order_id:
+            raise ValueError("order_id is required")
+        return {"order_id": order_id}
+    except ValueError as exc:
+        return {"error": str(exc), "retryable": False}
+`, wantFires: false},
+
+	// ─── CREW-008: CrewAI tool raises with no structured error contract ─────
+	{name: "CREW-008 fires on uncaught raise", ruleID: "CREW-008", kind: models.KindCrewAITool, src: `
+def lookup_order(order_id: str) -> str:
+    """Look up an order."""
+    if not order_id:
+        raise ValueError("order_id is required")
+    return order_id
+`, wantFires: true},
+	{name: "CREW-008 silent when the failure is caught", ruleID: "CREW-008", kind: models.KindCrewAITool, src: `
+def lookup_order(order_id: str) -> str:
+    """Look up an order."""
+    try:
+        if not order_id:
+            raise ValueError("order_id is required")
+        return order_id
+    except ValueError:
+        return "error: order_id was empty; supply the customer's order number"
+`, wantFires: false},
+
+	// ─── AG2-013: AutoGen tool raises with no structured error contract ─────
+	{name: "AG2-013 fires on uncaught raise", ruleID: "AG2-013", kind: models.KindAutoGenTool, src: `
+def lookup_order(order_id: str) -> str:
+    """Look up an order."""
+    if not order_id:
+        raise ValueError("order_id is required")
+    return order_id
+`, wantFires: true},
+	{name: "AG2-013 silent when the failure is caught", ruleID: "AG2-013", kind: models.KindAutoGenTool, src: `
+def lookup_order(order_id: str) -> str:
+    """Look up an order."""
+    try:
+        if not order_id:
+            raise ValueError("order_id is required")
+        return order_id
+    except ValueError:
+        return "error: order_id was empty; supply the customer's order number"
+`, wantFires: false},
+
+	// ─── PYD-009: Pydantic AI path param reaching I/O unnormalized ──────────
+	// call_uses_unnormalized_path_param is per-param, so the third case pins
+	// that a non-pathish param does not drag the rule in.
+	{name: "PYD-009 fires on path param in open()", ruleID: "PYD-009", kind: models.KindPydanticAITool, src: `
+def read_note(note_path: str) -> str:
+    """Read a note."""
+    with open(note_path, "r") as f:
+        return f.read()
+`, wantFires: true},
+	{name: "PYD-009 silent with .resolve()", ruleID: "PYD-009", kind: models.KindPydanticAITool, src: `
+from pathlib import Path
+def read_note(note_path: str) -> str:
+    """Read a note."""
+    p = Path(note_path).resolve()
+    with open(p, "r") as f:
+        return f.read()
+`, wantFires: false},
+	{name: "PYD-009 silent on non-pathish param", ruleID: "PYD-009", kind: models.KindPydanticAITool, src: `
+def get_note_meta(note_id: str) -> dict:
+    """Get note metadata."""
+    return {"id": note_id}
+`, wantFires: false},
+
+	// ─── CREW-009: CrewAI path param reaching I/O unnormalized ──────────────
+	{name: "CREW-009 fires on path param in open()", ruleID: "CREW-009", kind: models.KindCrewAITool, src: `
+def read_note(note_path: str) -> str:
+    """Read a note."""
+    with open(note_path, "r") as f:
+        return f.read()
+`, wantFires: true},
+	{name: "CREW-009 silent with .resolve()", ruleID: "CREW-009", kind: models.KindCrewAITool, src: `
+from pathlib import Path
+def read_note(note_path: str) -> str:
+    """Read a note."""
+    p = Path(note_path).resolve()
+    with open(p, "r") as f:
+        return f.read()
+`, wantFires: false},
+	{name: "CREW-009 silent on non-pathish param", ruleID: "CREW-009", kind: models.KindCrewAITool, src: `
+def get_note_meta(note_id: str) -> dict:
+    """Get note metadata."""
+    return {"id": note_id}
+`, wantFires: false},
+
+	// ─── AG2-014: AutoGen path param reaching I/O unnormalized ──────────────
+	{name: "AG2-014 fires on path param in open()", ruleID: "AG2-014", kind: models.KindAutoGenTool, src: `
+def read_note(note_path: str) -> str:
+    """Read a note."""
+    with open(note_path, "r") as f:
+        return f.read()
+`, wantFires: true},
+	{name: "AG2-014 silent with .resolve()", ruleID: "AG2-014", kind: models.KindAutoGenTool, src: `
+from pathlib import Path
+def read_note(note_path: str) -> str:
+    """Read a note."""
+    p = Path(note_path).resolve()
+    with open(p, "r") as f:
+        return f.read()
+`, wantFires: false},
+	{name: "AG2-014 silent on non-pathish param", ruleID: "AG2-014", kind: models.KindAutoGenTool, src: `
+def get_note_meta(note_id: str) -> dict:
+    """Get note metadata."""
+    return {"id": note_id}
+`, wantFires: false},
+
+	// ─── LC-017: mutating LangChain tool with no idempotency key ────────────
+	// Same name_has_prefix + param_name_matches shape as MCP-007. Third case
+	// pins that a non-mutating name is not swept in by the missing key alone.
+	{name: "LC-017 fires on mutating tool without key", ruleID: "LC-017", kind: models.KindLangChainTool, src: `
+def refund_payment(charge_id: str, amount_cents: int) -> dict:
+    """Refund a charge."""
+    return {"ok": True}
+`, wantFires: true},
+	{name: "LC-017 silent with idempotency key", ruleID: "LC-017", kind: models.KindLangChainTool, src: `
+def refund_payment(charge_id: str, amount_cents: int, idempotency_key: str) -> dict:
+    """Refund a charge."""
+    return {"ok": True}
+`, wantFires: false},
+	{name: "LC-017 silent on a read-only tool name", ruleID: "LC-017", kind: models.KindLangChainTool, src: `
+def get_payment(charge_id: str) -> dict:
+    """Get a charge."""
+    return {"ok": True}
+`, wantFires: false},
+
+	// ─── LC-025 side-effect bounds (recipient / amount, no visible cap) ────
+	{name: "LC-025 fires on send tool with free-form recipient", ruleID: "LC-025", kind: models.KindLangChainTool, src: `
+def send_email(to: str, body: str) -> str:
+    """Send an email."""
+    return "ok"
+`, wantFires: true},
+	{name: "LC-025 fires on charge tool with free-form amount", ruleID: "LC-025", kind: models.KindLangChainTool, src: `
+def charge_card(customer_id: str, amount_cents: int) -> str:
+    """Charge a card."""
+    return "ok"
+`, wantFires: true},
+	{name: "LC-025 silent when amount has an ALLOWED bound", ruleID: "LC-025", kind: models.KindLangChainTool, src: `
+def charge_card(customer_id: str, amount_cents: int) -> str:
+    """Charge a card."""
+    if amount_cents > ALLOWED_MAX_CENTS:
+        raise ValueError("too much")
+    return "ok"
+`, wantFires: false},
+	{name: "LC-025 silent when the tool calls interrupt() for approval", ruleID: "LC-025", kind: models.KindLangChainTool, src: `
+def charge_card(customer_id: str, amount_cents: int) -> str:
+    """Charge a card."""
+    interrupt("confirm this charge?")
+    return "ok"
+`, wantFires: false},
+	{name: "LC-025 silent when the name matches but the param does not", ruleID: "LC-025", kind: models.KindLangChainTool, src: `
+def charge_customer(customer_id: str) -> str:
+    """Charge, amount decided server-side."""
+    return "ok"
+`, wantFires: false},
+
+	// ─── PYD-010 / PYD-011: Pydantic AI description quality ─────────────────
+	// PYD-010 is has_description_text (placeholder markers); PYD-011 pairs
+	// description_length_lt with has_docstring so an ABSENT docstring stays
+	// PYD-001's finding rather than double-reporting here.
+	{name: "PYD-010 fires on placeholder description", ruleID: "PYD-010", kind: models.KindPydanticAITool, src: `
+def lookup_order(order_id: str) -> str:
+    """TODO: describe this tool."""
+    return order_id
+`, wantFires: true},
+	{name: "PYD-010 silent on a real description", ruleID: "PYD-010", kind: models.KindPydanticAITool, src: `
+def lookup_order(order_id: str) -> str:
+    """Look up a single order by its identifier and return its current status."""
+    return order_id
+`, wantFires: false},
+	{name: "PYD-011 fires on a too-short description", ruleID: "PYD-011", kind: models.KindPydanticAITool, src: `
+def list_orders(customer_id: str) -> str:
+    """Gets data."""
+    return customer_id
+`, wantFires: true},
+	{name: "PYD-011 silent on a full description", ruleID: "PYD-011", kind: models.KindPydanticAITool, src: `
+def list_orders(customer_id: str) -> str:
+    """List every order belonging to one customer, most recent first."""
+    return customer_id
+`, wantFires: false},
+	{name: "PYD-011 silent when the docstring is absent (PYD-001's case)", ruleID: "PYD-011", kind: models.KindPydanticAITool, src: `
+def list_orders(customer_id: str) -> str:
+    return customer_id
+`, wantFires: false},
+
+	// ─── LC-018 / LC-019: LangChain description quality ─────────────────────
+	{name: "LC-018 fires on placeholder description", ruleID: "LC-018", kind: models.KindLangChainTool, src: `
+def lookup_order(order_id: str) -> str:
+    """TODO: describe this tool."""
+    return order_id
+`, wantFires: true},
+	{name: "LC-018 silent on a real description", ruleID: "LC-018", kind: models.KindLangChainTool, src: `
+def lookup_order(order_id: str) -> str:
+    """Look up a single order by its identifier and return its current status."""
+    return order_id
+`, wantFires: false},
+	{name: "LC-019 fires on a too-short description", ruleID: "LC-019", kind: models.KindLangChainTool, src: `
+def list_orders(customer_id: str) -> str:
+    """Gets data."""
+    return customer_id
+`, wantFires: true},
+	{name: "LC-019 silent on a full description", ruleID: "LC-019", kind: models.KindLangChainTool, src: `
+def list_orders(customer_id: str) -> str:
+    """List every order belonging to one customer, most recent first."""
+    return customer_id
+`, wantFires: false},
+	{name: "LC-019 silent when the docstring is absent (LC-001's case)", ruleID: "LC-019", kind: models.KindLangChainTool, src: `
+def list_orders(customer_id: str) -> str:
+    return customer_id
+`, wantFires: false},
+
+	// ─── CREW-010 / CREW-011: CrewAI description quality ────────────────────
+	{name: "CREW-010 fires on placeholder description", ruleID: "CREW-010", kind: models.KindCrewAITool, src: `
+def lookup_order(order_id: str) -> str:
+    """TODO: describe this tool."""
+    return order_id
+`, wantFires: true},
+	{name: "CREW-010 silent on a real description", ruleID: "CREW-010", kind: models.KindCrewAITool, src: `
+def lookup_order(order_id: str) -> str:
+    """Look up a single order by its identifier and return its current status."""
+    return order_id
+`, wantFires: false},
+	{name: "CREW-011 fires on a too-short description", ruleID: "CREW-011", kind: models.KindCrewAITool, src: `
+def list_orders(customer_id: str) -> str:
+    """Gets data."""
+    return customer_id
+`, wantFires: true},
+	{name: "CREW-011 silent on a full description", ruleID: "CREW-011", kind: models.KindCrewAITool, src: `
+def list_orders(customer_id: str) -> str:
+    """List every order belonging to one customer, most recent first."""
+    return customer_id
+`, wantFires: false},
+	{name: "CREW-011 silent when the docstring is absent (CREW-001's case)", ruleID: "CREW-011", kind: models.KindCrewAITool, src: `
+def list_orders(customer_id: str) -> str:
+    return customer_id
+`, wantFires: false},
+
+	// ─── AG2-016 / AG2-017: AutoGen description quality ─────────────────────
+	{name: "AG2-016 fires on placeholder description", ruleID: "AG2-016", kind: models.KindAutoGenTool, src: `
+def lookup_order(order_id: str) -> str:
+    """TODO: describe this tool."""
+    return order_id
+`, wantFires: true},
+	{name: "AG2-016 silent on a real description", ruleID: "AG2-016", kind: models.KindAutoGenTool, src: `
+def lookup_order(order_id: str) -> str:
+    """Look up a single order by its identifier and return its current status."""
+    return order_id
+`, wantFires: false},
+	{name: "AG2-017 fires on a too-short description", ruleID: "AG2-017", kind: models.KindAutoGenTool, src: `
+def list_orders(customer_id: str) -> str:
+    """Gets data."""
+    return customer_id
+`, wantFires: true},
+	{name: "AG2-017 silent on a full description", ruleID: "AG2-017", kind: models.KindAutoGenTool, src: `
+def list_orders(customer_id: str) -> str:
+    """List every order belonging to one customer, most recent first."""
+    return customer_id
+`, wantFires: false},
+	{name: "AG2-017 silent when the docstring is absent (AG2-007's case)", ruleID: "AG2-017", kind: models.KindAutoGenTool, src: `
+def list_orders(customer_id: str) -> str:
+    return customer_id
+`, wantFires: false},
+
+	// ─── VAI-015: Vercel AI tool writes to the filesystem (typescript) ──────
+	// Coarse has_write_call signal, mirroring CSDK-012 until TS path
+	// normalization analysis exists.
+	{
+		name: "VAI-015 fires on filesystem write", ruleID: "VAI-015",
+		kind: models.KindVercelAITool, lang: models.LanguageTypeScript, wantFires: true,
+		src: "import { tool } from \"ai\";\n" +
+			"import { writeFileSync } from \"node:fs\";\n" +
+			"export const t = tool({ description: \"Save a note to disk for later retrieval.\", inputSchema: {}, execute: async ({ p, body }) => {\n" +
+			"  writeFileSync(p, body);\n" +
+			"  return \"saved\";\n" +
+			"} });\n",
+	},
+	{
+		name: "VAI-015 silent with no filesystem write", ruleID: "VAI-015",
+		kind: models.KindVercelAITool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { tool } from \"ai\";\n" +
+			"const notes = new Map<string, string>();\n" +
+			"export const t = tool({ description: \"Save a note to disk for later retrieval.\", inputSchema: {}, execute: async ({ body }) => {\n" +
+			"  notes.set(\"n1\", body);\n" +
+			"  return \"n1\";\n" +
+			"} });\n",
+	},
+
+	{name: "PYD-012 fires on print() in the tool body", ruleID: "PYD-012", kind: models.KindPydanticAITool, src: `
+def lookup_order(order_id: str) -> str:
+    """Look up an order."""
+    print("looking up " + order_id)
+    return order_id
+`, wantFires: true},
+	{name: "PYD-012 silent when logging instead of printing", ruleID: "PYD-012", kind: models.KindPydanticAITool, src: `
+import logging
+logger = logging.getLogger(__name__)
+def lookup_order(order_id: str) -> str:
+    """Look up an order."""
+    logger.info("looking up %s", order_id)
+    return order_id
+`, wantFires: false},
+	{name: "PYD-012 silent on pprint (bare-callee guard)", ruleID: "PYD-012", kind: models.KindPydanticAITool, src: `
+from pprint import pprint
+def lookup_order(order_id: str) -> str:
+    """Look up an order."""
+    pprint({"order_id": order_id})
+    return order_id
+`, wantFires: false},
+
+	{name: "LC-020 fires on print() in the tool body", ruleID: "LC-020", kind: models.KindLangChainTool, src: `
+def lookup_order(order_id: str) -> str:
+    """Look up an order."""
+    print("looking up " + order_id)
+    return order_id
+`, wantFires: true},
+	{name: "LC-020 silent when logging instead of printing", ruleID: "LC-020", kind: models.KindLangChainTool, src: `
+import logging
+logger = logging.getLogger(__name__)
+def lookup_order(order_id: str) -> str:
+    """Look up an order."""
+    logger.info("looking up %s", order_id)
+    return order_id
+`, wantFires: false},
+	{name: "LC-020 silent on pprint (bare-callee guard)", ruleID: "LC-020", kind: models.KindLangChainTool, src: `
+from pprint import pprint
+def lookup_order(order_id: str) -> str:
+    """Look up an order."""
+    pprint({"order_id": order_id})
+    return order_id
+`, wantFires: false},
+
+	{name: "CREW-012 fires on print() in the tool body", ruleID: "CREW-012", kind: models.KindCrewAITool, src: `
+def lookup_order(order_id: str) -> str:
+    """Look up an order."""
+    print("looking up " + order_id)
+    return order_id
+`, wantFires: true},
+	{name: "CREW-012 silent when logging instead of printing", ruleID: "CREW-012", kind: models.KindCrewAITool, src: `
+import logging
+logger = logging.getLogger(__name__)
+def lookup_order(order_id: str) -> str:
+    """Look up an order."""
+    logger.info("looking up %s", order_id)
+    return order_id
+`, wantFires: false},
+	{name: "CREW-012 silent on pprint (bare-callee guard)", ruleID: "CREW-012", kind: models.KindCrewAITool, src: `
+from pprint import pprint
+def lookup_order(order_id: str) -> str:
+    """Look up an order."""
+    pprint({"order_id": order_id})
+    return order_id
+`, wantFires: false},
+
+	{name: "AG2-018 fires on print() in the tool body", ruleID: "AG2-018", kind: models.KindAutoGenTool, src: `
+def lookup_order(order_id: str) -> str:
+    """Look up an order."""
+    print("looking up " + order_id)
+    return order_id
+`, wantFires: true},
+	{name: "AG2-018 silent when logging instead of printing", ruleID: "AG2-018", kind: models.KindAutoGenTool, src: `
+import logging
+logger = logging.getLogger(__name__)
+def lookup_order(order_id: str) -> str:
+    """Look up an order."""
+    logger.info("looking up %s", order_id)
+    return order_id
+`, wantFires: false},
+	{name: "AG2-018 silent on pprint (bare-callee guard)", ruleID: "AG2-018", kind: models.KindAutoGenTool, src: `
+from pprint import pprint
+def lookup_order(order_id: str) -> str:
+    """Look up an order."""
+    pprint({"order_id": order_id})
+    return order_id
+`, wantFires: false},
+
+	{name: "MCP-023 fires on print() in the tool body", ruleID: "MCP-023", kind: models.KindMCPTool, src: `
+def lookup_order(order_id: str) -> str:
+    """Look up an order."""
+    print("looking up " + order_id)
+    return order_id
+`, wantFires: true},
+	{name: "MCP-023 silent when logging to stderr instead", ruleID: "MCP-023", kind: models.KindMCPTool, src: `
+import logging
+logger = logging.getLogger(__name__)
+def lookup_order(order_id: str) -> str:
+    """Look up an order."""
+    logger.info("looking up %s", order_id)
+    return order_id
+`, wantFires: false},
+	{name: "MCP-023 silent on pprint (bare-callee guard)", ruleID: "MCP-023", kind: models.KindMCPTool, src: `
+from pprint import pprint
+def lookup_order(order_id: str) -> str:
+    """Look up an order."""
+    pprint({"order_id": order_id})
+    return order_id
+`, wantFires: false},
+
+	{name: "CSDK-019 fires on print() in the tool body", ruleID: "CSDK-019", kind: models.KindClaudeSDKTool, src: `
+def lookup_order(order_id: str) -> str:
+    """Look up an order."""
+    print("looking up " + order_id)
+    return order_id
+`, wantFires: true},
+	{name: "CSDK-019 silent when logging to stderr instead", ruleID: "CSDK-019", kind: models.KindClaudeSDKTool, src: `
+import logging
+logger = logging.getLogger(__name__)
+def lookup_order(order_id: str) -> str:
+    """Look up an order."""
+    logger.info("looking up %s", order_id)
+    return order_id
+`, wantFires: false},
+	{name: "CSDK-019 silent on pprint (bare-callee guard)", ruleID: "CSDK-019", kind: models.KindClaudeSDKTool, src: `
+from pprint import pprint
+def lookup_order(order_id: str) -> str:
+    """Look up an order."""
+    pprint({"order_id": order_id})
+    return order_id
+`, wantFires: false},
+
+	// ─── CSDK-020: TS Claude SDK tool HTTP call without a timeout ───────────
+	// Structural has_http_call_without_timeout, as OAI-016 uses. CSDK-003 is
+	// the Python half; this pack shipped TS rules but no TS timeout rule.
+	{
+		name: "CSDK-020 fires on TS fetch with no AbortSignal", ruleID: "CSDK-020",
+		kind: models.KindClaudeSDKTool, lang: models.LanguageTypeScript, wantFires: true,
+		src: "import { tool } from \"@anthropic-ai/claude-agent-sdk\";\n" +
+			"export const t = tool(\"fetch_report\", \"Fetch a report.\", {}, async () => {\n" +
+			"  const r = await fetch(\"https://reports.internal/x\");\n" +
+			"  return { content: [{ type: \"text\", text: await r.text() }] };\n" +
+			"});\n",
+	},
+	{
+		name: "CSDK-020 silent when AbortSignal present", ruleID: "CSDK-020",
+		kind: models.KindClaudeSDKTool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { tool } from \"@anthropic-ai/claude-agent-sdk\";\n" +
+			"export const t = tool(\"fetch_report\", \"Fetch a report.\", {}, async () => {\n" +
+			"  const r = await fetch(\"https://reports.internal/x\", { signal: AbortSignal.timeout(15000) });\n" +
+			"  return { content: [{ type: \"text\", text: await r.text() }] };\n" +
+			"});\n",
+	},
+	{
+		name: "CSDK-020 fires when fetch options omit any timeout", ruleID: "CSDK-020",
+		kind: models.KindClaudeSDKTool, lang: models.LanguageTypeScript, wantFires: true,
+		src: "import { tool } from \"@anthropic-ai/claude-agent-sdk\";\n" +
+			"export const t = tool(\"fetch_report\", \"Fetch a report.\", {}, async () => {\n" +
+			"  const r = await fetch(\"https://reports.internal/x\", { method: \"POST\" });\n" +
+			"  return { content: [{ type: \"text\", text: await r.text() }] };\n" +
+			"});\n",
+	},
+
+	// ─── MCP-024: TS MCP tool HTTP call without a timeout ───────────────────
+	{
+		name: "MCP-024 fires on TS fetch with no AbortSignal", ruleID: "MCP-024",
+		kind: models.KindMCPTool, lang: models.LanguageTypeScript, wantFires: true,
+		src: "import { McpServer } from \"@modelcontextprotocol/sdk/server/mcp.js\";\n" +
+			"const s = new McpServer({ name: \"orders\", version: \"1.0.0\" });\n" +
+			"s.tool(\"fetch_report\", \"Fetch a report.\", {}, async () => {\n" +
+			"  const r = await fetch(\"https://reports.internal/x\");\n" +
+			"  return { content: [{ type: \"text\", text: await r.text() }] };\n" +
+			"});\n",
+	},
+	{
+		name: "MCP-024 silent when AbortSignal present", ruleID: "MCP-024",
+		kind: models.KindMCPTool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { McpServer } from \"@modelcontextprotocol/sdk/server/mcp.js\";\n" +
+			"const s = new McpServer({ name: \"orders\", version: \"1.0.0\" });\n" +
+			"s.tool(\"fetch_report\", \"Fetch a report.\", {}, async () => {\n" +
+			"  const r = await fetch(\"https://reports.internal/x\", { signal: AbortSignal.timeout(15000) });\n" +
+			"  return { content: [{ type: \"text\", text: await r.text() }] };\n" +
+			"});\n",
+	},
+	{
+		name: "MCP-024 fires when fetch options omit any timeout", ruleID: "MCP-024",
+		kind: models.KindMCPTool, lang: models.LanguageTypeScript, wantFires: true,
+		src: "import { McpServer } from \"@modelcontextprotocol/sdk/server/mcp.js\";\n" +
+			"const s = new McpServer({ name: \"orders\", version: \"1.0.0\" });\n" +
+			"s.tool(\"fetch_report\", \"Fetch a report.\", {}, async () => {\n" +
+			"  const r = await fetch(\"https://reports.internal/x\", { method: \"POST\" });\n" +
+			"  return { content: [{ type: \"text\", text: await r.text() }] };\n" +
+			"});\n",
+	},
+
+	// ─── ADK-017: TS ADK FunctionTool HTTP call without a timeout ───────────
+	// adk-js uses the options-object form (new FunctionTool({ ..., execute })),
+	// not the Python FunctionTool(fn) wrapper shape.
+	{
+		name: "ADK-017 fires on TS fetch with no AbortSignal", ruleID: "ADK-017",
+		kind: models.KindADKFunctionTool, lang: models.LanguageTypeScript, wantFires: true,
+		src: "import { FunctionTool } from \"@google/adk\";\n" +
+			"const t = new FunctionTool({ name: \"fetch_report\", description: \"Fetch a report.\", parameters: {}, execute: async () => {\n" +
+			"  const r = await fetch(\"https://reports.internal/x\");\n" +
+			"  return await r.text();\n" +
+			"} });\n",
+	},
+	{
+		name: "ADK-017 silent when AbortSignal present", ruleID: "ADK-017",
+		kind: models.KindADKFunctionTool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { FunctionTool } from \"@google/adk\";\n" +
+			"const t = new FunctionTool({ name: \"fetch_report\", description: \"Fetch a report.\", parameters: {}, execute: async () => {\n" +
+			"  const r = await fetch(\"https://reports.internal/x\", { signal: AbortSignal.timeout(15000) });\n" +
+			"  return await r.text();\n" +
+			"} });\n",
+	},
+	{
+		name: "ADK-017 fires when fetch options omit any timeout", ruleID: "ADK-017",
+		kind: models.KindADKFunctionTool, lang: models.LanguageTypeScript, wantFires: true,
+		src: "import { FunctionTool } from \"@google/adk\";\n" +
+			"const t = new FunctionTool({ name: \"fetch_report\", description: \"Fetch a report.\", parameters: {}, execute: async () => {\n" +
+			"  const r = await fetch(\"https://reports.internal/x\", { method: \"POST\" });\n" +
+			"  return await r.text();\n" +
+			"} });\n",
+	},
+
+	{name: "OAI-025 fires on placeholder description", ruleID: "OAI-025", kind: models.KindOpenAITool, src: `
+def lookup_order(order_id: str) -> str:
+    """TODO: describe this tool."""
+    return order_id
+`, wantFires: true},
+	{name: "OAI-025 silent on a real description", ruleID: "OAI-025", kind: models.KindOpenAITool, src: `
+def lookup_order(order_id: str) -> str:
+    """Look up a single order by its identifier and return its current status."""
+    return order_id
+`, wantFires: false},
+	{name: "OAI-026 fires on a too-short description", ruleID: "OAI-026", kind: models.KindOpenAITool, src: `
+def list_orders(customer_id: str) -> str:
+    """Gets data."""
+    return customer_id
+`, wantFires: true},
+	{name: "OAI-026 silent on a full description", ruleID: "OAI-026", kind: models.KindOpenAITool, src: `
+def list_orders(customer_id: str) -> str:
+    """List every order belonging to one customer, most recent first."""
+    return customer_id
+`, wantFires: false},
+	{name: "OAI-026 silent when the docstring is absent (OAI-001's case)", ruleID: "OAI-026", kind: models.KindOpenAITool, src: `
+def list_orders(customer_id: str) -> str:
+    return customer_id
+`, wantFires: false},
+
+	{name: "MCP-025 fires on placeholder description", ruleID: "MCP-025", kind: models.KindMCPTool, src: `
+def lookup_order(order_id: str) -> str:
+    """TODO: describe this tool."""
+    return order_id
+`, wantFires: true},
+	{name: "MCP-025 silent on a real description", ruleID: "MCP-025", kind: models.KindMCPTool, src: `
+def lookup_order(order_id: str) -> str:
+    """Look up a single order by its identifier and return its current status."""
+    return order_id
+`, wantFires: false},
+	{name: "MCP-026 fires on a too-short description", ruleID: "MCP-026", kind: models.KindMCPTool, src: `
+def list_orders(customer_id: str) -> str:
+    """Gets data."""
+    return customer_id
+`, wantFires: true},
+	{name: "MCP-026 silent on a full description", ruleID: "MCP-026", kind: models.KindMCPTool, src: `
+def list_orders(customer_id: str) -> str:
+    """List every order belonging to one customer, most recent first."""
+    return customer_id
+`, wantFires: false},
+	{name: "MCP-026 silent when the docstring is absent (MCP-001's case)", ruleID: "MCP-026", kind: models.KindMCPTool, src: `
+def list_orders(customer_id: str) -> str:
+    return customer_id
+`, wantFires: false},
+
+	{name: "ADK-018 fires on placeholder description", ruleID: "ADK-018", kind: models.KindADKFunctionTool, src: `
+def lookup_order(order_id: str) -> str:
+    """TODO: describe this tool."""
+    return order_id
+`, wantFires: true},
+	{name: "ADK-018 silent on a real description", ruleID: "ADK-018", kind: models.KindADKFunctionTool, src: `
+def lookup_order(order_id: str) -> str:
+    """Look up a single order by its identifier and return its current status."""
+    return order_id
+`, wantFires: false},
+	{name: "ADK-019 fires on a too-short description", ruleID: "ADK-019", kind: models.KindADKFunctionTool, src: `
+def list_orders(customer_id: str) -> str:
+    """Gets data."""
+    return customer_id
+`, wantFires: true},
+	{name: "ADK-019 silent on a full description", ruleID: "ADK-019", kind: models.KindADKFunctionTool, src: `
+def list_orders(customer_id: str) -> str:
+    """List every order belonging to one customer, most recent first."""
+    return customer_id
+`, wantFires: false},
+	{name: "ADK-019 silent when the docstring is absent (ADK-001's case)", ruleID: "ADK-019", kind: models.KindADKFunctionTool, src: `
+def list_orders(customer_id: str) -> str:
+    return customer_id
+`, wantFires: false},
+
+	// ─── CSDK-021 / CSDK-022: TS Claude SDK description quality ─────────────
+	{
+		name: "CSDK-021 fires on placeholder description", ruleID: "CSDK-021",
+		kind: models.KindClaudeSDKTool, lang: models.LanguageTypeScript, wantFires: true,
+		src: "import { tool } from \"@anthropic-ai/claude-agent-sdk\";\n" +
+			"export const t = tool(\"lookup_order\", \"TODO: describe this tool.\", {}, async () => ({ content: [] }));\n",
+	},
+	{
+		name: "CSDK-021 silent on a real description", ruleID: "CSDK-021",
+		kind: models.KindClaudeSDKTool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { tool } from \"@anthropic-ai/claude-agent-sdk\";\n" +
+			"export const t = tool(\"lookup_order\", \"Look up one order by its number and return its fulfillment status.\", {}, async () => ({ content: [] }));\n",
+	},
+	{
+		name: "CSDK-022 fires on a too-short description", ruleID: "CSDK-022",
+		kind: models.KindClaudeSDKTool, lang: models.LanguageTypeScript, wantFires: true,
+		src: "import { tool } from \"@anthropic-ai/claude-agent-sdk\";\n" +
+			"export const t = tool(\"list_orders\", \"Gets data.\", {}, async () => ({ content: [] }));\n",
+	},
+	{
+		name: "CSDK-022 silent on a full description", ruleID: "CSDK-022",
+		kind: models.KindClaudeSDKTool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { tool } from \"@anthropic-ai/claude-agent-sdk\";\n" +
+			"export const t = tool(\"list_orders\", \"List every order belonging to one customer, most recent first.\", {}, async () => ({ content: [] }));\n",
+	},
+	{
+		name: "CSDK-022 silent when the description is absent (CSDK-014's case)", ruleID: "CSDK-022",
+		kind: models.KindClaudeSDKTool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { tool } from \"@anthropic-ai/claude-agent-sdk\";\n" +
+			"export const t = tool(\"list_orders\", \"\", {}, async () => ({ content: [] }));\n",
+	},
+
+	// ─── MCP-027 / MCP-028: TS MCP description quality ──────────────────────
+	{
+		name: "MCP-027 fires on placeholder description", ruleID: "MCP-027",
+		kind: models.KindMCPTool, lang: models.LanguageTypeScript, wantFires: true,
+		src: "import { McpServer } from \"@modelcontextprotocol/sdk/server/mcp.js\";\n" +
+			"const s = new McpServer({ name: \"orders\", version: \"1.0.0\" });\n" +
+			"s.tool(\"lookup_order\", \"TODO: describe this tool.\", {}, async () => ({ content: [] }));\n",
+	},
+	{
+		name: "MCP-027 silent on a real description", ruleID: "MCP-027",
+		kind: models.KindMCPTool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { McpServer } from \"@modelcontextprotocol/sdk/server/mcp.js\";\n" +
+			"const s = new McpServer({ name: \"orders\", version: \"1.0.0\" });\n" +
+			"s.tool(\"lookup_order\", \"Look up one order by its number and return its fulfillment status.\", {}, async () => ({ content: [] }));\n",
+	},
+	{
+		name: "MCP-028 fires on a too-short description", ruleID: "MCP-028",
+		kind: models.KindMCPTool, lang: models.LanguageTypeScript, wantFires: true,
+		src: "import { McpServer } from \"@modelcontextprotocol/sdk/server/mcp.js\";\n" +
+			"const s = new McpServer({ name: \"orders\", version: \"1.0.0\" });\n" +
+			"s.tool(\"list_orders\", \"Gets data.\", {}, async () => ({ content: [] }));\n",
+	},
+	{
+		name: "MCP-028 silent on a full description", ruleID: "MCP-028",
+		kind: models.KindMCPTool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { McpServer } from \"@modelcontextprotocol/sdk/server/mcp.js\";\n" +
+			"const s = new McpServer({ name: \"orders\", version: \"1.0.0\" });\n" +
+			"s.tool(\"list_orders\", \"List every order belonging to one customer, most recent first.\", {}, async () => ({ content: [] }));\n",
+	},
+	{
+		name: "MCP-028 silent when the description is absent (MCP-011's case)", ruleID: "MCP-028",
+		kind: models.KindMCPTool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { McpServer } from \"@modelcontextprotocol/sdk/server/mcp.js\";\n" +
+			"const s = new McpServer({ name: \"orders\", version: \"1.0.0\" });\n" +
+			"s.tool(\"list_orders\", \"\", {}, async () => ({ content: [] }));\n",
+	},
+
+	// ─── OAI-027 / OAI-028: TS OpenAI Agents description quality ────────────
+	{
+		name: "OAI-027 fires on placeholder description", ruleID: "OAI-027",
+		kind: models.KindOpenAITool, lang: models.LanguageTypeScript, wantFires: true,
+		src: "import { tool } from \"@openai/agents\";\n" +
+			"export const t = tool({ name: \"lookup_order\", description: \"TODO: describe this tool.\", parameters: {}, execute: async () => \"x\" });\n",
+	},
+	{
+		name: "OAI-027 silent on a real description", ruleID: "OAI-027",
+		kind: models.KindOpenAITool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { tool } from \"@openai/agents\";\n" +
+			"export const t = tool({ name: \"lookup_order\", description: \"Look up one order by its number and return its fulfillment status.\", parameters: {}, execute: async () => \"x\" });\n",
+	},
+	{
+		name: "OAI-028 fires on a too-short description", ruleID: "OAI-028",
+		kind: models.KindOpenAITool, lang: models.LanguageTypeScript, wantFires: true,
+		src: "import { tool } from \"@openai/agents\";\n" +
+			"export const t = tool({ name: \"list_orders\", description: \"Gets data.\", parameters: {}, execute: async () => \"x\" });\n",
+	},
+	{
+		name: "OAI-028 silent on a full description", ruleID: "OAI-028",
+		kind: models.KindOpenAITool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { tool } from \"@openai/agents\";\n" +
+			"export const t = tool({ name: \"list_orders\", description: \"List every order belonging to one customer, most recent first.\", parameters: {}, execute: async () => \"x\" });\n",
+	},
+	{
+		name: "OAI-028 silent when the description is absent (OAI-022's case)", ruleID: "OAI-028",
+		kind: models.KindOpenAITool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { tool } from \"@openai/agents\";\n" +
+			"export const t = tool({ name: \"list_orders\", parameters: {}, execute: async () => \"x\" });\n",
+	},
+
+	// ─── LC-021 / LC-022: TS LangChain description quality ──────────────────
+	{
+		name: "LC-021 fires on placeholder description", ruleID: "LC-021",
+		kind: models.KindLangChainTool, lang: models.LanguageTypeScript, wantFires: true,
+		src: "import { tool } from \"@langchain/core/tools\";\n" +
+			"export const t = tool(async () => \"x\", { name: \"lookup_order\", description: \"TODO: describe this tool.\", schema: {} });\n",
+	},
+	{
+		name: "LC-021 silent on a real description", ruleID: "LC-021",
+		kind: models.KindLangChainTool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { tool } from \"@langchain/core/tools\";\n" +
+			"export const t = tool(async () => \"x\", { name: \"lookup_order\", description: \"Look up one order by its number and return its fulfillment status.\", schema: {} });\n",
+	},
+	{
+		name: "LC-022 fires on a too-short description", ruleID: "LC-022",
+		kind: models.KindLangChainTool, lang: models.LanguageTypeScript, wantFires: true,
+		src: "import { tool } from \"@langchain/core/tools\";\n" +
+			"export const t = tool(async () => \"x\", { name: \"list_orders\", description: \"Gets data.\", schema: {} });\n",
+	},
+	{
+		name: "LC-022 silent on a full description", ruleID: "LC-022",
+		kind: models.KindLangChainTool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { tool } from \"@langchain/core/tools\";\n" +
+			"export const t = tool(async () => \"x\", { name: \"list_orders\", description: \"List every order belonging to one customer, most recent first.\", schema: {} });\n",
+	},
+	{
+		name: "LC-022 silent when the description is absent (LC-010's case)", ruleID: "LC-022",
+		kind: models.KindLangChainTool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { tool } from \"@langchain/core/tools\";\n" +
+			"export const t = tool(async () => \"x\", { name: \"list_orders\", schema: {} });\n",
+	},
+
+	// ─── MCP-029: TS MCP tool writes to the filesystem ──────────────────────
+	// Coarse has_write_call signal, mirroring CSDK-012 until TS path
+	// normalization analysis exists.
+	{
+		name: "MCP-029 fires on filesystem write", ruleID: "MCP-029",
+		kind: models.KindMCPTool, lang: models.LanguageTypeScript, wantFires: true,
+		src: "import { McpServer } from \"@modelcontextprotocol/sdk/server/mcp.js\";\n" +
+			"import { writeFileSync } from \"node:fs\";\n" +
+			"const s = new McpServer({ name: \"notes\", version: \"1.0.0\" });\n" +
+			"s.tool(\"save_note\", \"Save a note to disk for later retrieval.\", {}, async ({ p, body }) => {\n" +
+			"  writeFileSync(p, body);\n" +
+			"  return { content: [] };\n" +
+			"});\n",
+	},
+	{
+		name: "MCP-029 silent with no filesystem write", ruleID: "MCP-029",
+		kind: models.KindMCPTool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { McpServer } from \"@modelcontextprotocol/sdk/server/mcp.js\";\n" +
+			"const notes = new Map<string, string>();\n" +
+			"const s = new McpServer({ name: \"notes\", version: \"1.0.0\" });\n" +
+			"s.tool(\"save_note\", \"Save a note to disk for later retrieval.\", {}, async ({ body }) => {\n" +
+			"  notes.set(\"n1\", body);\n" +
+			"  return { content: [] };\n" +
+			"});\n",
+	},
+
+	// ─── OAI-029: TS OpenAI Agents tool writes to the filesystem ────────────
+	{
+		name: "OAI-029 fires on filesystem write", ruleID: "OAI-029",
+		kind: models.KindOpenAITool, lang: models.LanguageTypeScript, wantFires: true,
+		src: "import { tool } from \"@openai/agents\";\n" +
+			"import { writeFileSync } from \"node:fs\";\n" +
+			"export const t = tool({ name: \"save_note\", description: \"Save a note to disk for later retrieval.\", parameters: {}, execute: async ({ p, body }) => {\n" +
+			"  writeFileSync(p, body);\n" +
+			"  return \"saved\";\n" +
+			"} });\n",
+	},
+	{
+		name: "OAI-029 silent with no filesystem write", ruleID: "OAI-029",
+		kind: models.KindOpenAITool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { tool } from \"@openai/agents\";\n" +
+			"const notes = new Map<string, string>();\n" +
+			"export const t = tool({ name: \"save_note\", description: \"Save a note to disk for later retrieval.\", parameters: {}, execute: async ({ body }) => {\n" +
+			"  notes.set(\"n1\", body);\n" +
+			"  return \"n1\";\n" +
+			"} });\n",
+	},
+
+	// ─── ADK-014: TS ADK FunctionTool writes to the filesystem ──────────────
+	{
+		name: "ADK-014 fires on filesystem write", ruleID: "ADK-014",
+		kind: models.KindADKFunctionTool, lang: models.LanguageTypeScript, wantFires: true,
+		src: "import { FunctionTool } from \"@google/adk\";\n" +
+			"import { writeFileSync } from \"node:fs\";\n" +
+			"const t = new FunctionTool({ name: \"save_note\", description: \"Save a note to disk for later retrieval.\", parameters: {}, execute: async ({ p, body }) => {\n" +
+			"  writeFileSync(p, body);\n" +
+			"  return \"saved\";\n" +
+			"} });\n",
+	},
+	{
+		name: "ADK-014 silent with no filesystem write", ruleID: "ADK-014",
+		kind: models.KindADKFunctionTool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { FunctionTool } from \"@google/adk\";\n" +
+			"const notes = new Map<string, string>();\n" +
+			"const t = new FunctionTool({ name: \"save_note\", description: \"Save a note to disk for later retrieval.\", parameters: {}, execute: async ({ body }) => {\n" +
+			"  notes.set(\"n1\", body);\n" +
+			"  return \"n1\";\n" +
+			"} });\n",
+	},
+
+	{name: "LC-024 fires on a generic tool name", ruleID: "LC-024", kind: models.KindLangChainTool, src: `
+def process(payload: str) -> str:
+    """Handle an incoming payload and return the result of handling it."""
+    return payload
+`, wantFires: true},
+	{name: "LC-024 silent on a verb-object tool name", ruleID: "LC-024", kind: models.KindLangChainTool, src: `
+def summarize_invoice(invoice_id: str) -> str:
+    """Summarize one invoice by its identifier and return the summary text."""
+    return invoice_id
+`, wantFires: false},
+	{name: "LC-024 silent on a name merely containing a listed word", ruleID: "LC-024", kind: models.KindLangChainTool, src: `
+def process_invoice_batch(batch_id: str) -> str:
+    """Process one batch of invoices and return a per-invoice result summary."""
+    return batch_id
+`, wantFires: false},
+
+	{name: "CREW-013 fires on a generic tool name", ruleID: "CREW-013", kind: models.KindCrewAITool, src: `
+def process(payload: str) -> str:
+    """Handle an incoming payload and return the result of handling it."""
+    return payload
+`, wantFires: true},
+	{name: "CREW-013 silent on a verb-object tool name", ruleID: "CREW-013", kind: models.KindCrewAITool, src: `
+def summarize_invoice(invoice_id: str) -> str:
+    """Summarize one invoice by its identifier and return the summary text."""
+    return invoice_id
+`, wantFires: false},
+	{name: "CREW-013 silent on a name merely containing a listed word", ruleID: "CREW-013", kind: models.KindCrewAITool, src: `
+def process_invoice_batch(batch_id: str) -> str:
+    """Process one batch of invoices and return a per-invoice result summary."""
+    return batch_id
+`, wantFires: false},
+
+	{name: "AG2-019 fires on a generic tool name", ruleID: "AG2-019", kind: models.KindAutoGenTool, src: `
+def process(payload: str) -> str:
+    """Handle an incoming payload and return the result of handling it."""
+    return payload
+`, wantFires: true},
+	{name: "AG2-019 silent on a verb-object tool name", ruleID: "AG2-019", kind: models.KindAutoGenTool, src: `
+def summarize_invoice(invoice_id: str) -> str:
+    """Summarize one invoice by its identifier and return the summary text."""
+    return invoice_id
+`, wantFires: false},
+	{name: "AG2-019 silent on a name merely containing a listed word", ruleID: "AG2-019", kind: models.KindAutoGenTool, src: `
+def process_invoice_batch(batch_id: str) -> str:
+    """Process one batch of invoices and return a per-invoice result summary."""
+    return batch_id
+`, wantFires: false},
+
+	{name: "PYD-013 fires on a generic tool name", ruleID: "PYD-013", kind: models.KindPydanticAITool, src: `
+def process(payload: str) -> str:
+    """Handle an incoming payload and return the result of handling it."""
+    return payload
+`, wantFires: true},
+	{name: "PYD-013 silent on a verb-object tool name", ruleID: "PYD-013", kind: models.KindPydanticAITool, src: `
+def summarize_invoice(invoice_id: str) -> str:
+    """Summarize one invoice by its identifier and return the summary text."""
+    return invoice_id
+`, wantFires: false},
+	{name: "PYD-013 silent on a name merely containing a listed word", ruleID: "PYD-013", kind: models.KindPydanticAITool, src: `
+def process_invoice_batch(batch_id: str) -> str:
+    """Process one batch of invoices and return a per-invoice result summary."""
+    return batch_id
+`, wantFires: false},
+
+	// ─── CREW-014 side-effect bounds (recipient / amount, no visible cap) ────
+	{name: "CREW-014 fires on send tool with free-form recipient", ruleID: "CREW-014", kind: models.KindCrewAITool, src: `
+@tool
+def send_email(to: str, body: str) -> str:
+    """Send an email."""
+    return "ok"
+`, wantFires: true},
+	{name: "CREW-014 fires on refund tool with free-form amount", ruleID: "CREW-014", kind: models.KindCrewAITool, src: `
+@tool
+def refund_payment(charge_id: str, amount: int) -> str:
+    """Refund a payment."""
+    return "ok"
+`, wantFires: true},
+	{name: "CREW-014 silent when the body enforces a MAX_ cap", ruleID: "CREW-014", kind: models.KindCrewAITool, src: `
+@tool
+def refund_payment(charge_id: str, amount: int) -> str:
+    """Refund a payment."""
+    if amount > MAX_REFUND_CENTS:
+        raise ValueError("too much")
+    return "ok"
+`, wantFires: false},
+	{name: "CREW-014 silent with an allow-list check in the body", ruleID: "CREW-014", kind: models.KindCrewAITool, src: `
+@tool
+def send_email(to: str, body: str) -> str:
+    """Send an email."""
+    if not to.endswith("@example.com"):
+        raise ValueError("outside domain")
+    return "ok"
+`, wantFires: false},
+	{name: "CREW-014 silent when the name matches but the param does not", ruleID: "CREW-014", kind: models.KindCrewAITool, src: `
+@tool
+def charge_customer(customer_id: str) -> str:
+    """Charge, amount decided server-side."""
+    return "ok"
+`, wantFires: false},
+	{name: "CREW-014 silent on a non-mutating tool name", ruleID: "CREW-014", kind: models.KindCrewAITool, src: `
+@tool
+def get_recipient(recipient: str) -> str:
+    """Look up a recipient."""
+    return recipient
+`, wantFires: false},
+
+	// ─── AG2-020 side-effect bounds (recipient / amount, no visible cap) ────
+	{name: "AG2-020 fires on send tool with free-form recipient", ruleID: "AG2-020", kind: models.KindAutoGenTool, src: `
+@user.register_for_llm()
+def send_email(to: str, body: str) -> str:
+    """Send an email."""
+    return "ok"
+`, wantFires: true},
+	{name: "AG2-020 fires on refund tool with free-form amount", ruleID: "AG2-020", kind: models.KindAutoGenTool, src: `
+@user.register_for_llm()
+def refund_payment(charge_id: str, amount: int) -> str:
+    """Refund a payment."""
+    return "ok"
+`, wantFires: true},
+	{name: "AG2-020 silent when the body enforces a MAX_ cap", ruleID: "AG2-020", kind: models.KindAutoGenTool, src: `
+@user.register_for_llm()
+def refund_payment(charge_id: str, amount: int) -> str:
+    """Refund a payment."""
+    if amount > MAX_REFUND_CENTS:
+        raise ValueError("too much")
+    return "ok"
+`, wantFires: false},
+	{name: "AG2-020 silent with an allow-list check in the body", ruleID: "AG2-020", kind: models.KindAutoGenTool, src: `
+@user.register_for_llm()
+def send_email(to: str, body: str) -> str:
+    """Send an email."""
+    if not to.endswith("@example.com"):
+        raise ValueError("outside domain")
+    return "ok"
+`, wantFires: false},
+	{name: "AG2-020 silent when the name matches but the param does not", ruleID: "AG2-020", kind: models.KindAutoGenTool, src: `
+@user.register_for_llm()
+def charge_customer(customer_id: str) -> str:
+    """Charge, amount decided server-side."""
+    return "ok"
+`, wantFires: false},
+	{name: "AG2-020 silent on a non-mutating tool name", ruleID: "AG2-020", kind: models.KindAutoGenTool, src: `
+@user.register_for_llm()
+def get_recipient(recipient: str) -> str:
+    """Look up a recipient."""
+    return recipient
+`, wantFires: false},
+
+	// ─── ADK-020 side-effect bounds (recipient / amount, no visible cap) ────
+	{name: "ADK-020 fires on send tool with free-form recipient", ruleID: "ADK-020", kind: models.KindADKFunctionTool, src: `
+def send_email(to: str, body: str) -> str:
+    """Send an email."""
+    return "ok"
+`, wantFires: true},
+	{name: "ADK-020 fires on refund tool with free-form amount", ruleID: "ADK-020", kind: models.KindADKFunctionTool, src: `
+def refund_payment(charge_id: str, amount: int) -> str:
+    """Refund a payment."""
+    return "ok"
+`, wantFires: true},
+	{name: "ADK-020 silent when the body enforces a MAX_ cap", ruleID: "ADK-020", kind: models.KindADKFunctionTool, src: `
+def refund_payment(charge_id: str, amount: int) -> str:
+    """Refund a payment."""
+    if amount > MAX_REFUND_CENTS:
+        raise ValueError("too much")
+    return "ok"
+`, wantFires: false},
+	{name: "ADK-020 silent with an allow-list check in the body", ruleID: "ADK-020", kind: models.KindADKFunctionTool, src: `
+def send_email(to: str, body: str) -> str:
+    """Send an email."""
+    if not to.endswith("@example.com"):
+        raise ValueError("outside domain")
+    return "ok"
+`, wantFires: false},
+	{name: "ADK-020 silent when the name matches but the param does not", ruleID: "ADK-020", kind: models.KindADKFunctionTool, src: `
+def charge_customer(customer_id: str) -> str:
+    """Charge, amount decided server-side."""
+    return "ok"
+`, wantFires: false},
+	{name: "ADK-020 silent on a non-mutating tool name", ruleID: "ADK-020", kind: models.KindADKFunctionTool, src: `
+def get_recipient(recipient: str) -> str:
+    """Look up a recipient."""
+    return recipient
+`, wantFires: false},
+	{name: "ADK-020 silent when require_confirmation=True gates the call", ruleID: "ADK-020", kind: models.KindADKFunctionTool, toolConfig: map[string]string{"require_confirmation": "True"}, src: `
+def send_email(to: str, body: str) -> str:
+    """Send an email."""
+    return "ok"
+`, wantFires: false},
+	{name: "ADK-020 fires when require_confirmation=False explicitly", ruleID: "ADK-020", kind: models.KindADKFunctionTool, toolConfig: map[string]string{"require_confirmation": "False"}, src: `
+def send_email(to: str, body: str) -> str:
+    """Send an email."""
+    return "ok"
+`, wantFires: true},
+	{name: "ADK-020 silent when the function calls request_confirmation()", ruleID: "ADK-020", kind: models.KindADKFunctionTool, src: `
+def refund_payment(charge_id: str, amount: int, tool_context) -> str:
+    """Refund a payment."""
+    tool_context.request_confirmation(hint="approve this refund?")
+    return "ok"
+`, wantFires: false},
+
+	// ─── VAI-019 side-effect bounds (TypeScript, recipient / amount, no visible cap) ────
+	{
+		name: "VAI-019 fires on send tool with free-form recipient", ruleID: "VAI-019",
+		kind: models.KindVercelAITool, lang: models.LanguageTypeScript, wantFires: true,
+		src: "import { tool } from \"ai\";\n" +
+			"import { z } from \"zod\";\n" +
+			"const sendEmail = tool({ description: \"d\", inputSchema: z.object({ to: z.string(), body: z.string() }), execute: async (a) => \"ok\" });\n",
+	},
+	{
+		name: "VAI-019 fires on charge tool with free-form amount", ruleID: "VAI-019",
+		kind: models.KindVercelAITool, lang: models.LanguageTypeScript, wantFires: true,
+		src: "import { tool } from \"ai\";\n" +
+			"import { z } from \"zod\";\n" +
+			"const chargeCustomer = tool({ description: \"d\", inputSchema: z.object({ amount: z.number() }), execute: async (a) => \"ok\" });\n",
+	},
+	{
+		name: "VAI-019 silent when the amount has a zod .max() bound", ruleID: "VAI-019",
+		kind: models.KindVercelAITool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { tool } from \"ai\";\n" +
+			"import { z } from \"zod\";\n" +
+			"const chargeCustomer = tool({ description: \"d\", inputSchema: z.object({ amount: z.number().max(500) }), execute: async (a) => \"ok\" });\n",
+	},
+	{
+		name: "VAI-019 silent when the name matches but the param does not (payload, not a money verb)", ruleID: "VAI-019",
+		kind: models.KindVercelAITool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { tool } from \"ai\";\n" +
+			"import { z } from \"zod\";\n" +
+			"const payloadTransform = tool({ description: \"d\", inputSchema: z.object({ amount: z.number() }), execute: async (a) => \"ok\" });\n",
+	},
+	{
+		name: "VAI-019 silent when needsApproval: true gates the call", ruleID: "VAI-019",
+		kind: models.KindVercelAITool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { tool } from \"ai\";\n" +
+			"import { z } from \"zod\";\n" +
+			"const sendEmail = tool({ description: \"d\", inputSchema: z.object({ to: z.string(), body: z.string() }), needsApproval: true, execute: async (a) => \"ok\" });\n",
+	},
+	{
+		name: "VAI-019 fires when needsApproval: false explicitly", ruleID: "VAI-019",
+		kind: models.KindVercelAITool, lang: models.LanguageTypeScript, wantFires: true,
+		src: "import { tool } from \"ai\";\n" +
+			"import { z } from \"zod\";\n" +
+			"const sendEmail = tool({ description: \"d\", inputSchema: z.object({ to: z.string(), body: z.string() }), needsApproval: false, execute: async (a) => \"ok\" });\n",
+	},
+
+	// ─── ADK-021 side-effect bounds (TypeScript, recipient / amount, no visible cap) ────
+	{
+		name: "ADK-021 fires on send tool with free-form recipient", ruleID: "ADK-021",
+		kind: models.KindADKFunctionTool, lang: models.LanguageTypeScript, wantFires: true,
+		src: "import { FunctionTool } from \"@google/adk\";\n" +
+			"import { z } from \"zod\";\n" +
+			"export const t = new FunctionTool({ name: \"send_email\", description: \"d\", parameters: z.object({ to: z.string(), body: z.string() }), execute: async (a) => \"ok\" });\n",
+	},
+	{
+		name: "ADK-021 fires on charge tool with free-form amount", ruleID: "ADK-021",
+		kind: models.KindADKFunctionTool, lang: models.LanguageTypeScript, wantFires: true,
+		src: "import { FunctionTool } from \"@google/adk\";\n" +
+			"import { z } from \"zod\";\n" +
+			"export const t = new FunctionTool({ name: \"charge_customer\", description: \"d\", parameters: z.object({ amount: z.number() }), execute: async (a) => \"ok\" });\n",
+	},
+	{
+		name: "ADK-021 silent when the amount has a zod .max() bound", ruleID: "ADK-021",
+		kind: models.KindADKFunctionTool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { FunctionTool } from \"@google/adk\";\n" +
+			"import { z } from \"zod\";\n" +
+			"export const t = new FunctionTool({ name: \"charge_customer\", description: \"d\", parameters: z.object({ amount: z.number().max(500) }), execute: async (a) => \"ok\" });\n",
+	},
+	{
+		name: "ADK-021 silent when the name matches but the param does not (payload, not a money verb)", ruleID: "ADK-021",
+		kind: models.KindADKFunctionTool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { FunctionTool } from \"@google/adk\";\n" +
+			"import { z } from \"zod\";\n" +
+			"export const t = new FunctionTool({ name: \"payload_transform\", description: \"d\", parameters: z.object({ amount: z.number() }), execute: async (a) => \"ok\" });\n",
+	},
+	{
+		name: "ADK-021 silent when execute calls requestConfirmation()", ruleID: "ADK-021",
+		kind: models.KindADKFunctionTool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { FunctionTool } from \"@google/adk\";\n" +
+			"import { z } from \"zod\";\n" +
+			"export const t = new FunctionTool({ name: \"refund_payment\", description: \"d\", parameters: z.object({ amount: z.number() }), execute: async (a) => await ctx.requestConfirmation({ hint: \"approve?\" }) });\n",
+	},
+
+	// ─── CSDK-023 side-effect bounds (TypeScript, recipient / amount, no visible cap) ────
+	{
+		name: "CSDK-023 fires on send tool with free-form recipient", ruleID: "CSDK-023",
+		kind: models.KindClaudeSDKTool, lang: models.LanguageTypeScript, wantFires: true,
+		src: "import { tool } from \"@anthropic-ai/claude-agent-sdk\";\n" +
+			"import { z } from \"zod\";\n" +
+			"export const t = tool(\"send_email\", \"d\", { to: z.string(), body: z.string() }, async (a) => ({ content: [] }));\n",
+	},
+	{
+		name: "CSDK-023 fires on charge tool with free-form amount", ruleID: "CSDK-023",
+		kind: models.KindClaudeSDKTool, lang: models.LanguageTypeScript, wantFires: true,
+		src: "import { tool } from \"@anthropic-ai/claude-agent-sdk\";\n" +
+			"import { z } from \"zod\";\n" +
+			"export const t = tool(\"charge_customer\", \"d\", { amount: z.number() }, async (a) => ({ content: [] }));\n",
+	},
+	{
+		name: "CSDK-023 silent when the amount has a zod .max() bound", ruleID: "CSDK-023",
+		kind: models.KindClaudeSDKTool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { tool } from \"@anthropic-ai/claude-agent-sdk\";\n" +
+			"import { z } from \"zod\";\n" +
+			"export const t = tool(\"charge_customer\", \"d\", { amount: z.number().max(500) }, async (a) => ({ content: [] }));\n",
+	},
+	{
+		name: "CSDK-023 silent when the name matches but the param does not (payload, not a money verb)", ruleID: "CSDK-023",
+		kind: models.KindClaudeSDKTool, lang: models.LanguageTypeScript, wantFires: false,
+		src: "import { tool } from \"@anthropic-ai/claude-agent-sdk\";\n" +
+			"import { z } from \"zod\";\n" +
+			"export const t = tool(\"payload_transform\", \"d\", { amount: z.number() }, async (a) => ({ content: [] }));\n",
+	},
+
+	// ─── LC-115 LangGraph node side effect with no interrupt() gate ──────────
+	{name: "LC-115 fires on a node that shells out", ruleID: "LC-115", kind: models.KindLangGraphNode, src: `
+import subprocess
+
+def deploy(state):
+    subprocess.run(["make", "deploy"])
+    return state
+`, wantFires: true},
+	{name: "LC-115 fires on a node that writes a file", ruleID: "LC-115", kind: models.KindLangGraphNode, src: `
+def save(state):
+    with open("out.txt", "w") as f:
+        f.write(state["text"])
+    return state
+`, wantFires: true},
+	{name: "LC-115 silent when the node gates the side effect with interrupt()", ruleID: "LC-115", kind: models.KindLangGraphNode, src: `
+import subprocess
+from langgraph.types import interrupt
+
+def deploy(state):
+    interrupt("approve deploy?")
+    subprocess.run(["make", "deploy"])
+    return state
+`, wantFires: false},
+	{name: "LC-115 silent on a pure node", ruleID: "LC-115", kind: models.KindLangGraphNode, src: `
+def summarize(state):
+    return {"summary": state["text"][:100]}
+`, wantFires: false},
 }
 
 // policyRepoRuleCases covers repo-scoped rules.
@@ -2110,8 +3687,54 @@ var policyRepoRuleCases = []policyRepoCase{
 		},
 		false},
 
+	// ─── agent_config pre-trust rules (repo-scoped, no SDK gate) ─────────────
+	{"AGCFG-004 fires on a auto-enabled MCP server with no SDK detected", "AGCFG-004",
+		models.RepoProfile{},
+		models.RepoInventory{ProjectConfig: models.ProjectConfigFacts{MCPAutoEnable: []models.ConfigHit{{Reason: "x"}}}},
+		true},
+	{"AGCFG-004 silent when no pre-trust config fact exists", "AGCFG-004",
+		models.RepoProfile{},
+		models.RepoInventory{},
+		false},
+	{"AGCFG-005 fires on a risky hook with no SDK detected", "AGCFG-005",
+		models.RepoProfile{},
+		models.RepoInventory{ProjectConfig: models.ProjectConfigFacts{RiskyHooks: []models.ConfigHit{{Reason: "x"}}}},
+		true},
+	{"AGCFG-005 silent when no pre-trust config fact exists", "AGCFG-005",
+		models.RepoProfile{},
+		models.RepoInventory{},
+		false},
+	{"AGCFG-006 fires on a trust-override env key with no SDK detected", "AGCFG-006",
+		models.RepoProfile{},
+		models.RepoInventory{ProjectConfig: models.ProjectConfigFacts{TrustOverrideEnv: []models.ConfigHit{{Reason: "x"}}}},
+		true},
+	{"AGCFG-006 silent when no pre-trust config fact exists", "AGCFG-006",
+		models.RepoProfile{},
+		models.RepoInventory{},
+		false},
+	{"AGCFG-007 fires on a editor auto-approve with no SDK detected", "AGCFG-007",
+		models.RepoProfile{},
+		models.RepoInventory{ProjectConfig: models.ProjectConfigFacts{EditorAutoApprove: []models.ConfigHit{{Reason: "x"}}}},
+		true},
+	{"AGCFG-007 silent when no pre-trust config fact exists", "AGCFG-007",
+		models.RepoProfile{},
+		models.RepoInventory{},
+		false},
+	{"MCPCFG-002 fires on a local MCP launch with no SDK detected", "MCPCFG-002",
+		models.RepoProfile{},
+		models.RepoInventory{ProjectConfig: models.ProjectConfigFacts{LocalMCPLaunch: []models.ConfigHit{{Reason: "x"}}}},
+		true},
+	{"MCPCFG-002 silent when no pre-trust config fact exists", "MCPCFG-002",
+		models.RepoProfile{},
+		models.RepoInventory{},
+		false},
+	{"AGCFG-004 silent when only an unrelated fact is present", "AGCFG-004",
+		models.RepoProfile{},
+		models.RepoInventory{ProjectConfig: models.ProjectConfigFacts{RiskyHooks: []models.ConfigHit{{Reason: "x"}}}},
+		false},
+
 	// ─── CSDK-202 session permission_mode bypass (repo-scoped) ───────────────
-	{"CSDK-202 fires when ClaudeAgentOptions permission_mode is bypassPermissions", "CSDK-202",
+	{"CSDK-202 fires when ClaudeAgentOptions permission_mode is bypassPermissions with no deny-list", "CSDK-202",
 		models.RepoProfile{},
 		models.RepoInventory{
 			SDKsDetected:       []models.SDK{models.SDKClaudeAgentSDK},
@@ -2131,6 +3754,61 @@ var policyRepoRuleCases = []policyRepoCase{
 		models.RepoInventory{
 			SDKsDetected:       []models.SDK{models.SDKClaudeAgentSDK},
 			ClaudeAgentOptions: []models.ClaudeAgentOptionsDef{{}},
+		},
+		false},
+	// CSDK-202 now correlates permission_mode and disallowed_tools at the SAME
+	// construction site: a deny-list present at that site silences it.
+	{"CSDK-202 silent when disallowed_tools is set alongside bypassPermissions", "CSDK-202",
+		models.RepoProfile{},
+		models.RepoInventory{
+			SDKsDetected:       []models.SDK{models.SDKClaudeAgentSDK},
+			ClaudeAgentOptions: []models.ClaudeAgentOptionsDef{optionsWithModeAndDisallowedTools("bypassPermissions", "Bash")},
+		},
+		false},
+	// A repo-wide absence check would be silenced here because SOME
+	// construction sets a deny-list — but the risky bypassPermissions site
+	// has none, so the per-site correlation must still fire.
+	{"CSDK-202 fires when one of several sites bypasses with no deny-list even though another has one", "CSDK-202",
+		models.RepoProfile{},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKClaudeAgentSDK},
+			ClaudeAgentOptions: []models.ClaudeAgentOptionsDef{
+				optionsWithModeAndDisallowedTools("acceptEdits", "Bash"),
+				optionsWithPermissionMode("bypassPermissions"),
+			},
+		},
+		true},
+	// Opaque sites are NOT skipped by repo_claude_options_mode_without_kwarg —
+	// a deny-list hidden inside the ** unpack is not one this engine can see,
+	// so it reads as absent at this specific site.
+	{"CSDK-202 fires when the only bypassPermissions site is opaque with no visible deny-list", "CSDK-202",
+		models.RepoProfile{},
+		models.RepoInventory{
+			SDKsDetected:       []models.SDK{models.SDKClaudeAgentSDK},
+			ClaudeAgentOptions: []models.ClaudeAgentOptionsDef{opaqueOptionsWithPermissionMode("bypassPermissions")},
+		},
+		true},
+
+	// ─── CSDK-206 bypassPermissions with a deny-list present (repo-scoped) ───
+	{"CSDK-206 fires when bypassPermissions is paired with a deny-list", "CSDK-206",
+		models.RepoProfile{},
+		models.RepoInventory{
+			SDKsDetected:       []models.SDK{models.SDKClaudeAgentSDK},
+			ClaudeAgentOptions: []models.ClaudeAgentOptionsDef{optionsWithModeAndDisallowedTools("bypassPermissions", "Bash")},
+		},
+		true},
+	{"CSDK-206 silent when bypassPermissions has no deny-list (CSDK-202's rule, not this one)", "CSDK-206",
+		models.RepoProfile{},
+		models.RepoInventory{
+			SDKsDetected:       []models.SDK{models.SDKClaudeAgentSDK},
+			ClaudeAgentOptions: []models.ClaudeAgentOptionsDef{optionsWithPermissionMode("bypassPermissions")},
+		},
+		false},
+	{"CSDK-206 silent when there is no bypassPermissions anywhere", "CSDK-206",
+		models.RepoProfile{},
+		models.RepoInventory{
+			SDKsDetected:       []models.SDK{models.SDKClaudeAgentSDK},
+			ClaudeAgentOptions: []models.ClaudeAgentOptionsDef{optionsWithModeAndDisallowedTools("acceptEdits", "Bash")},
 		},
 		false},
 
@@ -2177,6 +3855,59 @@ var policyRepoRuleCases = []policyRepoCase{
 		models.RepoInventory{
 			SDKsDetected:       []models.SDK{models.SDKClaudeAgentSDK},
 			ClaudeAgentOptions: []models.ClaudeAgentOptionsDef{{Opaque: true}},
+		},
+		false},
+
+	// ─── CSDK-205 acceptEdits with no tool deny-list (repo-scoped) ───────────
+	{"CSDK-205 fires when acceptEdits is set and no construction sets disallowed_tools", "CSDK-205",
+		models.RepoProfile{},
+		models.RepoInventory{
+			SDKsDetected:       []models.SDK{models.SDKClaudeAgentSDK},
+			ClaudeAgentOptions: []models.ClaudeAgentOptionsDef{optionsWithPermissionMode("acceptEdits")},
+		},
+		true},
+	{"CSDK-205 silent when a deny-list is set alongside acceptEdits", "CSDK-205",
+		models.RepoProfile{},
+		models.RepoInventory{
+			SDKsDetected:       []models.SDK{models.SDKClaudeAgentSDK},
+			ClaudeAgentOptions: []models.ClaudeAgentOptionsDef{optionsWithModeAndDisallowedTools("acceptEdits", "Bash")},
+		},
+		false},
+	{"CSDK-205 silent when permission_mode is default", "CSDK-205",
+		models.RepoProfile{},
+		models.RepoInventory{
+			SDKsDetected:       []models.SDK{models.SDKClaudeAgentSDK},
+			ClaudeAgentOptions: []models.ClaudeAgentOptionsDef{optionsWithPermissionMode("default")},
+		},
+		false},
+	// bypassPermissions is CSDK-202's rule to own — CSDK-205 only targets
+	// acceptEdits, so a bypassPermissions-only repo stays silent here even
+	// though it also has no disallowed_tools.
+	{"CSDK-205 silent when permission_mode is bypassPermissions (CSDK-202's rule, not this one)", "CSDK-205",
+		models.RepoProfile{},
+		models.RepoInventory{
+			SDKsDetected:       []models.SDK{models.SDKClaudeAgentSDK},
+			ClaudeAgentOptions: []models.ClaudeAgentOptionsDef{optionsWithPermissionMode("bypassPermissions")},
+		},
+		false},
+	// No ClaudeAgentOptions construction anywhere: nothing to flag.
+	{"CSDK-205 silent when repo has no ClaudeAgentOptions", "CSDK-205",
+		models.RepoProfile{},
+		models.RepoInventory{
+			SDKsDetected:       []models.SDK{models.SDKClaudeAgentSDK},
+			ClaudeAgentOptions: nil,
+		},
+		false},
+	// The only construction is Opaque: repo_claude_options_disallowed_tools_missing
+	// skips it (concrete == 0, so the predicate returns false), which makes the
+	// all: conjunction false regardless of the permission_mode read (which does
+	// NOT skip Opaque) — asymmetric skip rules between the two predicates still
+	// silence the combined rule.
+	{"CSDK-205 silent when the only ClaudeAgentOptions is opaque", "CSDK-205",
+		models.RepoProfile{},
+		models.RepoInventory{
+			SDKsDetected:       []models.SDK{models.SDKClaudeAgentSDK},
+			ClaudeAgentOptions: []models.ClaudeAgentOptionsDef{opaqueOptionsWithPermissionMode("acceptEdits")},
 		},
 		false},
 
@@ -2247,6 +3978,533 @@ var policyRepoRuleCases = []policyRepoCase{
 		models.RepoInventory{SDKsDetected: []models.SDK{models.SDKOpenAIAgents}},
 		false},
 
+	// ─── MCP-201: MCP server repo with no agent-guidance doc ────────────────
+	// Same shape as CSDK-203 / ADK-201 / OAI-202: repo_has_sdk_in_code reads
+	// inv.SDKsDetected, repo_component_present reads
+	// profile.Manifest.Components. Either AGENTS.md or CLAUDE.md silences it.
+	{"MCP-201 fires when MCP server code has no agent-guidance doc", "MCP-201",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{SDKsDetected: []models.SDK{models.SDKMCP}},
+		true},
+	{"MCP-201 silent when AGENTS.md is present", "MCP-201",
+		models.RepoProfile{
+			Languages: []models.Language{models.LanguagePython},
+			Manifest:  models.ScanManifest{Components: []models.AgentComponent{{Kind: models.ComponentAgentsMd}}},
+		},
+		models.RepoInventory{SDKsDetected: []models.SDK{models.SDKMCP}},
+		false},
+	{"MCP-201 silent when the repo has no MCP code", "MCP-201",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{SDKsDetected: []models.SDK{models.SDKLangChain}},
+		false},
+	// ─── Observability absence (repo-scoped) ─────────────────────────────────
+	{"OAI-203 fires when an OpenAI Agents repo wires no observability", "OAI-203",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+		},
+		true},
+	{"OAI-203 silent when observability is present", "OAI-203",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorLangfuse, Kind: models.ObsSignalInit},
+			},
+		},
+		false},
+	{"CSDK-208 fires when a Claude SDK repo wires no observability", "CSDK-208",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKClaudeAgentSDK},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+		},
+		true},
+	{"CSDK-208 silent when observability is present", "CSDK-208",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKClaudeAgentSDK},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorLangfuse, Kind: models.ObsSignalInit},
+			},
+		},
+		false},
+	{"LC-202 fires when a LangChain repo wires no observability", "LC-202",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKLangChain},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+		},
+		true},
+	{"LC-202 silent when observability is present", "LC-202",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKLangChain},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorLangfuse, Kind: models.ObsSignalInit},
+			},
+		},
+		false},
+	{"PYD-202 fires when a Pydantic AI repo wires no observability", "PYD-202",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKPydanticAI},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+		},
+		true},
+	{"PYD-202 silent when observability is present", "PYD-202",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKPydanticAI},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorLangfuse, Kind: models.ObsSignalInit},
+			},
+		},
+		false},
+	{"VAI-201 fires when a Vercel AI repo wires no observability", "VAI-201",
+		models.RepoProfile{Languages: []models.Language{models.LanguageTypeScript}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKVercelAI},
+			Manifest:     models.ScanManifest{TypeScriptFiles: []string{"app.ts"}},
+		},
+		true},
+	{"VAI-201 silent when observability is present", "VAI-201",
+		models.RepoProfile{Languages: []models.Language{models.LanguageTypeScript}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKVercelAI},
+			Manifest:     models.ScanManifest{TypeScriptFiles: []string{"app.ts"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorLangfuse, Kind: models.ObsSignalInit},
+			},
+		},
+		false},
+	{"CREW-202 fires when a CrewAI repo wires no observability", "CREW-202",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKCrewAI},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+		},
+		true},
+	{"CREW-202 silent when observability is present", "CREW-202",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKCrewAI},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorLangfuse, Kind: models.ObsSignalInit},
+			},
+		},
+		false},
+	{"ADK-202 fires when a Google ADK repo wires no observability", "ADK-202",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKGoogleADK},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+		},
+		true},
+	{"ADK-202 silent when observability is present", "ADK-202",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKGoogleADK},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorLangfuse, Kind: models.ObsSignalInit},
+			},
+		},
+		false},
+	{"AG2-202 fires when an AutoGen repo wires no observability", "AG2-202",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKAutoGen},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+		},
+		true},
+	{"AG2-202 silent when observability is present", "AG2-202",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKAutoGen},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorLangfuse, Kind: models.ObsSignalInit},
+			},
+		},
+		false},
+	{"MCP-202 fires when an MCP repo wires no observability", "MCP-202",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKMCP},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+		},
+		true},
+	{"MCP-202 silent when observability is present", "MCP-202",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKMCP},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorLangfuse, Kind: models.ObsSignalInit},
+			},
+		},
+		false},
+	// ─── Observability quality (OBS-*) ───────────────────────────────────────
+	{"OBS-001 fires when instrumentation is imported but never initialized", "OBS-001",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorLangfuse, Kind: models.ObsSignalImport},
+			},
+		},
+		true},
+	{"OBS-001 silent when initialized", "OBS-001",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorLangfuse, Kind: models.ObsSignalImport},
+				{Vendor: models.VendorLangfuse, Kind: models.ObsSignalInit},
+			},
+		},
+		false},
+	{"OBS-002 fires when the only exporter is the console", "OBS-002",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalExporter, Detail: "console"},
+			},
+		},
+		true},
+	{"OBS-002 silent when an OTLP exporter is also present", "OBS-002",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalExporter, Detail: "console"},
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalExporter, Detail: "otlp"},
+			},
+		},
+		false},
+	// Exporter detection is Python-only (tsObservabilitySignals never emits
+	// ObsSignalExporter). language: python keeps the rule from firing on a
+	// TS-only repo even given a hand-constructed signal that TS discovery
+	// itself could never actually produce.
+	{"OBS-002 silent on a TypeScript-only repo (language gate)", "OBS-002",
+		models.RepoProfile{Languages: []models.Language{models.LanguageTypeScript}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKVercelAI},
+			Manifest:     models.ScanManifest{TypeScriptFiles: []string{"app.ts"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalExporter, Detail: "console"},
+			},
+		},
+		false},
+	{"OBS-005 fires when a declared observability dep is never wired", "OBS-005",
+		models.RepoProfile{
+			Languages: []models.Language{models.LanguagePython},
+			ObsDeps:   []models.ObsDep{{Vendor: models.VendorLangfuse, Source: "requirements.txt", Confidence: 0.9}},
+		},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+		},
+		true},
+	{"OBS-005 silent when the declared dep is actually imported", "OBS-005",
+		models.RepoProfile{
+			Languages: []models.Language{models.LanguagePython},
+			ObsDeps:   []models.ObsDep{{Vendor: models.VendorLangfuse, Source: "requirements.txt", Confidence: 0.9}},
+		},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorLangfuse, Kind: models.ObsSignalImport},
+			},
+		},
+		false},
+	{"OBS-005 silent when the dep appears only in a lock file", "OBS-005",
+		models.RepoProfile{
+			Languages: []models.Language{models.LanguagePython},
+			ObsDeps:   []models.ObsDep{{Vendor: models.VendorOTel, Source: "poetry.lock", Confidence: 0.9}},
+		},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+		},
+		false},
+	// agent-reliability-otel-labels ladder (OBS-006..008). Every rung is gated on the repo
+	// already being instrumented: the library only labels spans that exist, so
+	// recommending it to an uninstrumented repo would be advice it cannot use.
+	// The three rules are mutually exclusive — each fires at the first missing
+	// rung and stays silent on the others.
+	{"OBS-006 fires when an instrumented repo has no agent-reliability-otel-labels", "OBS-006",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalInit},
+			},
+		},
+		true},
+	{"OBS-006 silent when the repo is not instrumented", "OBS-006",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+		},
+		false},
+	{"OBS-006 silent when agent-reliability-otel-labels is declared in a manifest", "OBS-006",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}, OtelLabelsDeclaredIn: []string{"requirements.txt"}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalInit},
+			},
+		},
+		false},
+	{"OBS-006 silent when agent-reliability-otel-labels is imported in code", "OBS-006",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalInit},
+			},
+			OtelLabelsSignals: []models.OtelLabelsSignal{
+				{Kind: models.OtelLabelsImport},
+			},
+		},
+		false},
+	{"OBS-006 silent when the trustabl.* keys are written by hand", "OBS-006",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalInit},
+			},
+			OtelLabelsSignals: []models.OtelLabelsSignal{
+				{Kind: models.OtelLabelsAttrLiteral, Key: "trustabl.run_id"},
+			},
+		},
+		false},
+	{"OBS-007 fires when agent-reliability-otel-labels is installed but no run is started", "OBS-007",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}, OtelLabelsDeclaredIn: []string{"requirements.txt"}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalInit},
+			},
+		},
+		true},
+	{"OBS-007 fires when spans are labelled but the run is never started", "OBS-007",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalInit},
+			},
+			OtelLabelsSignals: []models.OtelLabelsSignal{
+				{Kind: models.OtelLabelsImport},
+				{Kind: models.OtelLabelsToolSpan},
+				{Kind: models.OtelLabelsRunEnd},
+			},
+		},
+		true},
+	{"OBS-007 silent when a run is started", "OBS-007",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}, OtelLabelsDeclaredIn: []string{"requirements.txt"}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalInit},
+			},
+			OtelLabelsSignals: []models.OtelLabelsSignal{
+				{Kind: models.OtelLabelsImport},
+				{Kind: models.OtelLabelsRunStart},
+			},
+		},
+		false},
+	{"OBS-007 silent when agent-reliability-otel-labels is not installed (OBS-006 owns that case)", "OBS-007",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalInit},
+			},
+		},
+		false},
+	{"OBS-007 silent when the repo is not instrumented", "OBS-007",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}, OtelLabelsDeclaredIn: []string{"requirements.txt"}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+		},
+		false},
+	{"OBS-008 fires when a run is started but no tool span is labelled", "OBS-008",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}, OtelLabelsDeclaredIn: []string{"requirements.txt"}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalInit},
+			},
+			Tools: []models.ToolDef{{Name: "search", Kind: models.KindOpenAITool}},
+			OtelLabelsSignals: []models.OtelLabelsSignal{
+				{Kind: models.OtelLabelsImport},
+				{Kind: models.OtelLabelsRunStart},
+				{Kind: models.OtelLabelsRunEnd},
+			},
+		},
+		true},
+	{"OBS-008 fires when a run is started but its end is never recorded", "OBS-008",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}, OtelLabelsDeclaredIn: []string{"requirements.txt"}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalInit},
+			},
+			Tools: []models.ToolDef{{Name: "search", Kind: models.KindOpenAITool}},
+			OtelLabelsSignals: []models.OtelLabelsSignal{
+				{Kind: models.OtelLabelsImport},
+				{Kind: models.OtelLabelsRunStart},
+				{Kind: models.OtelLabelsToolSpan},
+			},
+		},
+		true},
+	{"OBS-008 silent when tool spans are labelled and the run end is recorded", "OBS-008",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}, OtelLabelsDeclaredIn: []string{"requirements.txt"}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalInit},
+			},
+			Tools: []models.ToolDef{{Name: "search", Kind: models.KindOpenAITool}},
+			OtelLabelsSignals: []models.OtelLabelsSignal{
+				{Kind: models.OtelLabelsImport},
+				{Kind: models.OtelLabelsRunStart},
+				{Kind: models.OtelLabelsToolSpan},
+				{Kind: models.OtelLabelsRunEnd},
+			},
+		},
+		false},
+	{"OBS-008 silent on a tool-less repo that records the run end", "OBS-008",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}, OtelLabelsDeclaredIn: []string{"requirements.txt"}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalInit},
+			},
+			OtelLabelsSignals: []models.OtelLabelsSignal{
+				{Kind: models.OtelLabelsImport},
+				{Kind: models.OtelLabelsRunStart},
+				{Kind: models.OtelLabelsRunEnd},
+			},
+		},
+		false},
+	{"OBS-008 silent when no run is started (OBS-007 owns that case)", "OBS-008",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}, OtelLabelsDeclaredIn: []string{"requirements.txt"}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalInit},
+			},
+			Tools: []models.ToolDef{{Name: "search", Kind: models.KindOpenAITool}},
+			OtelLabelsSignals: []models.OtelLabelsSignal{
+				{Kind: models.OtelLabelsImport},
+			},
+		},
+		false},
+	// Mutual exclusion with the absence rules: a declared-but-unwired dep is
+	// OBS-005 at medium, NOT "this project wires no observability" at low.
+	{"OAI-203 silent when the dep is declared (OBS-005 owns that case)", "OAI-203",
+		models.RepoProfile{
+			Languages: []models.Language{models.LanguagePython},
+			ObsDeps:   []models.ObsDep{{Vendor: models.VendorLangfuse, Source: "requirements.txt", Confidence: 0.9}},
+		},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+		},
+		false},
+	{"OBS-003 fires when tracing captures message content", "OBS-003",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalContentCapture, Detail: "include_content"},
+			},
+		},
+		true},
+	{"OBS-003 silent with no content-capture switch", "OBS-003",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalInit},
+			},
+		},
+		false},
+	// Content-capture detection is Python-only (tsObservabilitySignals never
+	// emits ObsSignalContentCapture — Vercel's experimental_telemetry is not
+	// wired yet). language: python keeps the rule honest on a TS-only repo.
+	{"OBS-003 silent on a TypeScript-only repo (language gate)", "OBS-003",
+		models.RepoProfile{Languages: []models.Language{models.LanguageTypeScript}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKVercelAI},
+			Manifest:     models.ScanManifest{TypeScriptFiles: []string{"app.ts"}},
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalContentCapture, Detail: "include_content"},
+			},
+		},
+		false},
+	// The inspectable gate: a Go-only repo produces no signals because nothing
+	// looked, which must NOT read as "you have no observability".
+	{"OAI-203 silent on an uninspectable (Go-only) repo", "OAI-203",
+		models.RepoProfile{Languages: []models.Language{models.LanguageGo}},
+		models.RepoInventory{
+			SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+			Manifest:     models.ScanManifest{GoFiles: []string{"main.go"}},
+		},
+		false},
+
+	// ─── RAW-001 / RAW-002 raw SDK tool output in a dynamic system prompt ────
+	{"RAW-001 fires when the Anthropic tool-loop anti-pattern was discovered", "RAW-001",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{RawAnthropicToolOutputInSystemPrompt: true},
+		true},
+	{"RAW-001 silent when not discovered (even with the OpenAI flag set)", "RAW-001",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{RawOpenAIToolOutputInSystemMessage: true},
+		false},
+	{"RAW-002 fires when the OpenAI tool-loop anti-pattern was discovered", "RAW-002",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{RawOpenAIToolOutputInSystemMessage: true},
+		true},
+	{"RAW-002 silent when not discovered (even with the Anthropic flag set)", "RAW-002",
+		models.RepoProfile{Languages: []models.Language{models.LanguagePython}},
+		models.RepoInventory{RawAnthropicToolOutputInSystemPrompt: true},
+		false},
 }
 
 // optionsWithPermissionMode builds a ClaudeAgentOptionsDef whose captured
@@ -2271,6 +4529,36 @@ func optionsWithMaxTurns(v string) models.ClaudeAgentOptionsDef {
 			},
 		},
 	}
+}
+
+// opaqueOptionsWithPermissionMode builds an Opaque ClaudeAgentOptionsDef whose
+// captured kwargs still contain permission_mode — mirroring a construction
+// built with ** unpacking that also passes an explicit permission_mode
+// alongside it. PredRepoClaudeOptionsPermissionModeIs does not skip Opaque
+// constructions (a presence/value check on captured kwargs is still
+// trustworthy), while repoClaudeOptionsMissingKwarg does (an absence check on
+// an opaque call's kwarg set is not evidence of a missing value) — this
+// asymmetry is what CSDK-205's opaque test case exercises.
+func opaqueOptionsWithPermissionMode(mode string) models.ClaudeAgentOptionsDef {
+	opt := optionsWithPermissionMode(mode)
+	opt.Opaque = true
+	return opt
+}
+
+// optionsWithModeAndDisallowedTools builds a ClaudeAgentOptionsDef whose
+// captured kwargs contain both permission_mode and disallowed_tools, mirroring
+// what DiscoverClaudeAgentOptions produces from
+// ClaudeAgentOptions(permission_mode="...", disallowed_tools=[...]).
+func optionsWithModeAndDisallowedTools(mode string, tools ...string) models.ClaudeAgentOptionsDef {
+	items := make([]models.Expr, 0, len(tools))
+	for _, t := range tools {
+		items = append(items, models.Expr{Kind: models.ExprLiteralString, Text: `"` + t + `"`})
+	}
+	opt := optionsWithPermissionMode(mode)
+	opt.Kwargs.Children["disallowed_tools"] = &models.KwargTree{
+		Value: &models.Expr{Kind: models.ExprList, List: items},
+	}
+	return opt
 }
 
 // policySubagentRuleCases covers subagent-scoped rules.
@@ -2305,6 +4593,9 @@ var policySkillRuleCases = []policySkillCase{
 	{"CSKILL-001 fires on Bash(*) grant", "CSKILL-001",
 		models.SkillDef{Name: "leak", Location: models.Location{FilePath: ".claude/skills/leak/SKILL.md"},
 			ToolGrants: []models.ToolGrant{{Tool: "Bash", Pattern: "*"}}}, models.RepoInventory{}, true},
+	{"CSKILL-001 fires on Bash(:*) grant", "CSKILL-001",
+		models.SkillDef{Name: "leak2", Location: models.Location{FilePath: ".claude/skills/leak2/SKILL.md"},
+			ToolGrants: []models.ToolGrant{{Tool: "Bash", Pattern: ":*"}}}, models.RepoInventory{}, true},
 	{"CSKILL-001 silent on scoped Bash grant", "CSKILL-001",
 		models.SkillDef{Name: "safe", Location: models.Location{FilePath: ".claude/skills/safe/SKILL.md"},
 			ToolGrants: []models.ToolGrant{{Tool: "Bash", Pattern: "git status *"}}}, models.RepoInventory{}, false},
@@ -2340,10 +4631,25 @@ var policySkillRuleCases = []policySkillCase{
 	{"CSKILL-050 fires on model-invocable skill granting Write", "CSKILL-050",
 		models.SkillDef{Name: "auto", Location: models.Location{FilePath: ".claude/skills/auto/SKILL.md"},
 			ToolGrants: []models.ToolGrant{{Tool: "Write"}}}, models.RepoInventory{}, true},
+	{"CSKILL-050 fires on unrestricted Bash(*) grant", "CSKILL-050",
+		models.SkillDef{Name: "auto2", Location: models.Location{FilePath: ".claude/skills/auto2/SKILL.md"},
+			ToolGrants: []models.ToolGrant{{Tool: "Bash", Pattern: "*"}}}, models.RepoInventory{}, true},
+	{"CSKILL-050 fires on Write with a path pattern (Claude Code never enforces it)", "CSKILL-050",
+		models.SkillDef{Name: "auto3", Location: models.Location{FilePath: ".claude/skills/auto3/SKILL.md"},
+			ToolGrants: []models.ToolGrant{{Tool: "Write", Pattern: "src/**"}}}, models.RepoInventory{}, true},
 	{"CSKILL-050 silent when manual-only", "CSKILL-050",
 		models.SkillDef{Name: "manual", Location: models.Location{FilePath: ".claude/skills/manual/SKILL.md"},
 			DisableModelInvocation: true,
 			ToolGrants:             []models.ToolGrant{{Tool: "Write"}}}, models.RepoInventory{}, false},
+	{"CSKILL-050 silent on scoped Bash grant", "CSKILL-050",
+		models.SkillDef{Name: "scoped", Location: models.Location{FilePath: ".claude/skills/scoped/SKILL.md"},
+			ToolGrants: []models.ToolGrant{{Tool: "Bash", Pattern: "git status:*"}}}, models.RepoInventory{}, false},
+	{"CSKILL-050 silent on scoped Edit and WebFetch grants", "CSKILL-050",
+		models.SkillDef{Name: "scoped2", Location: models.Location{FilePath: ".claude/skills/scoped2/SKILL.md"},
+			ToolGrants: []models.ToolGrant{
+				{Tool: "Edit", Pattern: "docs/**"},
+				{Tool: "WebFetch", Pattern: "domain:example.com"},
+			}}, models.RepoInventory{}, false},
 
 	{"CSKILL-010 fires on bundled script network egress", "CSKILL-010",
 		models.SkillDef{Name: "boot", Location: models.Location{FilePath: ".claude/skills/boot/SKILL.md"},
@@ -2378,6 +4684,10 @@ var policySkillRuleCases = []policySkillCase{
 		models.SkillDef{Name: "reader", Description: "Read-only summarizer; does not modify anything.",
 			Location:   models.Location{FilePath: ".claude/skills/reader/SKILL.md"},
 			ToolGrants: []models.ToolGrant{{Tool: "Read"}, {Tool: "Grep"}}}, models.RepoInventory{}, false},
+	{"CSKILL-060 silent when the read-only claim's Bash grant is scoped", "CSKILL-060",
+		models.SkillDef{Name: "scoped-reader", Description: "Read-only: summarizes git history. Cannot modify anything.",
+			Location:   models.Location{FilePath: ".claude/skills/scoped-reader/SKILL.md"},
+			ToolGrants: []models.ToolGrant{{Tool: "Bash", Pattern: "git status:*"}}}, models.RepoInventory{}, false},
 	{"CSKILL-070 fires on skill with empty description", "CSKILL-070",
 		models.SkillDef{Name: "helper", Location: models.Location{FilePath: ".claude/skills/helper/SKILL.md"},
 			Description: ""},
@@ -2406,27 +4716,56 @@ var policySkillRuleCases = []policySkillCase{
 	{"CSKILL-080 fires when the name claims a crypto operation", "CSKILL-080",
 		models.SkillDef{Name: "encrypt-helper",
 			Location: models.Location{FilePath: ".claude/skills/encrypt-helper/SKILL.md"}}, models.RepoInventory{}, true},
+	{"CSKILL-080 fires when the description claims signing", "CSKILL-080",
+		models.SkillDef{Name: "release-helper", Description: "Signs release artifacts with Ed25519.",
+			Location: models.Location{FilePath: ".claude/skills/release-helper/SKILL.md"}}, models.RepoInventory{}, true},
 	{"CSKILL-080 silent when the name and description have no crypto terms", "CSKILL-080",
 		models.SkillDef{Name: "helper", Description: "Summarises the current git diff.",
 			Location: models.Location{FilePath: ".claude/skills/helper/SKILL.md"}}, models.RepoInventory{}, false},
+	{"CSKILL-080 silent on substring artifacts (design/assigns/signal)", "CSKILL-080",
+		models.SkillDef{Name: "design-helper", Description: "Design system helper; assigns signal handlers.",
+			Location: models.Location{FilePath: ".claude/skills/design-helper/SKILL.md"}}, models.RepoInventory{}, false},
+	{"CSKILL-080 silent when a crypto term appears only as a documentation example", "CSKILL-080",
+		models.SkillDef{Name: "helper", Description: "For example, hash a string using the utils module.",
+			Location: models.Location{FilePath: ".claude/skills/helper/SKILL.md"}}, models.RepoInventory{}, false},
 
-	{"CSKILL-081 fires when the body names a sensitive data class", "CSKILL-081",
+	{"CSKILL-081 fires when the body names a sensitive data class with an operational verb", "CSKILL-081",
 		models.SkillDef{Name: "helper",
 			Location: models.Location{FilePath: ".claude/skills/helper/SKILL.md"},
 			Body:     "# Helper\n\nReads the user's password from the config file."}, models.RepoInventory{}, true},
+	{"CSKILL-081 fires when the body claims to encrypt credentials", "CSKILL-081",
+		models.SkillDef{Name: "helper",
+			Location: models.Location{FilePath: ".claude/skills/helper/SKILL.md"},
+			Body:     "# Helper\n\nThe skill encrypts credentials before storing them."}, models.RepoInventory{}, true},
 	{"CSKILL-081 silent when the body and description name no sensitive data", "CSKILL-081",
 		models.SkillDef{Name: "helper",
 			Location: models.Location{FilePath: ".claude/skills/helper/SKILL.md"},
 			Body:     "# Helper\n\nSummarises the current git diff."}, models.RepoInventory{}, false},
+	{"CSKILL-081 silent when a credential class is only named, not handled", "CSKILL-081",
+		models.SkillDef{Name: "helper",
+			Location: models.Location{FilePath: ".claude/skills/helper/SKILL.md"},
+			Body:     "# Helper\n\nAPI keys live in GitHub Actions secrets."}, models.RepoInventory{}, false},
+	{"CSKILL-081 silent on a substring artifact (case-insensitive)", "CSKILL-081",
+		models.SkillDef{Name: "helper",
+			Location: models.Location{FilePath: ".claude/skills/helper/SKILL.md"},
+			Body:     "# Helper\n\nMatching is case-insensitive."}, models.RepoInventory{}, false},
 
 	{"CSKILL-082 fires when a security-purpose skill grants Bash", "CSKILL-082",
 		models.SkillDef{Name: "security-audit",
 			Location:   models.Location{FilePath: ".claude/skills/security-audit/SKILL.md"},
 			ToolGrants: []models.ToolGrant{{Tool: "Bash", Pattern: "*"}}}, models.RepoInventory{}, true},
+	{"CSKILL-082 fires when a security-purpose skill grants bare Bash", "CSKILL-082",
+		models.SkillDef{Name: "security-audit2",
+			Location:   models.Location{FilePath: ".claude/skills/security-audit2/SKILL.md"},
+			ToolGrants: []models.ToolGrant{{Tool: "Bash"}}}, models.RepoInventory{}, true},
 	{"CSKILL-082 silent when a security-purpose skill only reads", "CSKILL-082",
 		models.SkillDef{Name: "security-audit",
 			Location:   models.Location{FilePath: ".claude/skills/security-audit/SKILL.md"},
 			ToolGrants: []models.ToolGrant{{Tool: "Read"}, {Tool: "Grep"}}}, models.RepoInventory{}, false},
+	{"CSKILL-082 silent when a security-purpose skill's Bash grant is scoped", "CSKILL-082",
+		models.SkillDef{Name: "security-audit3",
+			Location:   models.Location{FilePath: ".claude/skills/security-audit3/SKILL.md"},
+			ToolGrants: []models.ToolGrant{{Tool: "Bash", Pattern: "git status:*"}}}, models.RepoInventory{}, false},
 
 	{"CSKILL-083 fires when the body has no error-handling language", "CSKILL-083",
 		models.SkillDef{Name: "helper",
@@ -2461,6 +4800,13 @@ var policySkillRuleCases = []policySkillCase{
 		models.SkillDef{Name: "helper",
 			Location: models.Location{FilePath: ".claude/skills/helper/SKILL.md"},
 			Body:     "# Helper\n\nSummarises the current git diff."}, models.RepoInventory{}, false},
+
+	{"CSKILL-087 fires when the description is a placeholder", "CSKILL-087",
+		models.SkillDef{Name: "helper", Description: "TODO: describe this skill.",
+			Location: models.Location{FilePath: ".claude/skills/helper/SKILL.md"}}, models.RepoInventory{}, true},
+	{"CSKILL-087 silent when the description is real content", "CSKILL-087",
+		models.SkillDef{Name: "helper", Description: "Summarises the current git diff.",
+			Location: models.Location{FilePath: ".claude/skills/helper/SKILL.md"}}, models.RepoInventory{}, false},
 }
 
 // policyAgentRuleCases covers agent-scoped rules.
@@ -2495,6 +4841,144 @@ var policyAgentRuleCases = []policyAgentCase{
 			}}},
 		models.RepoInventory{}, false},
 
+	// ─── Observability outliers (agent-scoped) ───────────────────────────────
+	// Gated on repo_has_observability: true, so the finding reads "this agent is
+	// the outlier" rather than repeating the repo-scope absence complaint once
+	// per agent.
+	{"PYD-107 fires when an instrumented repo has an uninstrumented agent", "PYD-107",
+		models.AgentDef{
+			SDK: models.SDKPydanticAI, Class: "PydanticAgent", Language: models.LanguagePython,
+		},
+		models.RepoInventory{
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorLogfire, Kind: models.ObsSignalInit},
+			},
+		},
+		true},
+	{"PYD-107 silent when the agent sets instrument", "PYD-107",
+		models.AgentDef{
+			SDK: models.SDKPydanticAI, Class: "PydanticAgent", Language: models.LanguagePython,
+			Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{
+				"instrument": {Value: &models.Expr{Kind: models.ExprLiteralBool, Text: "True"}},
+			}},
+		},
+		models.RepoInventory{
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorLogfire, Kind: models.ObsSignalInit},
+			},
+		},
+		false},
+	{"PYD-107 silent when logfire.instrument_pydantic_ai() covers the agent", "PYD-107",
+		models.AgentDef{
+			SDK: models.SDKPydanticAI, Class: "PydanticAgent", Language: models.LanguagePython,
+			InstrumentedBy: &models.GlobalInstrumentation{Kwarg: "instrument", Call: "logfire.instrument_pydantic_ai"},
+		},
+		models.RepoInventory{
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorLogfire, Kind: models.ObsSignalInit},
+			},
+		},
+		false},
+	{"PYD-107 silent when Agent.instrument_all() covers the agent", "PYD-107",
+		models.AgentDef{
+			SDK: models.SDKPydanticAI, Class: "PydanticAgent", Language: models.LanguagePython,
+			InstrumentedBy: &models.GlobalInstrumentation{Kwarg: "instrument", Call: "agent.instrument_all"},
+		},
+		models.RepoInventory{
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorLogfire, Kind: models.ObsSignalInit},
+			},
+		},
+		false},
+	{"PYD-107 still fires when the global credit names a different kwarg", "PYD-107",
+		models.AgentDef{
+			SDK: models.SDKPydanticAI, Class: "PydanticAgent", Language: models.LanguagePython,
+			InstrumentedBy: &models.GlobalInstrumentation{Kwarg: "callbacks", Call: "agent.instrument_all"},
+		},
+		models.RepoInventory{
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorLogfire, Kind: models.ObsSignalInit},
+			},
+		},
+		true},
+	{"PYD-107 silent when the repo has no observability at all", "PYD-107",
+		models.AgentDef{
+			SDK: models.SDKPydanticAI, Class: "PydanticAgent", Language: models.LanguagePython,
+		},
+		models.RepoInventory{},
+		false},
+	{"LC-112 fires when an instrumented repo has an agent with no callbacks", "LC-112",
+		models.AgentDef{
+			SDK: models.SDKLangChain, Class: "ReactAgent", Language: models.LanguagePython,
+		},
+		models.RepoInventory{
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorLangfuse, Kind: models.ObsSignalInit},
+			},
+		},
+		true},
+	{"LC-112 silent when callbacks are wired", "LC-112",
+		models.AgentDef{
+			SDK: models.SDKLangChain, Class: "ReactAgent", Language: models.LanguagePython,
+			Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{
+				"callbacks": {Value: &models.Expr{Kind: models.ExprList, Text: "[handler]"}},
+			}},
+		},
+		models.RepoInventory{
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorLangfuse, Kind: models.ObsSignalInit},
+			},
+		},
+		false},
+	{"LC-112 silent when LangChainInstrumentor().instrument() covers the agent", "LC-112",
+		models.AgentDef{
+			SDK: models.SDKLangChain, Class: "ReactAgent", Language: models.LanguagePython,
+			InstrumentedBy: &models.GlobalInstrumentation{Kwarg: "callbacks", Call: "langchaininstrumentor.instrument"},
+		},
+		models.RepoInventory{
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorLogfire, Kind: models.ObsSignalInit},
+			},
+		},
+		false},
+	{"LC-112 silent when the repo has no observability at all", "LC-112",
+		models.AgentDef{
+			SDK: models.SDKLangChain, Class: "ReactAgent", Language: models.LanguagePython,
+		},
+		models.RepoInventory{},
+		false},
+	{"VAI-101 fires when an instrumented repo has a call with no telemetry", "VAI-101",
+		models.AgentDef{
+			SDK: models.SDKVercelAI, Class: "GenerateText", Language: models.LanguageTypeScript,
+		},
+		models.RepoInventory{
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalInit},
+			},
+		},
+		true},
+	{"VAI-101 silent when experimental_telemetry is set", "VAI-101",
+		models.AgentDef{
+			SDK: models.SDKVercelAI, Class: "GenerateText", Language: models.LanguageTypeScript,
+			Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{
+				"experimental_telemetry": {Children: map[string]*models.KwargTree{
+					"isEnabled": {Value: &models.Expr{Kind: models.ExprLiteralBool, Text: "true"}},
+				}},
+			}},
+		},
+		models.RepoInventory{
+			ObservabilitySignals: []models.ObservabilitySignal{
+				{Vendor: models.VendorOTel, Kind: models.ObsSignalInit},
+			},
+		},
+		false},
+	{"VAI-101 silent when the repo has no observability at all", "VAI-101",
+		models.AgentDef{
+			SDK: models.SDKVercelAI, Class: "GenerateText", Language: models.LanguageTypeScript,
+		},
+		models.RepoInventory{},
+		false},
+
 	{"LC-111 fires when TS AgentExecutor has no maxIterations", "LC-111",
 		models.AgentDef{SDK: models.SDKLangChain, Class: "AgentExecutor", Language: models.LanguageTypeScript},
 		models.RepoInventory{}, true},
@@ -2503,6 +4987,53 @@ var policyAgentRuleCases = []policyAgentCase{
 			Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{
 				"maxIterations": {Value: &models.Expr{Kind: models.ExprLiteralInt, Text: "5"}},
 			}}},
+		models.RepoInventory{}, false},
+
+	{"LC-113 fires when AgentExecutor has no max_execution_time", "LC-113",
+		models.AgentDef{SDK: models.SDKLangChain, Class: "AgentExecutor", Language: models.LanguagePython},
+		models.RepoInventory{}, true},
+	{"LC-113 silent when max_execution_time set", "LC-113",
+		models.AgentDef{SDK: models.SDKLangChain, Class: "AgentExecutor", Language: models.LanguagePython,
+			Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{
+				"max_execution_time": {Value: &models.Expr{Kind: models.ExprLiteralInt, Text: "60"}},
+			}}},
+		models.RepoInventory{}, false},
+	{"LC-113 silent on the TypeScript AgentExecutor", "LC-113",
+		models.AgentDef{SDK: models.SDKLangChain, Class: "AgentExecutor", Language: models.LanguageTypeScript},
+		models.RepoInventory{}, false},
+
+	{"LC-103 fires when agent wires RequestsGetTool", "LC-103",
+		models.AgentDef{
+			SDK: models.SDKLangChain, Class: "ReactAgent", Language: models.LanguagePython,
+			HostedToolRefs: []models.HostedToolRef{{Class: "RequestsGetTool"}},
+		},
+		models.RepoInventory{}, true},
+	{"LC-103 fires when an AgentExecutor wires RequestsPostTool", "LC-103",
+		models.AgentDef{
+			SDK: models.SDKLangChain, Class: "AgentExecutor", Language: models.LanguagePython,
+			HostedToolRefs: []models.HostedToolRef{{Class: "RequestsPostTool"}},
+		},
+		models.RepoInventory{}, true},
+	{"LC-103 fires on a StateGraph wiring RequestsPostTool", "LC-103",
+		models.AgentDef{
+			SDK: models.SDKLangChain, Class: "StateGraph", Language: models.LanguagePython,
+			HostedToolRefs: []models.HostedToolRef{{Class: "RequestsPostTool"}},
+		},
+		models.RepoInventory{}, true},
+	{"LC-103 silent without a hosted tool", "LC-103",
+		models.AgentDef{SDK: models.SDKLangChain, Class: "ReactAgent", Language: models.LanguagePython},
+		models.RepoInventory{}, false},
+	{"LC-103 silent on a benign hosted tool", "LC-103",
+		models.AgentDef{
+			SDK: models.SDKLangChain, Class: "ReactAgent", Language: models.LanguagePython,
+			HostedToolRefs: []models.HostedToolRef{{Class: "TavilySearchResults"}},
+		},
+		models.RepoInventory{}, false},
+	{"LC-103 silent when the hosted tool is PythonREPLTool, not a Requests class", "LC-103",
+		models.AgentDef{
+			SDK: models.SDKLangChain, Class: "ReactAgent", Language: models.LanguagePython,
+			HostedToolRefs: []models.HostedToolRef{{Class: "PythonREPLTool"}},
+		},
 		models.RepoInventory{}, false},
 
 	// ─── CrewAI agent rules (CREW-*) ────────────────────────────────────────
@@ -2569,6 +5100,24 @@ var policyAgentRuleCases = []policyAgentCase{
 			SDK: models.SDKCrewAI, Class: "Agent", Language: models.LanguagePython,
 			Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{
 				"max_iter": {Value: &models.Expr{Kind: models.ExprLiteralInt, Text: "5"}},
+			}}},
+		models.RepoInventory{}, false},
+
+	{"CREW-111 fires when Agent has no max_execution_time", "CREW-111",
+		models.AgentDef{SDK: models.SDKCrewAI, Class: "Agent", Language: models.LanguagePython},
+		models.RepoInventory{}, true},
+	{"CREW-111 silent when max_execution_time set", "CREW-111",
+		models.AgentDef{
+			SDK: models.SDKCrewAI, Class: "Agent", Language: models.LanguagePython,
+			Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{
+				"max_execution_time": {Value: &models.Expr{Kind: models.ExprLiteralInt, Text: "120"}},
+			}}},
+		models.RepoInventory{}, false},
+	{"CREW-111 silent when the agent is built from config=", "CREW-111",
+		models.AgentDef{
+			SDK: models.SDKCrewAI, Class: "Agent", Language: models.LanguagePython,
+			Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{
+				"config": {Value: &models.Expr{Kind: models.ExprNameRef, Text: "self.agents_config['researcher']"}},
 			}}},
 		models.RepoInventory{}, false},
 
@@ -2885,6 +5434,152 @@ var policyAgentRuleCases = []policyAgentCase{
 			Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{
 				"mcp_servers": {Value: &models.Expr{Kind: models.ExprList, List: []models.Expr{}}},
 			}},
+		},
+		models.RepoInventory{},
+		false},
+
+	// ─── OAI-115 HostedMCPTool without tool_config.allowed_tools (E1 hosted-kwarg) ─
+	{"OAI-115 fires when tool_config has no allowed_tools", "OAI-115",
+		models.AgentDef{
+			SDK:      models.SDKOpenAIAgents,
+			Class:    "Agent",
+			Language: models.LanguagePython,
+			HostedToolRefs: []models.HostedToolRef{
+				{Class: "HostedMCPTool", Resolved: &models.HostedToolDef{Class: "HostedMCPTool",
+					Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{
+						"tool_config": {Children: map[string]*models.KwargTree{
+							"server_label": {Value: &models.Expr{Kind: models.ExprLiteralString, Text: `"deepwiki"`}},
+							"server_url":   {Value: &models.Expr{Kind: models.ExprLiteralString, Text: `"https://mcp.deepwiki.com/mcp"`}},
+						}},
+					}}}},
+			},
+		},
+		models.RepoInventory{},
+		true},
+	{"OAI-115 fires when HostedMCPTool has no kwargs at all", "OAI-115",
+		models.AgentDef{
+			SDK:      models.SDKOpenAIAgents,
+			Class:    "Agent",
+			Language: models.LanguagePython,
+			HostedToolRefs: []models.HostedToolRef{
+				{Class: "HostedMCPTool", Resolved: &models.HostedToolDef{Class: "HostedMCPTool"}},
+			},
+		},
+		models.RepoInventory{},
+		true},
+	{"OAI-115 silent when tool_config sets allowed_tools", "OAI-115",
+		models.AgentDef{
+			SDK:      models.SDKOpenAIAgents,
+			Class:    "Agent",
+			Language: models.LanguagePython,
+			HostedToolRefs: []models.HostedToolRef{
+				{Class: "HostedMCPTool", Resolved: &models.HostedToolDef{Class: "HostedMCPTool",
+					Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{
+						"tool_config": {Children: map[string]*models.KwargTree{
+							"server_label":  {Value: &models.Expr{Kind: models.ExprLiteralString, Text: `"deepwiki"`}},
+							"allowed_tools": {Value: &models.Expr{Kind: models.ExprList, List: []models.Expr{{Kind: models.ExprLiteralString, Text: `"ask_question"`}}}},
+						}},
+					}}}},
+			},
+		},
+		models.RepoInventory{},
+		false},
+	// An agent with no HostedMCPTool at all is out of scope for this rule —
+	// nothing to restrict, so it must not fire just because allowed_tools is
+	// absent.
+	{"OAI-115 silent when agent has no HostedMCPTool", "OAI-115",
+		models.AgentDef{
+			SDK:      models.SDKOpenAIAgents,
+			Class:    "Agent",
+			Language: models.LanguagePython,
+			HostedToolRefs: []models.HostedToolRef{
+				{Class: "WebSearchTool", Resolved: &models.HostedToolDef{Class: "WebSearchTool"}},
+			},
+		},
+		models.RepoInventory{},
+		false},
+
+	// ─── OAI-118 MCP server without tool_filter (E1 hosted-kwarg, multi-class) ─
+	{"OAI-118 fires when MCPServerStdio has no tool_filter", "OAI-118",
+		models.AgentDef{
+			SDK:      models.SDKOpenAIAgents,
+			Class:    "Agent",
+			Language: models.LanguagePython,
+			MCPServerRefs: []models.MCPServerRef{
+				{Class: "MCPServerStdio", Resolved: &models.MCPServerDef{Class: "MCPServerStdio",
+					Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{
+						"params": {Children: map[string]*models.KwargTree{
+							"command": {Value: &models.Expr{Kind: models.ExprLiteralString, Text: `"npx"`}},
+						}},
+					}}}},
+			},
+		},
+		models.RepoInventory{},
+		true},
+	{"OAI-118 fires when MCPServerSse has no kwargs at all", "OAI-118",
+		models.AgentDef{
+			SDK:      models.SDKOpenAIAgents,
+			Class:    "Agent",
+			Language: models.LanguagePython,
+			MCPServerRefs: []models.MCPServerRef{
+				{Class: "MCPServerSse", Resolved: &models.MCPServerDef{Class: "MCPServerSse"}},
+			},
+		},
+		models.RepoInventory{},
+		true},
+	{"OAI-118 fires when tool_filter is explicitly None", "OAI-118",
+		models.AgentDef{
+			SDK:      models.SDKOpenAIAgents,
+			Class:    "Agent",
+			Language: models.LanguagePython,
+			MCPServerRefs: []models.MCPServerRef{
+				{Class: "MCPServerStreamableHttp", Resolved: &models.MCPServerDef{Class: "MCPServerStreamableHttp",
+					Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{
+						"tool_filter": {Value: &models.Expr{Kind: models.ExprLiteralNone, Text: "None"}},
+					}}}},
+			},
+		},
+		models.RepoInventory{},
+		true},
+	{"OAI-118 silent when MCPServerStdio sets tool_filter", "OAI-118",
+		models.AgentDef{
+			SDK:      models.SDKOpenAIAgents,
+			Class:    "Agent",
+			Language: models.LanguagePython,
+			MCPServerRefs: []models.MCPServerRef{
+				{Class: "MCPServerStdio", Resolved: &models.MCPServerDef{Class: "MCPServerStdio",
+					Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{
+						"tool_filter": {Value: &models.Expr{Kind: models.ExprCall, Text: `create_static_tool_filter(allowed_tool_names=["read_file"])`}},
+					}}}},
+			},
+		},
+		models.RepoInventory{},
+		false},
+	// An agent with no MCP server at all is out of scope for this rule —
+	// nothing to restrict, so it must not fire just because tool_filter is
+	// absent.
+	{"OAI-118 silent when agent has no MCP server", "OAI-118",
+		models.AgentDef{
+			SDK:      models.SDKOpenAIAgents,
+			Class:    "Agent",
+			Language: models.LanguagePython,
+			HostedToolRefs: []models.HostedToolRef{
+				{Class: "WebSearchTool", Resolved: &models.HostedToolDef{Class: "WebSearchTool"}},
+			},
+		},
+		models.RepoInventory{},
+		false},
+	// An unresolved/external MCP server ref cannot be inspected for
+	// tool_filter, so it must not be counted as missing — matches
+	// agent_hosted_tool_kwarg_present's Resolved-required convention.
+	{"OAI-118 silent when MCP server ref is unresolved (external)", "OAI-118",
+		models.AgentDef{
+			SDK:      models.SDKOpenAIAgents,
+			Class:    "Agent",
+			Language: models.LanguagePython,
+			MCPServerRefs: []models.MCPServerRef{
+				{Class: "MCPServerStdio", External: true},
+			},
 		},
 		models.RepoInventory{},
 		false},
@@ -3214,6 +5909,46 @@ var policyAgentRuleCases = []policyAgentCase{
 		},
 		models.RepoInventory{},
 		false},
+	{"CSDK-103 fires on bypassPermissions with Bash explicitly granted", "CSDK-103",
+		models.AgentDef{
+			SDK:      models.SDKClaudeAgentSDK,
+			Class:    "AgentDefinition",
+			Language: models.LanguagePython,
+			Name:     "worker",
+			Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{
+				"permissionMode": {Value: &models.Expr{Kind: models.ExprLiteralString, Text: `"bypassPermissions"`}},
+				"tools": {Value: &models.Expr{Kind: models.ExprList, List: []models.Expr{
+					{Kind: models.ExprLiteralString, Text: `"Bash"`},
+				}}},
+			},
+			},
+			ToolRefs: []models.ToolRef{{Name: `"Bash"`, External: true}},
+		},
+		models.RepoInventory{},
+		true},
+	{"CSDK-103 silent on bypassPermissions with a read-only tools list", "CSDK-103",
+		models.AgentDef{
+			SDK:      models.SDKClaudeAgentSDK,
+			Class:    "AgentDefinition",
+			Language: models.LanguagePython,
+			Name:     "worker",
+			Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{
+				"permissionMode": {Value: &models.Expr{Kind: models.ExprLiteralString, Text: `"bypassPermissions"`}},
+				"tools": {Value: &models.Expr{Kind: models.ExprList, List: []models.Expr{
+					{Kind: models.ExprLiteralString, Text: `"Read"`},
+					{Kind: models.ExprLiteralString, Text: `"Grep"`},
+					{Kind: models.ExprLiteralString, Text: `"Glob"`},
+				}}},
+			},
+			},
+			ToolRefs: []models.ToolRef{
+				{Name: `"Read"`, External: true},
+				{Name: `"Grep"`, External: true},
+				{Name: `"Glob"`, External: true},
+			},
+		},
+		models.RepoInventory{},
+		false},
 
 	// ─── CSDK-104 subagent granted Write/Edit ─────────────────────────────────
 	{"CSDK-104 fires when AgentDefinition grants Edit", "CSDK-104",
@@ -3539,6 +6274,59 @@ var policyAgentRuleCases = []policyAgentCase{
 		models.RepoInventory{},
 		true},
 
+	// ─── ADK-111 MCPToolset without tool_filter (E1 hosted-kwarg) ────────────
+	{"ADK-111 fires when MCPToolset has no tool_filter", "ADK-111",
+		models.AgentDef{
+			SDK:      models.SDKGoogleADK,
+			Class:    "LlmAgent",
+			Language: models.LanguagePython,
+			Name:     "fs",
+			HostedToolRefs: []models.HostedToolRef{
+				{Class: "MCPToolset", Resolved: &models.HostedToolDef{Class: "MCPToolset"}},
+			},
+			Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{
+				"name": {Value: &models.Expr{Kind: models.ExprLiteralString, Text: `"fs"`}},
+			}},
+		},
+		models.RepoInventory{},
+		true},
+	{"ADK-111 silent when MCPToolset sets tool_filter", "ADK-111",
+		models.AgentDef{
+			SDK:      models.SDKGoogleADK,
+			Class:    "LlmAgent",
+			Language: models.LanguagePython,
+			Name:     "fs",
+			HostedToolRefs: []models.HostedToolRef{
+				{Class: "MCPToolset", Resolved: &models.HostedToolDef{Class: "MCPToolset",
+					Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{
+						"tool_filter": {Value: &models.Expr{Kind: models.ExprList, Text: `["read_file"]`}},
+					}}}},
+			},
+			Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{
+				"name": {Value: &models.Expr{Kind: models.ExprLiteralString, Text: `"fs"`}},
+			}},
+		},
+		models.RepoInventory{},
+		false},
+	// An agent with no MCPToolset at all is out of scope for this rule —
+	// nothing to restrict, so it must not fire just because tool_filter is
+	// absent.
+	{"ADK-111 silent when agent has no MCPToolset", "ADK-111",
+		models.AgentDef{
+			SDK:      models.SDKGoogleADK,
+			Class:    "LlmAgent",
+			Language: models.LanguagePython,
+			Name:     "fs",
+			HostedToolRefs: []models.HostedToolRef{
+				{Class: "GoogleSearchTool", Resolved: &models.HostedToolDef{Class: "GoogleSearchTool"}},
+			},
+			Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{
+				"name": {Value: &models.Expr{Kind: models.ExprLiteralString, Text: `"fs"`}},
+			}},
+		},
+		models.RepoInventory{},
+		false},
+
 	// ─── ADK-008 bash tool without a restrictive policy (E1 hosted-kwarg) ────
 	{"ADK-008 fires when ExecuteBashTool has no policy", "ADK-008",
 		models.AgentDef{
@@ -3757,6 +6545,39 @@ var policyAgentRuleCases = []policyAgentCase{
 		agent: parseTSAgentInline("import { query } from \"@anthropic-ai/claude-agent-sdk\";\n" +
 			"const a: AgentDefinition = { description: \"x\", prompt: \"y\", permissionMode: \"default\" };\n"),
 	},
+	{"CSDK-120 fires on bypassPermissions with Bash explicitly granted", "CSDK-120",
+		models.AgentDef{
+			SDK:      models.SDKClaudeAgentSDK,
+			Class:    "AgentDefinition",
+			Language: models.LanguageTypeScript,
+			Name:     "opsAgent",
+			Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{
+				"permissionMode": {Value: &models.Expr{Kind: models.ExprLiteralString, Text: `"bypassPermissions"`}},
+				"tools": {Value: &models.Expr{Kind: models.ExprList, List: []models.Expr{
+					{Kind: models.ExprLiteralString, Text: `"Bash"`},
+				}}},
+			}},
+			ToolRefs: []models.ToolRef{{Name: `"Bash"`, External: true}},
+		},
+		models.RepoInventory{},
+		true},
+	{"CSDK-120 silent on bypassPermissions with a read-only tools list", "CSDK-120",
+		models.AgentDef{
+			SDK:      models.SDKClaudeAgentSDK,
+			Class:    "AgentDefinition",
+			Language: models.LanguageTypeScript,
+			Name:     "reader",
+			Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{
+				"permissionMode": {Value: &models.Expr{Kind: models.ExprLiteralString, Text: `"bypassPermissions"`}},
+				"tools": {Value: &models.Expr{Kind: models.ExprList, List: []models.Expr{
+					{Kind: models.ExprLiteralString, Text: `"Read"`},
+					{Kind: models.ExprLiteralString, Text: `"Grep"`},
+				}}},
+			}},
+			ToolRefs: []models.ToolRef{{Name: `"Read"`, External: true}, {Name: `"Grep"`, External: true}},
+		},
+		models.RepoInventory{},
+		false},
 
 	// ─── CSDK-130 query() main agent granted Bash ────────────────────────────
 	{"CSDK-130 fires when query main agent allows Bash", "CSDK-130",
@@ -3787,6 +6608,29 @@ var policyAgentRuleCases = []policyAgentCase{
 		models.RepoInventory{},
 		false},
 
+	// ─── CSDK-114 query() main agent without maxBudgetUsd ────────────────────
+	{"CSDK-114 fires when inline options set no maxBudgetUsd", "CSDK-114",
+		parseTSAgentInline("import { query } from \"@anthropic-ai/claude-agent-sdk\";\n" +
+			"const a = query({ prompt: \"y\", options: { allowedTools: [\"Read\"], maxTurns: 5 } });\n"),
+		models.RepoInventory{},
+		true},
+	{"CSDK-114 silent when maxBudgetUsd is set", "CSDK-114",
+		parseTSAgentInline("import { query } from \"@anthropic-ai/claude-agent-sdk\";\n" +
+			"const a = query({ prompt: \"y\", options: { allowedTools: [\"Read\"], maxBudgetUsd: 2 } });\n"),
+		models.RepoInventory{},
+		false},
+	{"CSDK-114 silent when options is a variable (not inspectable)", "CSDK-114",
+		parseTSAgentInline("import { query } from \"@anthropic-ai/claude-agent-sdk\";\n" +
+			"const opts = { allowedTools: [\"Read\"] };\n" +
+			"const a = query({ prompt: \"y\", options: opts });\n"),
+		models.RepoInventory{},
+		false},
+	{"CSDK-114 silent when inline options carry none of the known keys", "CSDK-114",
+		parseTSAgentInline("import { query } from \"@anthropic-ai/claude-agent-sdk\";\n" +
+			"const a = query({ prompt: \"y\", options: {} });\n"),
+		models.RepoInventory{},
+		false},
+
 	// ─── OAI-105 TS agent content hosted-tool without inputGuardrails ─────────
 	{"OAI-105 fires on webSearchTool agent with no inputGuardrails", "OAI-105",
 		parseTSOpenAIAgentInline("import { Agent, webSearchTool } from \"@openai/agents\";\n" +
@@ -3801,6 +6645,98 @@ var policyAgentRuleCases = []policyAgentCase{
 	{"OAI-105 silent when no content hosted tool", "OAI-105",
 		parseTSOpenAIAgentInline("import { Agent } from \"@openai/agents\";\n" +
 			"const a = new Agent({ name: \"x\", instructions: \"y\", tools: [] });\n"),
+		models.RepoInventory{},
+		false},
+
+	// ─── OAI-116 TS agent hostedMcpTool without allowedTools ──────────────────
+	{"OAI-116 fires when hostedMcpTool has no allowedTools", "OAI-116",
+		parseTSOpenAIAgentInlineResolved("import { Agent, hostedMcpTool } from \"@openai/agents\";\n" +
+			"const a = new Agent({ name: \"x\", instructions: \"y\", tools: [hostedMcpTool({ serverLabel: \"deepwiki\", serverUrl: \"https://mcp.deepwiki.com/mcp\" })] });\n"),
+		models.RepoInventory{},
+		true},
+	{"OAI-116 fires when hostedMcpTool has no options at all", "OAI-116",
+		parseTSOpenAIAgentInlineResolved("import { Agent, hostedMcpTool } from \"@openai/agents\";\n" +
+			"const a = new Agent({ name: \"x\", instructions: \"y\", tools: [hostedMcpTool()] });\n"),
+		models.RepoInventory{},
+		true},
+	{"OAI-116 silent when allowedTools is a flat array", "OAI-116",
+		parseTSOpenAIAgentInlineResolved("import { Agent, hostedMcpTool } from \"@openai/agents\";\n" +
+			"const a = new Agent({ name: \"x\", instructions: \"y\", tools: [hostedMcpTool({ serverLabel: \"deepwiki\", allowedTools: [\"ask_question\"] })] });\n"),
+		models.RepoInventory{},
+		false},
+	{"OAI-116 silent when allowedTools is a toolNames filter object", "OAI-116",
+		parseTSOpenAIAgentInlineResolved("import { Agent, hostedMcpTool } from \"@openai/agents\";\n" +
+			"const a = new Agent({ name: \"x\", instructions: \"y\", tools: [hostedMcpTool({ serverLabel: \"deepwiki\", allowedTools: { toolNames: [\"ask_question\"] } })] });\n"),
+		models.RepoInventory{},
+		false},
+	{"OAI-116 silent when no hostedMcpTool", "OAI-116",
+		parseTSOpenAIAgentInlineResolved("import { Agent, webSearchTool } from \"@openai/agents\";\n" +
+			"const a = new Agent({ name: \"x\", instructions: \"y\", tools: [webSearchTool()] });\n"),
+		models.RepoInventory{},
+		false},
+
+	// ─── OAI-117 TS agent hostedMcpTool without requireApproval ───────────────
+	{"OAI-117 fires when hostedMcpTool has no requireApproval", "OAI-117",
+		parseTSOpenAIAgentInlineResolved("import { Agent, hostedMcpTool } from \"@openai/agents\";\n" +
+			"const a = new Agent({ name: \"x\", instructions: \"y\", tools: [hostedMcpTool({ serverLabel: \"deepwiki\", serverUrl: \"https://mcp.deepwiki.com/mcp\" })] });\n"),
+		models.RepoInventory{},
+		true},
+	{"OAI-117 fires when hostedMcpTool has no options at all", "OAI-117",
+		parseTSOpenAIAgentInlineResolved("import { Agent, hostedMcpTool } from \"@openai/agents\";\n" +
+			"const a = new Agent({ name: \"x\", instructions: \"y\", tools: [hostedMcpTool()] });\n"),
+		models.RepoInventory{},
+		true},
+	{"OAI-117 fires when allowedTools is set but requireApproval is absent", "OAI-117",
+		parseTSOpenAIAgentInlineResolved("import { Agent, hostedMcpTool } from \"@openai/agents\";\n" +
+			"const a = new Agent({ name: \"x\", instructions: \"y\", tools: [hostedMcpTool({ serverLabel: \"deepwiki\", allowedTools: [\"ask_question\"] })] });\n"),
+		models.RepoInventory{},
+		true},
+	{"OAI-117 silent when requireApproval is 'always'", "OAI-117",
+		parseTSOpenAIAgentInlineResolved("import { Agent, hostedMcpTool } from \"@openai/agents\";\n" +
+			"const a = new Agent({ name: \"x\", instructions: \"y\", tools: [hostedMcpTool({ serverLabel: \"deepwiki\", requireApproval: \"always\" })] });\n"),
+		models.RepoInventory{},
+		false},
+	{"OAI-117 silent when requireApproval is explicitly 'never'", "OAI-117",
+		parseTSOpenAIAgentInlineResolved("import { Agent, hostedMcpTool } from \"@openai/agents\";\n" +
+			"const a = new Agent({ name: \"x\", instructions: \"y\", tools: [hostedMcpTool({ serverLabel: \"deepwiki\", requireApproval: \"never\" })] });\n"),
+		models.RepoInventory{},
+		false},
+	{"OAI-117 silent when requireApproval is a toolNames filter object", "OAI-117",
+		parseTSOpenAIAgentInlineResolved("import { Agent, hostedMcpTool } from \"@openai/agents\";\n" +
+			"const a = new Agent({ name: \"x\", instructions: \"y\", tools: [hostedMcpTool({ serverLabel: \"deepwiki\", requireApproval: { never: { toolNames: [\"ask_question\"] } } })] });\n"),
+		models.RepoInventory{},
+		false},
+	{"OAI-117 silent when no hostedMcpTool", "OAI-117",
+		parseTSOpenAIAgentInlineResolved("import { Agent, webSearchTool } from \"@openai/agents\";\n" +
+			"const a = new Agent({ name: \"x\", instructions: \"y\", tools: [webSearchTool()] });\n"),
+		models.RepoInventory{},
+		false},
+
+	// ─── OAI-119 TS agent MCP server without toolFilter (multi-class) ──────────
+	{"OAI-119 fires when MCPServerStdio has no toolFilter", "OAI-119",
+		parseTSOpenAIMCPAgentInlineResolved("import { Agent, MCPServerStdio } from \"@openai/agents\";\n" +
+			"const fs = new MCPServerStdio({ command: \"npx\" });\n" +
+			"const a = new Agent({ name: \"x\", instructions: \"y\", mcpServers: [fs] });\n"),
+		models.RepoInventory{},
+		true},
+	{"OAI-119 fires when MCPServerSSE has no toolFilter", "OAI-119",
+		parseTSOpenAIMCPAgentInlineResolved("import { Agent, MCPServerSSE } from \"@openai/agents\";\n" +
+			"const sse = new MCPServerSSE({ url: \"https://example.com/sse\" });\n" +
+			"const a = new Agent({ name: \"x\", instructions: \"y\", mcpServers: [sse] });\n"),
+		models.RepoInventory{},
+		true},
+	{"OAI-119 silent when toolFilter is set via createMCPToolStaticFilter", "OAI-119",
+		parseTSOpenAIMCPAgentInlineResolved("import { Agent, MCPServerStdio, createMCPToolStaticFilter } from \"@openai/agents\";\n" +
+			"const fs = new MCPServerStdio({ command: \"npx\", toolFilter: createMCPToolStaticFilter({ allowed: [\"read_file\"] }) });\n" +
+			"const a = new Agent({ name: \"x\", instructions: \"y\", mcpServers: [fs] });\n"),
+		models.RepoInventory{},
+		false},
+	// An agent with no MCP server at all is out of scope for this rule —
+	// nothing to restrict, so it must not fire just because toolFilter is
+	// absent.
+	{"OAI-119 silent when no MCP server", "OAI-119",
+		parseTSOpenAIMCPAgentInlineResolved("import { Agent, webSearchTool } from \"@openai/agents\";\n" +
+			"const a = new Agent({ name: \"x\", instructions: \"y\", tools: [webSearchTool()] });\n"),
 		models.RepoInventory{},
 		false},
 
@@ -3854,6 +6790,33 @@ var policyAgentRuleCases = []policyAgentCase{
 		},
 		models.RepoInventory{}, true},
 	{"PYD-103 silent without a URL-fetching native tool", "PYD-103",
+		models.AgentDef{SDK: models.SDKPydanticAI, Class: "PydanticAgent", Language: models.LanguagePython},
+		models.RepoInventory{}, false},
+
+	{"PYD-104 fires on FileUrl force_download=True", "PYD-104",
+		models.AgentDef{
+			SDK: models.SDKPydanticAI, Class: "PydanticAgent", Language: models.LanguagePython,
+			FileURLForceDownload: "True",
+		},
+		models.RepoInventory{}, true},
+	{"PYD-104 fires on FileUrl force_download=allow-local", "PYD-104",
+		models.AgentDef{
+			SDK: models.SDKPydanticAI, Class: "PydanticAgent", Language: models.LanguagePython,
+			FileURLForceDownload: "allow-local",
+		},
+		models.RepoInventory{}, true},
+	{"PYD-104 fires when WebFetchTool sets force_download=True", "PYD-104",
+		models.AgentDef{
+			SDK: models.SDKPydanticAI, Class: "PydanticAgent", Language: models.LanguagePython,
+			HostedToolRefs: []models.HostedToolRef{
+				{Class: "WebFetchTool", Resolved: &models.HostedToolDef{Class: "WebFetchTool",
+					Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{
+						"force_download": {Value: &models.Expr{Kind: models.ExprNameRef, Text: "True"}},
+					}}}},
+			},
+		},
+		models.RepoInventory{}, true},
+	{"PYD-104 silent when force_download is unset", "PYD-104",
 		models.AgentDef{SDK: models.SDKPydanticAI, Class: "PydanticAgent", Language: models.LanguagePython},
 		models.RepoInventory{}, false},
 
@@ -3927,6 +6890,43 @@ var policyAgentRuleCases = []policyAgentCase{
 		models.RepoInventory{},
 		false},
 
+	{"VAI-020 fires on a bounded tool loop with no abortSignal", "VAI-020",
+		parseTSVercelAgentInline("import { generateText } from \"ai\";\n" +
+			"import { openai } from \"@ai-sdk/openai\";\n" +
+			"const r = await generateText({ model: openai(\"gpt-5\"), maxSteps: 5, tools: { weather: weatherTool } });\n"),
+		models.RepoInventory{},
+		true},
+	{"VAI-020 silent when abortSignal is set", "VAI-020",
+		parseTSVercelAgentInline("import { generateText } from \"ai\";\n" +
+			"import { openai } from \"@ai-sdk/openai\";\n" +
+			"const r = await generateText({ model: openai(\"gpt-5\"), maxSteps: 5, abortSignal: AbortSignal.timeout(30000), tools: { weather: weatherTool } });\n"),
+		models.RepoInventory{},
+		false},
+	{"VAI-020 silent when the timeout option is set (object form)", "VAI-020",
+		parseTSVercelAgentInline("import { generateText } from \"ai\";\n" +
+			"import { openai } from \"@ai-sdk/openai\";\n" +
+			"const r = await generateText({ model: openai(\"gpt-5\"), maxSteps: 5, timeout: { totalMs: 60000, stepMs: 10000 }, tools: { weather: weatherTool } });\n"),
+		models.RepoInventory{},
+		false},
+	{"VAI-020 silent when the timeout option is set (number form)", "VAI-020",
+		parseTSVercelAgentInline("import { generateText } from \"ai\";\n" +
+			"import { openai } from \"@ai-sdk/openai\";\n" +
+			"const r = await generateText({ model: openai(\"gpt-5\"), maxSteps: 5, timeout: 60000, tools: { weather: weatherTool } });\n"),
+		models.RepoInventory{},
+		false},
+	{"VAI-020 silent when the call sets no loop bound", "VAI-020",
+		parseTSVercelAgentInline("import { generateText } from \"ai\";\n" +
+			"import { openai } from \"@ai-sdk/openai\";\n" +
+			"const r = await generateText({ model: openai(\"gpt-5\"), tools: { weather: weatherTool } });\n"),
+		models.RepoInventory{},
+		false},
+	{"VAI-020 silent on a ToolLoopAgent (signal goes on .generate)", "VAI-020",
+		parseTSVercelAgentInline("import { ToolLoopAgent, stepCountIs } from \"ai\";\n" +
+			"import { openai } from \"@ai-sdk/openai\";\n" +
+			"const a = new ToolLoopAgent({ model: openai(\"gpt-5\"), stopWhen: stepCountIs(5), tools: { weather: weatherTool } });\n"),
+		models.RepoInventory{},
+		false},
+
 	{"VAI-008 fires when toolChoice required with dangerous tool", "VAI-008",
 		parseTSVercelAgentInline("import { generateText } from \"ai\";\n" +
 			"import { anthropic } from \"@ai-sdk/anthropic\";\n" +
@@ -3950,6 +6950,260 @@ var policyAgentRuleCases = []policyAgentCase{
 		parseTSVercelAgentInline("import { generateText } from \"ai\";\n" +
 			"import { openai } from \"@ai-sdk/openai\";\n" +
 			"const r = await generateText({ model: openai(\"gpt-5\"), tools: { weather: weatherTool } });\n"),
+		models.RepoInventory{},
+		false},
+
+	// ─── ADK-112 workflow agent without a description ────────────────────────
+	// ADK-101 makes this check for LlmAgent; the workflow classes were
+	// uncovered — adk_sequential_agent / adk_parallel_agent had no rule at all.
+	// One fire case per class in applies_to, so all three are exercised rather
+	// than assumed to behave alike.
+	{"ADK-112 fires when SequentialAgent has no description", "ADK-112",
+		models.AgentDef{
+			SDK: models.SDKGoogleADK, Class: "SequentialAgent",
+			Language: models.LanguagePython, Name: "pipeline",
+			Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{
+				"name": {Value: &models.Expr{Kind: models.ExprLiteralString, Text: `"pipeline"`}},
+			}},
+		},
+		models.RepoInventory{},
+		true},
+	{"ADK-112 fires when ParallelAgent has no description", "ADK-112",
+		models.AgentDef{
+			SDK: models.SDKGoogleADK, Class: "ParallelAgent",
+			Language: models.LanguagePython, Name: "fanout",
+			Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{
+				"name": {Value: &models.Expr{Kind: models.ExprLiteralString, Text: `"fanout"`}},
+			}},
+		},
+		models.RepoInventory{},
+		true},
+	{"ADK-112 fires when LoopAgent has no description", "ADK-112",
+		models.AgentDef{
+			SDK: models.SDKGoogleADK, Class: "LoopAgent",
+			Language: models.LanguagePython, Name: "refine",
+			Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{
+				"name":           {Value: &models.Expr{Kind: models.ExprLiteralString, Text: `"refine"`}},
+				"max_iterations": {Value: &models.Expr{Kind: models.ExprLiteralInt, Text: "3"}},
+			}},
+		},
+		models.RepoInventory{},
+		true},
+	{"ADK-112 silent when the workflow agent has a description", "ADK-112",
+		models.AgentDef{
+			SDK: models.SDKGoogleADK, Class: "SequentialAgent",
+			Language: models.LanguagePython, Name: "pipeline",
+			Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{
+				"name":        {Value: &models.Expr{Kind: models.ExprLiteralString, Text: `"pipeline"`}},
+				"description": {Value: &models.Expr{Kind: models.ExprLiteralString, Text: `"Drafts, reviews, and revises a support reply before it is sent."`}},
+			}},
+		},
+		models.RepoInventory{},
+		false},
+
+	// ─── LC-114 StateGraph compiled with no checkpointer ─────────────────────
+	{"LC-114 fires when a resolved compile() has no checkpointer", "LC-114",
+		models.AgentDef{SDK: models.SDKLangChain, Class: "StateGraph", Language: models.LanguagePython,
+			Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{}}},
+		models.RepoInventory{}, true},
+	{"LC-114 silent when compile() sets a checkpointer", "LC-114",
+		models.AgentDef{SDK: models.SDKLangChain, Class: "StateGraph", Language: models.LanguagePython,
+			Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{
+				"checkpointer": {Value: &models.Expr{Kind: models.ExprCall, Text: "MemorySaver()"}},
+			}}},
+		models.RepoInventory{}, false},
+	{"LC-114 silent when compile() was never linked (Kwargs nil)", "LC-114",
+		models.AgentDef{SDK: models.SDKLangChain, Class: "StateGraph", Language: models.LanguagePython},
+		models.RepoInventory{}, false},
+	{"LC-114 silent when compile() is opaque (**config)", "LC-114",
+		models.AgentDef{SDK: models.SDKLangChain, Class: "StateGraph", Language: models.LanguagePython,
+			Opaque: true, Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{}}},
+		models.RepoInventory{}, false},
+	{"LC-114 silent on a LangGraph Platform repo (langgraph.json)", "LC-114",
+		models.AgentDef{SDK: models.SDKLangChain, Class: "StateGraph", Language: models.LanguagePython,
+			Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{}}},
+		models.RepoInventory{Manifest: models.ScanManifest{JSONFiles: []string{"services/api/langgraph.json"}}}, false},
+
+	{"LC-114 unaffected by LangGraph run calls (still fires, no checkpointer)", "LC-114",
+		models.AgentDef{SDK: models.SDKLangChain, Class: "StateGraph", Language: models.LanguagePython,
+			Location: models.Location{FilePath: "graph.py"}, VarName: "builder",
+			Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{}}},
+		lc116Inv("graph.py", "", "api.py"), true},
+
+	// ─── LC-116 in-memory checkpointer run from a server entrypoint ──────────
+	{"LC-116 fires: StateGraph + MemorySaver, run in a same-file FastAPI route", "LC-116",
+		lc116Graph("app.py", "MemorySaver"), lc116Inv("app.py", "", "app.py"), true},
+	{"LC-116 fires: InMemorySaver", "LC-116",
+		lc116Graph("app.py", "InMemorySaver"), lc116Inv("app.py", "", "app.py"), true},
+	{"LC-116 fires: graph in graph.py, run from a handler in api.py", "LC-116",
+		lc116Graph("graph.py", "MemorySaver"), lc116Inv("api.py", "graph.py", "api.py"), true},
+	{"LC-116 fires: run from a Celery worker task", "LC-116",
+		lc116Graph("app.py", "MemorySaver"),
+		models.RepoInventory{AgentRunCalls: []models.AgentRunCallDef{{
+			SDK: models.SDKLangChain, Location: models.Location{FilePath: "tasks.py"}, AgentVarName: "builder", AgentFilePath: "app.py",
+			ServerReachable: &models.EntrypointRef{FilePath: "tasks.py", Kind: models.EntrypointWorker, Framework: "celery", Via: "direct"},
+		}}}, true},
+	{"LC-116 fires: prebuilt create_react_agent with MemorySaver", "LC-116",
+		models.AgentDef{SDK: models.SDKLangChain, Class: "ReactAgent", Language: models.LanguagePython,
+			Location: models.Location{FilePath: "app.py"}, VarName: "agent", CheckpointerClass: "MemorySaver"},
+		models.RepoInventory{AgentRunCalls: []models.AgentRunCallDef{{
+			SDK: models.SDKLangChain, Location: models.Location{FilePath: "app.py"}, AgentVarName: "agent",
+			ServerReachable: &models.EntrypointRef{FilePath: "app.py", Kind: models.EntrypointHTTP, Framework: "fastapi", Via: "direct"},
+		}}}, true},
+	{"LC-116 silent: PostgresSaver", "LC-116",
+		lc116Graph("app.py", "PostgresSaver"), lc116Inv("app.py", "", "app.py"), false},
+	{"LC-116 silent: SqliteSaver", "LC-116",
+		lc116Graph("app.py", "SqliteSaver"), lc116Inv("app.py", "", "app.py"), false},
+	{"LC-116 silent: RedisSaver", "LC-116",
+		lc116Graph("app.py", "RedisSaver"), lc116Inv("app.py", "", "app.py"), false},
+	{"LC-116 silent: unresolved checkpointer (empty class)", "LC-116",
+		lc116Graph("app.py", ""), lc116Inv("app.py", "", "app.py"), false},
+	{"LC-116 silent: no checkpointer at all (LC-114's job)", "LC-116",
+		models.AgentDef{SDK: models.SDKLangChain, Class: "StateGraph", Language: models.LanguagePython,
+			Location: models.Location{FilePath: "app.py"}, VarName: "builder",
+			Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{}}},
+		lc116Inv("app.py", "", "app.py"), false},
+	{"LC-116 silent: run call not reachable from any entrypoint (script)", "LC-116",
+		lc116Graph("app.py", "MemorySaver"),
+		models.RepoInventory{AgentRunCalls: []models.AgentRunCallDef{{
+			SDK: models.SDKLangChain, Location: models.Location{FilePath: "run.py"}, AgentVarName: "builder", AgentFilePath: "app.py",
+		}}}, false},
+	{"LC-116 silent: LangGraph Platform repo (langgraph.json)", "LC-116",
+		lc116Graph("app.py", "MemorySaver"),
+		func() models.RepoInventory {
+			inv := lc116Inv("app.py", "", "app.py")
+			inv.Manifest = models.ScanManifest{JSONFiles: []string{"langgraph.json"}}
+			return inv
+		}(), false},
+	{"LC-116 silent: run call resolves to a same-named graph in another file", "LC-116",
+		lc116Graph("app.py", "MemorySaver"), lc116Inv("api.py", "other_graph.py", "api.py"), false},
+	{"LC-116 silent: FastAPI test app under tests/", "LC-116",
+		lc116Graph("app.py", "MemorySaver"), lc116Inv("tests/test_api.py", "app.py", "tests/test_api.py"), false},
+	{"LC-116 silent: production run call stamped only by a conftest.py entrypoint", "LC-116",
+		lc116Graph("app.py", "MemorySaver"), lc116Inv("app.py", "", "conftest.py"), false},
+	{"LC-116 silent: graph defined in a test_*.py file", "LC-116",
+		lc116Graph("test_graph.py", "MemorySaver"), lc116Inv("test_graph.py", "", "test_graph.py"), false},
+
+	// ─── OAI-120 / PYD-108 no wall-clock timeout on run calls ────────────────
+	{"OAI-120 fires when the Runner.run call is not timeout-wrapped", "OAI-120",
+		models.AgentDef{
+			SDK: models.SDKOpenAIAgents, Class: "Agent", Language: models.LanguagePython,
+			Location: models.Location{FilePath: "main.py"}, VarName: "agent",
+		},
+		models.RepoInventory{AgentRunCalls: []models.AgentRunCallDef{
+			{SDK: models.SDKOpenAIAgents, Location: models.Location{FilePath: "main.py"}, AgentVarName: "agent"},
+		}},
+		true},
+	{"OAI-120 silent when the run call is wrapped in a wall-clock timeout", "OAI-120",
+		models.AgentDef{
+			SDK: models.SDKOpenAIAgents, Class: "Agent", Language: models.LanguagePython,
+			Location: models.Location{FilePath: "main.py"}, VarName: "agent",
+		},
+		models.RepoInventory{AgentRunCalls: []models.AgentRunCallDef{
+			{SDK: models.SDKOpenAIAgents, Location: models.Location{FilePath: "main.py"}, AgentVarName: "agent", WallClockTimeoutWrapped: true},
+		}},
+		false},
+	{"OAI-120 silent when no run call resolves", "OAI-120",
+		models.AgentDef{
+			SDK: models.SDKOpenAIAgents, Class: "Agent", Language: models.LanguagePython,
+			Location: models.Location{FilePath: "main.py"}, VarName: "agent",
+		},
+		models.RepoInventory{}, false},
+	{"PYD-108 fires when the agent.run call is not timeout-wrapped", "PYD-108",
+		models.AgentDef{
+			SDK: models.SDKPydanticAI, Class: "PydanticAgent", Language: models.LanguagePython,
+			Location: models.Location{FilePath: "main.py"}, VarName: "agent",
+		},
+		models.RepoInventory{AgentRunCalls: []models.AgentRunCallDef{
+			{SDK: models.SDKPydanticAI, Location: models.Location{FilePath: "main.py"}, AgentVarName: "agent"},
+		}},
+		true},
+	{"PYD-108 silent when the run call is wrapped in a wall-clock timeout", "PYD-108",
+		models.AgentDef{
+			SDK: models.SDKPydanticAI, Class: "PydanticAgent", Language: models.LanguagePython,
+			Location: models.Location{FilePath: "main.py"}, VarName: "agent",
+		},
+		models.RepoInventory{AgentRunCalls: []models.AgentRunCallDef{
+			{SDK: models.SDKPydanticAI, Location: models.Location{FilePath: "main.py"}, AgentVarName: "agent", WallClockTimeoutWrapped: true},
+		}},
+		false},
+
+	// ─── ADK-113 / AG2-021 no wall-clock timeout on run calls ────────────────
+	{"ADK-113 fires when the run_async call is not timeout-wrapped", "ADK-113",
+		models.AgentDef{
+			SDK: models.SDKGoogleADK, Class: "LlmAgent", Language: models.LanguagePython,
+			Location: models.Location{FilePath: "main.py"}, VarName: "agent",
+		},
+		models.RepoInventory{AgentRunCalls: []models.AgentRunCallDef{
+			{SDK: models.SDKGoogleADK, Location: models.Location{FilePath: "main.py"}, AgentVarName: "agent"},
+		}},
+		true},
+	{"ADK-113 silent when the run call is wrapped in a wall-clock timeout", "ADK-113",
+		models.AgentDef{
+			SDK: models.SDKGoogleADK, Class: "LlmAgent", Language: models.LanguagePython,
+			Location: models.Location{FilePath: "main.py"}, VarName: "agent",
+		},
+		models.RepoInventory{AgentRunCalls: []models.AgentRunCallDef{
+			{SDK: models.SDKGoogleADK, Location: models.Location{FilePath: "main.py"}, AgentVarName: "agent", WallClockTimeoutWrapped: true},
+		}},
+		false},
+	{"ADK-113 silent when run_async passes abort_signal", "ADK-113",
+		models.AgentDef{
+			SDK: models.SDKGoogleADK, Class: "LlmAgent", Language: models.LanguagePython,
+			Location: models.Location{FilePath: "main.py"}, VarName: "agent",
+		},
+		models.RepoInventory{AgentRunCalls: []models.AgentRunCallDef{
+			{SDK: models.SDKGoogleADK, Location: models.Location{FilePath: "main.py"}, AgentVarName: "agent", Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{"abort_signal": {Value: &models.Expr{Kind: models.ExprNameRef, Text: "x"}}}}},
+		}},
+		false},
+	{"ADK-113 fires when abort_signal is explicitly None", "ADK-113",
+		models.AgentDef{
+			SDK: models.SDKGoogleADK, Class: "LlmAgent", Language: models.LanguagePython,
+			Location: models.Location{FilePath: "main.py"}, VarName: "agent",
+		},
+		models.RepoInventory{AgentRunCalls: []models.AgentRunCallDef{
+			{SDK: models.SDKGoogleADK, Location: models.Location{FilePath: "main.py"}, AgentVarName: "agent", Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{"abort_signal": {Value: &models.Expr{Kind: models.ExprLiteralNone, Text: "None"}}}}},
+		}},
+		true},
+	{"ADK-113 silent when no run call resolves", "ADK-113",
+		models.AgentDef{
+			SDK: models.SDKGoogleADK, Class: "LlmAgent", Language: models.LanguagePython,
+			Location: models.Location{FilePath: "main.py"}, VarName: "agent",
+		},
+		models.RepoInventory{},
+		false},
+	{"AG2-021 fires when the chat call is not timeout-wrapped", "AG2-021",
+		models.AgentDef{
+			SDK: models.SDKAutoGen, Class: "ConversableAgent", Language: models.LanguagePython,
+			Location: models.Location{FilePath: "main.py"}, VarName: "agent",
+		},
+		models.RepoInventory{AgentRunCalls: []models.AgentRunCallDef{
+			{SDK: models.SDKAutoGen, Location: models.Location{FilePath: "main.py"}, AgentVarName: "agent"},
+		}},
+		true},
+	{"AG2-021 silent when the run call is wrapped in a wall-clock timeout", "AG2-021",
+		models.AgentDef{
+			SDK: models.SDKAutoGen, Class: "ConversableAgent", Language: models.LanguagePython,
+			Location: models.Location{FilePath: "main.py"}, VarName: "agent",
+		},
+		models.RepoInventory{AgentRunCalls: []models.AgentRunCallDef{
+			{SDK: models.SDKAutoGen, Location: models.Location{FilePath: "main.py"}, AgentVarName: "agent", WallClockTimeoutWrapped: true},
+		}},
+		false},
+	{"AG2-021 silent when run passes cancellation_token", "AG2-021",
+		models.AgentDef{
+			SDK: models.SDKAutoGen, Class: "AssistantAgent", Language: models.LanguagePython,
+			Location: models.Location{FilePath: "main.py"}, VarName: "agent",
+		},
+		models.RepoInventory{AgentRunCalls: []models.AgentRunCallDef{
+			{SDK: models.SDKAutoGen, Location: models.Location{FilePath: "main.py"}, AgentVarName: "agent", Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{"cancellation_token": {Value: &models.Expr{Kind: models.ExprNameRef, Text: "x"}}}}},
+		}},
+		false},
+	{"AG2-021 silent when no run call resolves", "AG2-021",
+		models.AgentDef{
+			SDK: models.SDKAutoGen, Class: "ConversableAgent", Language: models.LanguagePython,
+			Location: models.Location{FilePath: "main.py"}, VarName: "agent",
+		},
 		models.RepoInventory{},
 		false},
 }
@@ -4174,4 +7428,24 @@ func TestFixtureAgentsHaveLanguage(t *testing.T) {
 			}
 		}
 	}
+}
+
+// lc116Graph is a resolved StateGraph AgentDef with the given checkpointer class.
+func lc116Graph(file, ckpt string) models.AgentDef {
+	return models.AgentDef{SDK: models.SDKLangChain, Class: "StateGraph", Language: models.LanguagePython,
+		Location: models.Location{FilePath: file}, VarName: "builder", CheckpointerClass: ckpt,
+		Kwargs: &models.KwargTree{Children: map[string]*models.KwargTree{
+			"checkpointer": {Value: &models.Expr{Kind: models.ExprCall, Text: ckpt + "()"}},
+		}}}
+}
+
+// lc116Inv is an inventory with one LangGraph run call of `builder` in
+// callFile (agentFile set when resolved cross-file), stamped reachable from a
+// FastAPI route in entryFile.
+func lc116Inv(callFile, agentFile, entryFile string) models.RepoInventory {
+	return models.RepoInventory{AgentRunCalls: []models.AgentRunCallDef{{
+		SDK: models.SDKLangChain, Callee: "app.invoke", Location: models.Location{FilePath: callFile},
+		AgentVarName: "builder", AgentFilePath: agentFile,
+		ServerReachable: &models.EntrypointRef{FilePath: entryFile, Kind: models.EntrypointHTTP, Framework: "fastapi", Via: "direct"},
+	}}}
 }

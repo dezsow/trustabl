@@ -4,8 +4,8 @@ This file captures durable architectural commitments that span the whole
 codebase. Per-area conventions live in nested CLAUDE.md files (see
 [`testdata/rules-fixture/CLAUDE.md`](testdata/rules-fixture/CLAUDE.md)
 for rule authoring). The detection rule packs do **not** live in this repo:
-they live in the external **`trustabl-rules`** repository
-(`https://github.com/trustabl/trustabl-rules`), which the engine pulls at
+they live in the external **`agent-reliability-rules`** repository
+(`https://github.com/trustabl/agent-reliability-rules`), which the engine pulls at
 scan time. `testdata/rules-fixture/` is an in-engine **test mirror** of those
 packs — see [Two-repo rule model](#two-repo-rule-model-rules-vs-engine) below,
 which is required reading before touching any rule.
@@ -102,8 +102,8 @@ steps build is what makes policy selection data-driven rather than
 statically configured.
 
 Before the pipeline runs, the CLI resolves detection rules from the
-external `trustabl-rules` git repository (`rulesource.DefaultRepoURL`,
-currently `https://github.com/trustabl/trustabl-rules`; the engine embeds
+external `agent-reliability-rules` git repository (`rulesource.DefaultRepoURL`,
+currently `https://github.com/trustabl/agent-reliability-rules`; the engine embeds
 none — see `internal/rulesource/`) and hands them to `scanner.Run` as an
 `fs.FS`. The
 resolution path fetches the configured ref, caches the clone under
@@ -214,7 +214,7 @@ location: tool file/line, agent constructor call site, or the manifest.
 - **Future SDKs slot in cleanly.** Adding a new SDK means: extend the
   recon dep-scan needles, extend the inventory-step discovery patterns for
   that SDK's tool/agent shapes, add a policy pack under `<sdk>/` in the
-  external `trustabl-rules` repository. No engine changes, no rebuild.
+  external `agent-reliability-rules` repository. No engine changes, no rebuild.
 
 ## Agent as the unit of analysis (not the repo)
 
@@ -267,11 +267,11 @@ touching rules — getting it wrong silently ships untested rules, test-passes
 rules users never receive, or ships rules with no defensible grounding behind
 them.
 
-- **Engine repo** (this one, `github.com/trustabl/trustabl`): the scanner
+- **Engine repo** (this one, `github.com/trustabl/agent-reliability-analyzer`): the scanner
   binary. Owns discovery, the rule **schema** (`internal/rules/schema.go` +
   `schema.yaml`), predicates, the evaluator, the loader, scoring, and the
   per-rule test harness. Ships with **no rules embedded**.
-- **Rules repo** (`https://github.com/trustabl/trustabl-rules`, set as
+- **Rules repo** (`https://github.com/trustabl/agent-reliability-rules`, set as
   `rulesource.DefaultRepoURL`): the `.yaml` rule packs + `manifest.yaml`.
   This is what `trustabl scan` clones and runs at scan time. It is the
   **production source of rules**.
@@ -324,16 +324,16 @@ untested (the engine's `TestPolicyRules_AllRulesCovered` guard only sees the
 fixture). Both are defects.
 
 This drift is now caught automatically: the `rules-sync` CI job
-(`.github/workflows/test.yml`) checks out `trustabl-rules` and runs
+(`.github/workflows/test.yml`) checks out `agent-reliability-rules` and runs
 [`scripts/check-rules-sync.sh`](scripts/check-rules-sync.sh), which fails the
 build on any fixture↔production divergence (a fixture-only file, a
 production-only file, or content drift — line endings ignored). Run it locally
-with `RULES_REPO=../trustabl-rules scripts/check-rules-sync.sh` before pushing a
+with `RULES_REPO=../agent-reliability-rules scripts/check-rules-sync.sh` before pushing a
 rule change to either repo.
 
 When changing a rule (add / remove / edit severity, confidence, match, text):
 
-1. Make the change in the **rules repo** (`../trustabl-rules/`) — that is what
+1. Make the change in the **rules repo** (`../agent-reliability-rules/`) — that is what
    users pull.
 2. Mirror the identical change into **`testdata/rules-fixture/`** in this repo.
 3. Add/update the rule's fire + silent cases in
@@ -350,16 +350,151 @@ When changing a rule (add / remove / edit severity, confidence, match, text):
 6. Commit and push the rules repo **and** the rulebook (the user pushes engine
    commits manually; confirm before pushing any of the three).
 
-> **Rulebook status (2026-08-12):** the fixture and production both carry
-> **204** rules across ten SDK categories (`autogen`, `claude_sdk`,
+> **Pre-trust agent config (2026-10-12, `schema_version` 22 → 23; +5 rules):** new unconditionally-loaded category `agent_config`
+> (**AGCFG-004..007**, **MCPCFG-002**, repo scope) over five new repo predicates backed by `RepoInventory.ProjectConfig`
+> (`analysis.DiscoverProjectConfig`). The walk now enters `.gemini/`, `.vscode/`, `.cursor/`, `.codex/`. Env files are read for **key
+> names only** — never store, log or print a value. The IDs deliberately sit outside the SDK-prefix `NNN`/`1NN`/`2NN` convention (they
+> are cross-harness config rules; AGCFG-001..003 and MCPCFG-001 are unused). Rulebook docs live under `docs/Policy/agent_config/`. Built in parallel with LC-116, which took
+> 21 → 22, so this batch takes 23. The fixture holds **339** rules (334 + 5; re-derive, do not trust this figure).
+>
+> **In-memory LangGraph checkpointer on a server path (2026-10-08, `schema_version` 21 → 22):** one rule, **LC-116** (high, 0.6, agent
+> scope, Python; `applies_to: [langchain_state_graph, langchain_agent]`): a graph whose `checkpointer=` is `MemorySaver` / `InMemorySaver`
+> and that is run from a FastAPI / Flask / Celery / Dramatiq entrypoint, silent when the repo ships a `langgraph.json`. New predicates
+> `agent_checkpointer_in_memory` and `agent_server_reachable` (the first consumer of #244's `ServerReachable` stamp); new in-memory
+> fields `AgentDef.CheckpointerClass` and `AgentRunCallDef.AgentFilePath`; run-call discovery gained a LangGraph (`models.SDKLangChain`)
+> anchor on compiled-graph variables, `builder.compile(...).invoke(...)` and prebuilt-agent variables, cross-file via the entrypoint import
+> resolver. `buildImportsByFile` no longer drops `from graph import graph` (a name equal to its module). The fixture holds **331** rules
+> (330 + 1; re-derive). **Test paths:** `agent_server_reachable` ignores an agent, run call or entrypoint under a `pathclass` test path
+> (`tests/`, `test_*.py`, `conftest.py`, ...) — entrypoint and run-call discovery stay unfiltered, so the exclusion is local to LC-116.
+> **Limits:** one hop per edge (a helper of a helper is silent); a graph built or compiled in a factory function is not tracked; a saver
+> chosen at runtime is silent; subgraphs and the Platform exemption are inherited from LC-114; recall on real server repos is
+> **unmeasured** — the corpus has 40 run calls, none LangGraph, none server-reachable, and its findings are byte-identical before and after.
+> Rulebook rationale doc for LC-116 is a separate follow-up in `../trustabl-rulebook` (not touched here).
+>
+> **Server-entrypoint fact (2026-10-05, no schema change, stays 20; no rules, no predicates):** `RepoInventory.Entrypoints`
+> (`models.EntrypointDef`; also `ScanResult.entrypoints`) records Python FastAPI / Flask routes (`http`) and Celery / Dramatiq
+> tasks (`worker`), and `analysis.ApplyEntrypointReachability` stamps `AgentRunCallDef.ServerReachable` (in-memory) on run calls
+> reachable from one (direct, same-file helper, or imported helper; one hop each). It is a **fact only** — nothing reads the
+> stamp. Ranks 4 and 6 (a LangGraph run-call anchor, rules) build on it in follow-up PRs; do not add a rule or predicate here.
+> See `internal/analysis/entrypoints.go` for the v1 limits.
+>
+> **Observability instrumentor credit (2026-10-05, no schema change, stays 20; no new rules):** process-wide instrumentation calls
+> (`logfire.instrument_pydantic_ai()`, `Agent.instrument_all()`, `LangChainInstrumentor().instrument()`) now credit the agents they cover via
+> `AgentDef.InstrumentedBy`, which `agent_kwarg_missing` reads, so PYD-107 / LC-112 stop firing on a user who followed their own fix text.
+> Opik was added as a vendor. Deliberately **not** built: **rank 3** (tool result not recorded on a span — frameworks span every tool call once
+> tracing is on and enablement is often env/CLI-only, so a repo-level gate cannot say which tool is spanned; not same-body evidence),
+> **rank 2** (required span attributes — the SDK or instrumentor writes them, so a well-instrumented repo has no literals to find, and the
+> OTel GenAI semconv is still Development with renamed keys), and **rank 4** (run-level correlation id — session / `group_id` — needs a
+> run-call kwarg predicate, tracked with the HTTP-entrypoint design ticket). See `COVERAGE.md`.
+>
+> **agent-reliability-otel-labels batch (2026-10-04, `schema_version` 20 → 21):** the fixture now holds **333** rules
+> (330 + 3; re-derive, do not trust this figure). Built in parallel with the HTTPS-only batch, which had already taken
+> 19 → 20, so this batch takes 21. **OBS-006** / **OBS-007** / **OBS-008** are a mutually exclusive
+> ladder over `agent-reliability-otel-labels` (not installed → installed but no `mark_start` → run started but no labels), each gated on
+> `repo_observability_initialized: true`. They read a new `OtelLabelsSignal` inventory slice and
+> `RepoProfile.OtelLabelsDeclaredIn`, kept apart from `ObservabilitySignals` / `ObsDeps` so the library cannot satisfy
+> its own prerequisite. Deliberately **not** built: the correctness checks (a `Run` at module scope, `mark_tool_span`
+> outside `finally`, a constant `attempt`, a `side_effect` that contradicts the tool body, handoffs with no
+> `mark_handoff`, run end on the success path only) and Go-binding inspection. `OBS-004` is reserved by the observability
+> design for the first runtime rule, so these start at `OBS-006`.
+>
+> **P0 fetch HTTPS-only batch (2026-10-02, `schema_version` 19 → 20):** new tool-scope predicate `has_unpinned_scheme_url_call` and 14 rules (**CSDK-024/025**, **OAI-032/033**, **MCP-031/032**, **ADK-022/023**, **LC-026/027**, **CREW-015**, **PYD-015**, **AG2-022**, **VAI-021**), one per SSRF rule, each firing only once the SSRF sibling's allow-list credit applies and the URL scheme is neither pinned to a literal `https://` nor checked. The fixture now holds **330** rules (316 + 14; re-derive, do not trust this figure). Not built: LangGraph nodes, `raw_llm_sdk`, a Pydantic `WebFetchTool` `allowed_domains` rule (Anthropic-only option). PYD-103's fix text gained an `allowed_domains` caveat. Rulebook docs live in the nine `docs/Policy/*/ssrf.md` files plus `openai_sdk/network.md`.
+>
+> **P0 partial-gaps batch (2026-10-01, no schema change, stays 19):** the fixture now holds **316** rules
+> (314 + 2; re-derive, do not trust this figure). **ADK-113** / **AG2-021** extend the wall-clock-timeout check to Google
+> ADK and AutoGen by widening `agent_run_call_wall_clock_timeout_missing` and `DiscoverAgentRunCalls` (ADK runner → agent
+> resolved via a same-file pre-pass; AutoGen `initiate_chat` yields receiver and recipient); the predicate also credits
+> `abort_signal` / `cancellation_token`. **VAI-020** now credits the Vercel AI native `timeout` option. Deliberately **not**
+> built: a per-run token/cost-cap rule (no enforced run-level token/cost parameter exists in OpenAI Agents, LangChain,
+> ADK, Vercel AI, or CrewAI — `Agent.max_tokens` is declared but never read; AutoGen v0.4 `TokenUsageTermination` needs team
+> discovery) and a general untrusted-tool-output rule (needs inter-procedural taint; see `COVERAGE.md`).
+>
+> **P0 engine batch (2026-10-01, `schema_version` 18 → 19):** built the gaps the batch below deferred, so the fixture
+> now holds **314** rules (308 + 6; re-derive, do not trust this figure): **LC-114** (StateGraph with no
+> checkpointer; `agent_kwargs_observed` + dual-scope `repo_langgraph_platform_config_present`), **LC-115**
+> (`add_node` function with a side effect and no `interrupt(`; new `langgraph_node` ToolKind), **OAI-120** /
+> **PYD-108** (no wall-clock timeout on the run call; `AgentRunCallDef.WallClockTimeoutWrapped`), and
+> **RAW-001** / **RAW-002** (new unconditionally-loaded `raw_llm_sdk` category; narrow same-function heuristic for
+> tool output fed into a dynamic system prompt in a raw `anthropic` / `openai` tool loop). Still **not** built:
+> Python `max_budget_usd`, LangChain.js `maxExecutionTime`, and the broader LangGraph mutating-node-without-HITL case.
+> The rulebook docs for these six live in `../trustabl-rulebook` (new `raw_llm_sdk/tool_output_trust.md` and
+> `langchain/side_effect_bounds.md`).
+>
+> **P0 remaining-gaps batch (2026-09-30, rules-layer only, `schema_version` was 18):** +4 rules
+> (**CSDK-114**, **CREW-111**, **LC-113**, **VAI-020**) and an allow-list credit on the 14 SSRF rules,
+> layered on top of Batch 2 (already on `main`), so the fixture now holds **308** rules
+> (302 + Batch 2's 6; re-derive, do not trust this figure). Deliberately
+> **not** built, because each needs a new predicate or discovery the batch was barred from adding:
+> OAI/PYD whole-run deadline (a run-call deadline-wrapper fact), Python `max_budget_usd` (a repo-scope
+> predicate like `repo_claude_options_max_turns_missing`), LangGraph no-checkpointer and
+> mutating-node-without-HITL (a `langgraph.json` exemption reachable from agent scope, opaque/empty
+> `compile()` handling, an `interrupt()` fact, and user `@tool` edges on `StateGraph`), LangChain.js
+> `maxExecutionTime` (option unverified), and untrusted-tool-output concat (no raw `anthropic`/`openai`
+> loop discovery). Shipping the first two LangGraph rules on existing predicates alone would
+> false-positive on every LangGraph Platform repo, so they were held back rather than degraded.
+>
+> **Rulebook status (2026-09-29):** the fixture carries **304** rules across
+> **eleven** categories — the ten SDK categories (`autogen`, `claude_sdk`,
 > `claude_skill`, `crewai`, `google_adk`, `langchain`, `mcp`, `openai_sdk`,
-> `pydantic_ai`, `vercel_ai`) — in sync as of the `claude_skill` reconciliation
-> that added `skill_quality_text.yaml` (CSKILL-080..086) to the fixture and
-> dropped the fixture-only CSKILL-062..064 test artifacts. Known gap: CSKILL-
-> 080..086 ship in production with no paired rationale doc in
-> `trustabl-rulebook/docs/Policy/claude_skill/` (only `skill_safety.md`
-> exists there) — `check_rulebook.py` should be failing on this and needs a
-> `skill_quality_text.md` doc to close it.
+> `pydantic_ai`, `vercel_ai`) plus the cross-SDK **`observability`** category —
+> at `schema_version` **18**. This note combines two workstreams merged
+> together: the 16 agent-observability rules from main and Batch 1 of the
+> side-effect-bounds rule. Re-derive the count, never trust the figure in this
+> note: `grep -rhoE '^\s*-\s*id:\s*\S+' testdata/rules-fixture/*/*.yaml | wc -l`
+> and the same over `../agent-reliability-rules/*/*.yaml`. Earlier notes were
+> repeatedly stale when checked: **210** (claimed in sync while production had
+> run ahead to 228 and `LC-103` was shipped but untested), **243**, **277**,
+> and **292** (main's figure at the time of the observability merge; the merged
+> tree measures 298 = 293 on main + the 5 Batch 1 rules, and the 293-vs-292
+> difference is a recount, not a rule change).
+>
+> **Side-effect bounds (Batch 1, competitive-analysis backlog rank 12, P0):**
+> **OAI-030/031**, **PYD-014**, **MCP-030**, **LC-025** — a side-effecting tool
+> (send/notify/refund/charge/pay/payout/transfer/issue) with a free-form
+> recipient or amount parameter, no visible bound in the body, and no
+> SDK-native approval gate.
+>
+> **Batch 2 (done):** **CREW-014**, **ADK-020/021**, **AG2-020**, **VAI-019**,
+> **CSDK-023** (304 rules = 298 + 6). CrewAI, AutoGen, and Claude TS have no
+> tool-level approval gate to check, and ADK TypeScript has no declarative
+> confirmation option (its gate is a `requestConfirmation(` call in the
+> handler); each is stated in the rule's explanation and in COVERAGE.md.
+>
+> **Agent observability:** nine repo-scope absence rules, three agent-scope
+> outlier rules, `OBS-001..003`, and `OBS-005`. `OBS-005` and its backing
+> `repo_observability_declared` predicate are a deliberate 16th-rule /
+> 7th-predicate addition beyond the 15 rules / 6 predicates the design doc
+> originally scoped — confirmed intentional, not drift.
+>
+> **Fixture ↔ production sync:** clean as of Batch 2 —
+> `RULES_REPO=../trustabl-rules scripts/check-rules-sync.sh` passes (304 rules
+> in both trees, both branches cut from the rules repo's main). Re-run it before
+> pushing rather than trusting this note.
+>
+> **Rulebook gate status:** two measurements exist and are **not a trend** —
+> they ran against different packs. On 2026-09-21, `check_rulebook.py`
+> reported **97 errors** against the observability-era pack, **none** naming
+> any of the 15 observability rules; it was 50 on 2026-09-17 and 32 before
+> that. Of the 65 rule IDs those errors named, **47 did not exist** at the
+> pre-rebase base (`43da0b4` in the rules repo) — they are rules that landed
+> on main without a rationale doc, and the gate runs only in the rulebook
+> repo's CI, which is exactly how rules reach production ungrounded. One of
+> the 18 older ones is a defect that work *revealed*, not caused:
+> `docs/Policy/claude_sdk/repo.md` documents `CSDK-206` and `CSDK-207`, neither
+> of which is shipped. The Claude observability rule initially took `CSDK-206`
+> (derived from the shipped packs, which do not contain it) and was renumbered
+> to **`CSDK-208`** once the collision surfaced — a reminder that the next
+> free ID must be derived from the union of the packs **and** the rulebook. On
+> 2026-09-28 the gate reported **99 errors** against the Batch 1 pack, none
+> introduced by the four new rationale docs (the count did not move across
+> them; the 5 new rules pass COVERAGE/CONSISTENCY/PLACEMENT cleanly).
+> Re-run the gate against the merged pack rather than trusting either number.
+> Clearing the backlog is a separate, not-yet-scoped cleanup.
+>
+> **Run the gate with the renamed repo path:**
+> `python3 tools/check_rulebook.py --rules-repo ../agent-reliability-rules` —
+> its default is still the pre-rename `../trustabl-rules` (which is also where
+> the checkout lives on some machines).
 
 The rule-authoring contract (required fields, ID conventions, per-scope
 `applies_to` values, framing discipline) lives in

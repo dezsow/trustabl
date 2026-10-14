@@ -8,6 +8,15 @@ to follow Semantic Versioning once it reaches 1.0.
 
 ### Changed
 
+- **Test-path findings are excluded from scoring and the exit-code gate by
+  default.** A finding whose file matches a test-path pattern (`tests/`,
+  `__tests__/`, `testdata/`, `test_*.py`, `*_test.go`, `*.spec.ts`, …; see
+  `internal/pathclass`) is still reported in every format but no longer counts
+  toward `OverallScore`/`Surfaces` or fails the build — closing the reported
+  gap where a `WebSearchTool` declared in a test fixture scored identically to
+  one shipped in production. **This can change `overall_score` and the exit
+  code** for a repo whose only agent/tool surface lives under a test path; pass
+  `--include-test-paths` to restore the previous behavior exactly.
 - **`ScanID` now folds the rules origin.** A provenance tag
   (`signed:<channel>` / `unsigned:custom` / `unsigned:default`) is folded into
   `ScanID` so two scans of the same code with rules of different provenance get
@@ -16,7 +25,28 @@ to follow Semantic Versioning once it reaches 1.0.
   is now part of a scan's identity by design; baselines pinned to old IDs must
   be re-captured once.
 
+- **The reported SDK list now describes the repository, not its test data.**
+  `ScanResult.SDKs` (the `sdks` field, the `SDKs:` summary line, and the
+  `sdks_detected` telemetry property) is derived from production surfaces only.
+  Scanning a repo that vendors sample agent code under `testdata/` previously
+  reported that sample code's SDKs as the repo's own — a Go repo reporting
+  `google_adk`, `langchain` and `openai_agents` off its own fixtures. **This
+  narrows `sdks` for any repo with vendored samples**, and shifts the
+  `sdks_detected` telemetry series accordingly; pass `--include-test-paths` to
+  restore the previous list. Findings, tools and agents are unaffected and stay
+  complete. Rule-pack selection is unaffected: `SDKsDetected` is still derived
+  from everything discovered, so test-path findings are still produced and
+  reported.
+
 ### Fixed
+
+- **`trustabl enrich` no longer rejects every generated Python fix on Windows.**
+  Windows 11 ships App Execution Alias stubs, so `python3` resolves and runs
+  even where no python3 is installed, printing "Python was not found" and
+  exiting non-zero. The interpreter lookup trusted that resolution, never tried
+  the `python` fallback, and reported the stub's failure as an authoritative
+  "not valid Python" verdict instead of falling back to the tree-sitter check.
+  Candidates are now probed with an empty program before use.
 
 - **Attestation now works with cosign v3.** cosign v3 removed the
   `--tlog-upload` flag (it defaults `--use-signing-config=true`), which broke the
@@ -28,6 +58,16 @@ to follow Semantic Versioning once it reaches 1.0.
 
 ### Added
 
+- **`--include-test-paths` flag and `Finding.Origin`.** New `internal/pathclass`
+  package classifies a finding's `FilePath` as production or test code by path
+  shape. `Finding` gains an additive `origin` JSON field (`omitempty`, so
+  production findings are wire-identical to before); the SARIF output gains a
+  matching `properties.origin` plus a `result.suppressions` entry (GitHub code
+  scanning excludes it from the default alert view without dropping it from
+  the document); the human output gains a trailing "Test-path findings (not
+  scored)" section. `--include-test-paths` opts these findings back into
+  scoring and the exit code. See "Changed" below for the default-behavior
+  impact.
 - **`custom` LLM provider for self-hosted / local model servers.** `trustabl
   enrich` can now target any OpenAI-compatible endpoint (LiteLLM, vLLM, a local
   model server, etc.) instead of a hosted provider. Set `OPENAI_BASE_URL` to

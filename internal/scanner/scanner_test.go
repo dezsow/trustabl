@@ -721,6 +721,186 @@ func TestScanExamples_EmailAgent_SubagentDiscoveredAndAudited(t *testing.T) {
 	}
 }
 
+// TestScan_OAI201_TracingDisabled is the source-level fire/silent pair for
+// OAI-201 (testdata/rules-fixture/CLAUDE.md's known gap (d)): it runs real
+// .py source through the full scanner rather than a hand-built RepoInventory,
+// so a discovery regression that stops producing the shape OAI-201 depends on
+// fails a test instead of silently killing the rule.
+func TestScan_OAI201_TracingDisabled(t *testing.T) {
+	writeRepo := func(t *testing.T, agentBody string) string {
+		t.Helper()
+		dir := t.TempDir()
+		writeFile := func(rel, body string) {
+			t.Helper()
+			full := filepath.Join(dir, rel)
+			if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		writeFile("pyproject.toml", "[project]\nname = \"f\"\ndependencies = [\"openai-agents\"]\n")
+		writeFile("agent.py", agentBody)
+		return dir
+	}
+
+	fires := func(t *testing.T, res models.ScanResult) bool {
+		t.Helper()
+		for _, f := range res.Findings {
+			if f.RuleID == "OAI-201" {
+				return true
+			}
+		}
+		return false
+	}
+
+	t.Run("fires with default tracing", func(t *testing.T) {
+		dir := writeRepo(t, `from agents import Agent
+
+agent = Agent(name="researcher")
+`)
+		res, err := scanner.Run(scanner.Config{Target: dir, RulesFS: rulesFixture(t)})
+		if err != nil {
+			t.Fatalf("scanner.Run: %v", err)
+		}
+		if !fires(t, res) {
+			t.Errorf("expected OAI-201 to fire on a repo with no tracing configuration; findings=%v", res.Findings)
+		}
+	})
+
+	t.Run("silent with RunConfig(tracing_disabled=True)", func(t *testing.T) {
+		dir := writeRepo(t, `from agents import Agent, Runner, RunConfig
+
+agent = Agent(name="researcher")
+Runner.run(agent, run_config=RunConfig(tracing_disabled=True))
+`)
+		res, err := scanner.Run(scanner.Config{Target: dir, RulesFS: rulesFixture(t)})
+		if err != nil {
+			t.Fatalf("scanner.Run: %v", err)
+		}
+		if fires(t, res) {
+			t.Errorf("expected OAI-201 to stay silent when RunConfig(tracing_disabled=True) is set; findings=%v", res.Findings)
+		}
+	})
+}
+
+// writeScanRepo writes rel->body files into a temp repo and returns its path.
+func writeScanRepo(t *testing.T, files map[string]string) string {
+	t.Helper()
+	dir := t.TempDir()
+	for rel, body := range files {
+		full := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+func scanFires(t *testing.T, files map[string]string, ruleID string) bool {
+	t.Helper()
+	res, err := scanner.Run(scanner.Config{Target: writeScanRepo(t, files), RulesFS: rulesFixture(t)})
+	if err != nil {
+		t.Fatalf("scanner.Run: %v", err)
+	}
+	for _, f := range res.Findings {
+		if f.RuleID == ruleID {
+			return true
+		}
+	}
+	return false
+}
+
+// TestScan_LC114_NoCheckpointer runs real source through the full scanner: a
+// builder compiled with no checkpointer fires; a checkpointer, a chained
+// (never-linked) compile, a subgraph, and a langgraph.json all stay silent.
+func TestScan_LC114_NoCheckpointer(t *testing.T) {
+	dep := "[project]\nname = \"f\"\ndependencies = [\"langgraph\"]\n"
+	cases := []struct {
+		name  string
+		files map[string]string
+		want  bool
+	}{
+		{"fires on bare compile()", map[string]string{"pyproject.toml": dep, "g.py": "from langgraph.graph import StateGraph\nb = StateGraph(dict)\napp = b.compile()\n"}, true},
+		{"silent with checkpointer", map[string]string{"pyproject.toml": dep, "g.py": "from langgraph.graph import StateGraph\nb = StateGraph(dict)\napp = b.compile(checkpointer=saver)\n"}, false},
+		{"silent on chained compile", map[string]string{"pyproject.toml": dep, "g.py": "from langgraph.graph import StateGraph\napp = StateGraph(dict).compile()\n"}, false},
+		{"silent on subgraph", map[string]string{"pyproject.toml": dep, "g.py": "from langgraph.graph import StateGraph\ns = StateGraph(dict)\nsub = s.compile(checkpointer=saver)\np = StateGraph(dict)\np.add_node('s', sub)\napp = p.compile(checkpointer=saver)\n"}, false},
+		{"silent with langgraph.json", map[string]string{"pyproject.toml": dep, "langgraph.json": "{}", "g.py": "from langgraph.graph import StateGraph\nb = StateGraph(dict)\napp = b.compile()\n"}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := scanFires(t, c.files, "LC-114"); got != c.want {
+				t.Errorf("LC-114 fired=%v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestScan_LC115_NodeSideEffect: an add_node-registered function that shells
+// out fires; the same function gated by interrupt() is silent.
+func TestScan_LC115_NodeSideEffect(t *testing.T) {
+	dep := "[project]\nname = \"f\"\ndependencies = [\"langgraph\"]\n"
+	body := func(gate string) string {
+		return "import subprocess\nfrom langgraph.graph import StateGraph\nfrom langgraph.types import interrupt\n\n" +
+			"def deploy(state):\n" + gate + "    subprocess.run(['make', 'deploy'])\n    return state\n\n" +
+			"b = StateGraph(dict)\nb.add_node('deploy', deploy)\napp = b.compile(checkpointer=saver)\n"
+	}
+	if !scanFires(t, map[string]string{"pyproject.toml": dep, "g.py": body("")}, "LC-115") {
+		t.Error("LC-115 should fire on an ungated side-effecting node")
+	}
+	if scanFires(t, map[string]string{"pyproject.toml": dep, "g.py": body("    interrupt('ok?')\n")}, "LC-115") {
+		t.Error("LC-115 should stay silent when the node calls interrupt()")
+	}
+}
+
+// TestScan_OAI120_PYD108_WallClock: end-to-end through discovery + predicate.
+func TestScan_OAI120_PYD108_WallClock(t *testing.T) {
+	oaiDep := "[project]\nname = \"f\"\ndependencies = [\"openai-agents\"]\n"
+	oai := func(call string) map[string]string {
+		return map[string]string{"pyproject.toml": oaiDep, "a.py": "import asyncio\nfrom agents import Agent, Runner\n\nagent = Agent(name='x')\n\nasync def main():\n    return " + call + "\n"}
+	}
+	if !scanFires(t, oai("await Runner.run(agent, 'hi')"), "OAI-120") {
+		t.Error("OAI-120 should fire on an unwrapped Runner.run")
+	}
+	if scanFires(t, oai("await asyncio.wait_for(Runner.run(agent, 'hi'), timeout=30)"), "OAI-120") {
+		t.Error("OAI-120 should be silent when wrapped in asyncio.wait_for")
+	}
+	pydDep := "[project]\nname = \"f\"\ndependencies = [\"pydantic-ai\"]\n"
+	pyd := func(call string) map[string]string {
+		return map[string]string{"pyproject.toml": pydDep, "a.py": "import asyncio\nfrom pydantic_ai import Agent\n\nagent = Agent('openai:gpt-4o')\n\nasync def main():\n    return " + call + "\n"}
+	}
+	if !scanFires(t, pyd("await agent.run('hi')"), "PYD-108") {
+		t.Error("PYD-108 should fire on an unwrapped agent.run")
+	}
+	if scanFires(t, pyd("await asyncio.wait_for(agent.run('hi'), timeout=30)"), "PYD-108") {
+		t.Error("PYD-108 should be silent when wrapped in asyncio.wait_for")
+	}
+}
+
+// TestScan_RAW001_RAW002: the raw_llm_sdk pack fires on real source with no
+// agent framework and no declared SDK dependency detected.
+func TestScan_RAW001_RAW002(t *testing.T) {
+	oai := "import json\nfrom openai import OpenAI\nclient = OpenAI()\n\ndef loop(messages, tools):\n    r = client.chat.completions.create(model='m', messages=messages, tools=tools)\n    tc = r.choices[0].message.tool_calls[0]\n    out = run_tool(json.loads(tc.function.arguments))\n    messages.append({'role': 'system', 'content': f'Tool: {out}'})\n"
+	ant := "import anthropic\nclient = anthropic.Anthropic()\n\ndef loop(messages, tools):\n    r = client.messages.create(model='m', max_tokens=1, messages=messages, tools=tools)\n    out = run_tool(r.content[0].input)\n    return client.messages.create(model='m', max_tokens=1, system=f'Tool: {out}', messages=messages, tools=tools)\n"
+	if !scanFires(t, map[string]string{"loop.py": oai}, "RAW-002") {
+		t.Error("RAW-002 should fire on the OpenAI raw tool loop")
+	}
+	if scanFires(t, map[string]string{"loop.py": oai}, "RAW-001") {
+		t.Error("RAW-001 must not fire on OpenAI-only code")
+	}
+	if !scanFires(t, map[string]string{"loop.py": ant}, "RAW-001") {
+		t.Error("RAW-001 should fire on the Anthropic raw tool loop")
+	}
+	static := "from openai import OpenAI\nclient = OpenAI()\n\ndef loop(messages, tools):\n    client.chat.completions.create(model='m', messages=messages, tools=tools)\n    messages.append({'role': 'system', 'content': 'static'})\n"
+	if scanFires(t, map[string]string{"loop.py": static}, "RAW-002") {
+		t.Error("RAW-002 must stay silent on a static system message")
+	}
+}
+
 // TestScanResult_JSONLineRangeFields asserts that every new JSON field path
 // added by the inventory line-attribution work is present in --format json
 // output. This is a "the JSON shape is what we promised" contract test: it
@@ -963,5 +1143,304 @@ func TestScanExamples_ADKJS_DiscoveryCounts(t *testing.T) {
 	}
 	if len(firedADKRules) == 0 {
 		t.Errorf("expected ADK-109 to fire on the description-less TS LlmAgents in this corpus; got findings=%v", res.Findings)
+	}
+}
+
+// obsScanRepo writes one Python file into a temp repo and scans it.
+func obsScanRepo(t *testing.T, src string) models.ScanResult {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "app.py"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := scanner.Run(scanner.Config{Target: dir, RulesFS: rulesFixture(t)})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	return res
+}
+
+func TestScan_ReportsObservabilitySignals(t *testing.T) {
+	res := obsScanRepo(t, `import langfuse
+from langfuse.callback import CallbackHandler
+
+handler = CallbackHandler()
+`)
+	if len(res.Observability) == 0 {
+		t.Fatal("ScanResult.Observability is empty; want the langfuse signals")
+	}
+	var sawInit bool
+	for _, s := range res.Observability {
+		if s.Vendor == models.VendorLangfuse && s.Kind == models.ObsSignalInit {
+			sawInit = true
+		}
+	}
+	if !sawInit {
+		t.Fatalf("no langfuse init signal in %+v", res.Observability)
+	}
+}
+
+// An import with no init must stay an import. This is the distinction OBS-001
+// fires on, asserted end to end rather than only at the discovery layer.
+func TestScan_ObservabilityImportedButNotInitialized(t *testing.T) {
+	res := obsScanRepo(t, `import langfuse
+
+def handler():
+    return 1
+`)
+	if len(res.Observability) == 0 {
+		t.Fatal("want an import signal")
+	}
+	for _, s := range res.Observability {
+		if s.Kind == models.ObsSignalInit {
+			t.Fatalf("an import alone must not produce an init signal: %+v", s)
+		}
+	}
+}
+
+func TestScan_NoObservabilityAtAll(t *testing.T) {
+	res := obsScanRepo(t, `import os
+
+def handler():
+    return os.getcwd()
+`)
+	if len(res.Observability) != 0 {
+		t.Fatalf("want no signals, got %+v", res.Observability)
+	}
+}
+
+// TestScan_RunCallWallClock_ADKAndAutoGen runs real source through the full
+// scanner: an unwrapped Runner.run_async / initiate_chat fires ADK-113 /
+// AG2-021; an enclosing asyncio.timeout / wait_for (or an abort_signal) is
+// silent. This proves run-call discovery -> predicate -> rule end to end.
+func TestScan_RunCallWallClock_ADKAndAutoGen(t *testing.T) {
+	adkDep := "[project]\nname = \"f\"\ndependencies = [\"google-adk\"]\n"
+	agDep := "[project]\nname = \"f\"\ndependencies = [\"ag2\"]\n"
+	adkHead := "from google.adk.agents import LlmAgent\nfrom google.adk.runners import Runner\nimport asyncio\n" +
+		"root = LlmAgent(name=\"r\", model=\"gemini-2.0-flash\", description=\"d\")\n" +
+		"runner = Runner(agent=root, app_name=\"a\", session_service=svc)\n"
+	cases := []struct {
+		name   string
+		rule   string
+		files  map[string]string
+		wantFn bool
+	}{
+		{"ADK fires on unwrapped run_async", "ADK-113", map[string]string{"pyproject.toml": adkDep,
+			"a.py": adkHead + "async def main():\n    async for ev in runner.run_async(user_id=\"u\", session_id=\"s\"):\n        pass\n"}, true},
+		{"ADK silent inside asyncio.timeout", "ADK-113", map[string]string{"pyproject.toml": adkDep,
+			"a.py": adkHead + "async def main():\n    async with asyncio.timeout(30):\n        async for ev in runner.run_async(user_id=\"u\", session_id=\"s\"):\n            pass\n"}, false},
+		{"ADK silent with abort_signal", "ADK-113", map[string]string{"pyproject.toml": adkDep,
+			"a.py": adkHead + "async def main():\n    async for ev in runner.run_async(user_id=\"u\", session_id=\"s\", abort_signal=stop):\n        pass\n"}, false},
+		{"AutoGen fires on unwrapped initiate_chat", "AG2-021", map[string]string{"pyproject.toml": agDep,
+			"a.py": "from autogen import ConversableAgent\na = ConversableAgent(name=\"a\")\nb = ConversableAgent(name=\"b\")\na.initiate_chat(b, message=\"hi\", max_turns=2)\n"}, true},
+		{"AutoGen silent inside wait_for", "AG2-021", map[string]string{"pyproject.toml": agDep,
+			"a.py": "import asyncio\nfrom autogen import ConversableAgent\na = ConversableAgent(name=\"a\")\nb = ConversableAgent(name=\"b\")\nasync def main():\n    await asyncio.wait_for(a.a_initiate_chat(b, message=\"hi\"), timeout=30)\n"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := scanFires(t, tc.files, tc.rule); got != tc.wantFn {
+				t.Errorf("%s fires = %v, want %v", tc.rule, got, tc.wantFn)
+			}
+		})
+	}
+}
+
+// End to end: the pre-trust fixture holds one offending file per agent_config
+// rule and no SDK code at all. Every rule fires at its own file, and because
+// the fixture lives under testdata/ the findings are tagged test-origin.
+func TestScan_PreTrustConfigFixtureFiresEveryRule(t *testing.T) {
+	_, thisFile, _, _ := runtime.Caller(0)
+	target := filepath.Join(filepath.Dir(thisFile), "..", "..", "testdata", "corpus", "preauth-config-fixture")
+	res, err := scanner.Run(scanner.Config{Target: target, RulesFS: rulesFixture(t)})
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	want := map[string]string{
+		"AGCFG-004":  ".claude/settings.json",
+		"AGCFG-005":  ".claude/settings.json",
+		"AGCFG-006":  ".codex/config.toml", // first path-sorted hit; .gemini/.env also matches
+		"AGCFG-007":  ".vscode/settings.json",
+		"MCPCFG-002": ".mcp.json",
+	}
+	got := map[string]models.Finding{}
+	for _, f := range res.Findings {
+		got[f.RuleID] = f
+	}
+	for id, file := range want {
+		f, ok := got[id]
+		if !ok {
+			t.Errorf("%s did not fire; fired: %v", id, got)
+			continue
+		}
+		if !strings.HasSuffix(f.FilePath, file) {
+			t.Errorf("%s attributed to %q, want a path ending %q", id, f.FilePath, file)
+		}
+		if f.StartLine < 1 {
+			t.Errorf("%s has no line", id)
+		}
+	}
+	for _, f := range res.Findings {
+		if strings.Contains(f.Explanation+f.Title, "fake-value-not-real") {
+			t.Errorf("%s leaked an env value", f.RuleID)
+		}
+	}
+}
+
+// The "pass" counterpart of the pre-trust fixture: the same five config files
+// rewritten to their safe forms. None of the agent_config rules may fire.
+func TestScan_PreTrustConfigSafeVariantsStaySilent(t *testing.T) {
+	dir := t.TempDir()
+	for rel, body := range map[string]string{
+		".claude/settings.json": `{"permissions": {"allow": ["Read"]}}`,
+		".mcp.json":             `{"mcpServers": {"pinned": {"command": "npx", "args": ["-y", "@example/mcp-server@1.2.3"]}, "remote": {"url": "https://mcp.example.invalid/sse"}}}`,
+		".gemini/.env":          "PLAIN_SETTING=fake-value-not-real\n",
+		".env":                  "OPENAI_BASE_URL=https://api.example.invalid\nNODE_OPTIONS=--max-old-space-size=4096\n",
+		".vscode/settings.json": "{\n  // fixture only\n  \"chat.tools.autoApprove\": false,\n}\n",
+		".codex/config.toml":    "sandbox_mode = \"workspace-write\"\napproval_policy = \"on-request\"\n",
+	} {
+		full := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	res, err := scanner.Run(scanner.Config{Target: dir, RulesFS: rulesFixture(t)})
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	for _, f := range res.Findings {
+		if strings.HasPrefix(f.RuleID, "AGCFG-") || strings.HasPrefix(f.RuleID, "MCPCFG-") {
+			t.Errorf("%s fired on a safe variant (%s:%d)", f.RuleID, f.FilePath, f.StartLine)
+		}
+	}
+}
+
+// TestScan_OtelLabelsLadder runs real Python source through the full scanner
+// for the OBS-006..008 ladder. The per-rule cases in policies_test.go feed
+// hand-built inventories, so they cannot catch recon or discovery failing to
+// produce the facts these rules read; this does. Exactly one rung fires per
+// repo, and none fires once the library is fully used or when the repo has no
+// tracing to label.
+func TestScan_OtelLabelsLadder(t *testing.T) {
+	const tracing = `from agents import Agent, function_tool
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+
+trace.set_tracer_provider(TracerProvider())
+tracer = trace.get_tracer(__name__)
+
+
+@function_tool
+def search_flights(origin: str) -> str:
+    """Search flights from an airport."""
+    return origin
+
+
+agent = Agent(name="travel-booker", tools=[search_flights])
+`
+	cases := []struct {
+		name string
+		deps string
+		src  string
+		want []string
+	}{
+		{
+			name: "instrumented, no agent-reliability-otel-labels",
+			deps: `"openai-agents", "opentelemetry-sdk"`,
+			src:  tracing,
+			want: []string{"OBS-006"},
+		},
+		{
+			name: "declared but no run started",
+			deps: `"openai-agents", "opentelemetry-sdk", "agent-reliability-otel-labels"`,
+			src:  tracing,
+			want: []string{"OBS-007"},
+		},
+		{
+			name: "run started but nothing labelled",
+			deps: `"openai-agents", "opentelemetry-sdk", "agent-reliability-otel-labels"`,
+			src: tracing + `
+from agent_reliability_otel_labels import Run
+
+
+def run_agent(prompt):
+    run = Run()
+    with tracer.start_as_current_span("invoke_agent") as root:
+        run.mark_start(root)
+        return prompt
+`,
+			want: []string{"OBS-008"},
+		},
+		{
+			name: "fully labelled",
+			deps: `"openai-agents", "opentelemetry-sdk", "agent-reliability-otel-labels"`,
+			src: tracing + `
+from agent_reliability_otel_labels import Run, mark_run_end, mark_tool_span
+
+
+def run_agent(prompt):
+    run = Run()
+    with tracer.start_as_current_span("invoke_agent") as root:
+        run.mark_start(root)
+        try:
+            return prompt
+        finally:
+            mark_tool_span(trace.get_current_span(), args={}, result=None,
+                           attempt=1, step_index=run.next_step(), run_id=run.run_id)
+            mark_run_end(root, exit_reason="final_answer")
+`,
+			want: nil,
+		},
+		{
+			name: "labels written by hand, no library",
+			deps: `"openai-agents", "opentelemetry-sdk"`,
+			src: tracing + `
+
+def run_agent(prompt):
+    with tracer.start_as_current_span("invoke_agent") as root:
+        root.set_attribute("trustabl.run_id", "r-1")
+        with tracer.start_as_current_span("execute_tool") as span:
+            span.set_attribute("trustabl.tool.input_fp", "abc")
+        root.set_attribute("trustabl.exit_reason", "final_answer")
+`,
+			want: nil,
+		},
+		{
+			name: "no tracing at all",
+			deps: `"openai-agents"`,
+			src: `from agents import Agent
+
+agent = Agent(name="travel-booker")
+`,
+			want: nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			manifest := "[project]\nname = \"f\"\ndependencies = [" + tc.deps + "]\n"
+			if err := os.WriteFile(filepath.Join(dir, "pyproject.toml"), []byte(manifest), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "agent.py"), []byte(tc.src), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			res, err := scanner.Run(scanner.Config{Target: dir, RulesFS: rulesFixture(t)})
+			if err != nil {
+				t.Fatalf("scanner.Run: %v", err)
+			}
+			var got []string
+			for _, f := range res.Findings {
+				switch f.RuleID {
+				case "OBS-006", "OBS-007", "OBS-008":
+					got = append(got, f.RuleID)
+				}
+			}
+			if strings.Join(got, ",") != strings.Join(tc.want, ",") {
+				t.Errorf("agent-reliability-otel-labels findings: got %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

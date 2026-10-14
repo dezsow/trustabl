@@ -25,6 +25,7 @@ import (
 	"github.com/trustabl/trustabl/internal/ingestion"
 	"github.com/trustabl/trustabl/internal/logx"
 	"github.com/trustabl/trustabl/internal/models"
+	"github.com/trustabl/trustabl/internal/pathclass"
 	"github.com/trustabl/trustabl/internal/progress"
 	"github.com/trustabl/trustabl/internal/rules"
 )
@@ -86,6 +87,15 @@ type Config struct {
 	// (SECRET-LIT-001) and scripts that read credentials from the environment
 	// (SECRET-ENV-001). Off by default.
 	SecretScan bool
+
+	// IncludeTestPaths opts findings whose FilePath classifies as
+	// models.OriginTest (internal/pathclass) back into scoring and the exit-code
+	// gate. Off by default: a test-path finding is still reported (never
+	// dropped — see models.SurfaceOrigin) but is excluded from
+	// Surfaces/OverallScore/ProjectedScores and does not affect NoAgentSurfaces
+	// or the CLI exit code, because a WebSearchTool declared in a test fixture
+	// is not the same finding as one shipped in a production agent.
+	IncludeTestPaths bool
 
 	// Progress receives real-time phase events. Nil means no progress output.
 	Progress progress.Reporter
@@ -179,7 +189,7 @@ func Run(cfg Config) (models.ScanResult, error) {
 		rep.Fatal(err)
 		return models.ScanResult{}, fmt.Errorf("recon: %w", err)
 	}
-	rep.EndPhase(fmt.Sprintf("%d files · %s", len(profile.Manifest.PythonFiles), languagesLabel(profile.Languages)))
+	rep.EndPhase(fmt.Sprintf("%d files · %s", profile.Manifest.SourceFileCount(), languagesLabel(profile.Languages)))
 	reconStop()
 	log.Verbosef("recon: languages %s · %d SDK deps declared", languagesLabel(profile.Languages), len(profile.SDKDeps))
 	if log.Enabled(logx.LevelDebug) {
@@ -194,7 +204,7 @@ func Run(cfg Config) (models.ScanResult, error) {
 	// Step 2: inventory (per-language AST; Python only for now)
 	rep.StartPhase("inventory", "Inventory")
 	inventoryStop := log.Timer("inventory")
-	rep.SetTotal(len(profile.Manifest.PythonFiles) + len(profile.Manifest.TypeScriptFiles) + len(profile.Manifest.JavaScriptFiles) + len(profile.Manifest.GoFiles) + len(profile.Manifest.CSharpFiles) + len(profile.Manifest.PHPFiles) + len(profile.Manifest.RustFiles))
+	rep.SetTotal(profile.Manifest.SourceFileCount())
 	tools, parsed, pySkipped, err := analysis.DiscoverTools(ctx, profile.Manifest, func(path string) {
 		rep.Advance(path)
 	})
@@ -211,6 +221,7 @@ func Run(cfg Config) (models.ScanResult, error) {
 	agents = append(agents, analysis.DiscoverPydanticAIAgents(parsed)...)
 	tools = append(tools, analysis.DiscoverADKTools(parsed)...)
 	tools = append(tools, analysis.DiscoverLangChainTools(parsed)...)
+	tools = append(tools, analysis.DiscoverLangGraphNodes(parsed)...)
 	tools = append(tools, analysis.DiscoverAutoGenTools(parsed)...)
 	tools = append(tools, analysis.DiscoverPydanticAITools(parsed)...)
 	guardrails := analysis.DiscoverGuardrails(parsed)
@@ -396,14 +407,33 @@ func Run(cfg Config) (models.ScanResult, error) {
 	allParsed = append(allParsed, phpFiles...)
 	allParsed = append(allParsed, rustFiles...)
 	analysis.ResolveEdges(&inventory, allParsed)
+	// Observability signals span Python and TS/JS, so they are computed from
+	// allParsed rather than the Python-only `parsed` slice that
+	// computeUsesDefaultTracing uses. DiscoverObservability ignores every other
+	// language by extension.
+	inventory.ObservabilitySignals = analysis.MergeObservabilitySignals(
+		analysis.DiscoverObservability(allParsed),
+		analysis.DiscoverAgentObservabilitySignals(agents),
+	)
+	// Credit process-wide instrumentation (logfire.instrument_pydantic_ai(),
+	// Agent.instrument_all(), ...) onto the agents it covers, so the
+	// per-agent kwarg-missing outlier rules do not fire on them.
+	analysis.ApplyGlobalInstrumentation(inventory.Agents, inventory.ObservabilitySignals)
+	inventory.OtelLabelsSignals = analysis.DiscoverOtelLabels(allParsed)
 	inventory.Subagents = analysis.DiscoverSubagents(profile.Manifest)
 	inventory.Skills = analysis.DiscoverSkills(profile.Manifest)
 	inventory.Dependencies = analysis.DiscoverDependencies(profile.Manifest.RepoRoot)
 	inventory.SlashCommands = analysis.DiscoverSlashCommands(profile.Manifest)
 	inventory.PluginManifests = analysis.DiscoverPlugins(profile.Manifest)
 	inventory.ClaudeSettings = analysis.DiscoverClaudeSettings(profile.Manifest)
+	inventory.ProjectConfig = analysis.DiscoverProjectConfig(profile.Manifest, inventory.ClaudeSettings)
 	inventory.ClaudeAgentOptions = analysis.DiscoverClaudeAgentOptions(parsed)
 	inventory.AgentRunCalls = analysis.DiscoverAgentRunCalls(parsed)
+	// Server-entrypoint fact (Python): must follow DiscoverAgentRunCalls, which
+	// supplies the run calls the reachability stamp is applied to.
+	inventory.Entrypoints = analysis.DiscoverEntrypoints(parsed)
+	analysis.ApplyEntrypointReachability(&inventory, parsed)
+	inventory.RawAnthropicToolOutputInSystemPrompt, inventory.RawOpenAIToolOutputInSystemMessage = analysis.DetectRawLLMToolOutputInSystem(parsed)
 	// Markdown subagents are an independent Claude Agent SDK signal: a repo can
 	// ship .claude/agents/*.md (or a flat collection) with no Claude SDK code.
 	// Fold them into SDKsDetected so LoadFor loads the claude_sdk pack (CSDK-110).
@@ -504,9 +534,86 @@ func Run(cfg Config) (models.ScanResult, error) {
 		log.Verbosef("secret-scan: %d potential secrets", len(secrets))
 	}
 
-	// Step 5: scoring
-	surfaces, overall := analysis.Score(tools, inventory.Agents, inventory.Subagents, inventory.Skills, findings)
-	projected := analysis.Project(tools, inventory.Agents, inventory.Subagents, inventory.Skills, findings)
+	// Step 4c: classify every finding's origin (production vs. test-path) by its
+	// FilePath — one pass over the fully-assembled findings list (rule + META +
+	// vuln/license/secret), so no individual finding constructor needs to know
+	// about path classification. Pure function of the already-normalized,
+	// forward-slash repo-relative path; never touches ScanManifest, so ScanID
+	// stays unaffected. See internal/pathclass and models.SurfaceOrigin.
+	for i := range findings {
+		findings[i].Origin = pathclass.Classify(findings[i].FilePath)
+	}
+
+	// Step 5: scoring. A test-path finding is still reported (it's in
+	// `findings` above, untouched) but by default must not move the readiness
+	// score, OverallScore, or NoAgentSurfaces: a WebSearchTool declared in
+	// tests/test_adapter.py is not a production agent surface, and scoring it
+	// the same as a shipped agent is exactly the non-actionable-finding
+	// complaint this classification exists to fix. --include-test-paths
+	// reproduces the pre-classification behavior exactly by scoring everything.
+	scoreTools, scoreAgents, scoreSubagents, scoreSkills, scoreFindings := tools, inventory.Agents, inventory.Subagents, inventory.Skills, findings
+	// Same production-only view, for the two repo-scope Claude surfaces. They
+	// do not feed Score, but they do feed the SDK list this scan reports (see
+	// reportedSDKs below), and a .claude/settings.json vendored as scanner
+	// test data is not evidence that this repo is a Claude Agent SDK repo.
+	scoreSettings, scoreAgentOptions := inventory.ClaudeSettings, inventory.ClaudeAgentOptions
+	if !cfg.IncludeTestPaths {
+		scoreTools = nil
+		for _, t := range tools {
+			if pathclass.Classify(t.FilePath) != models.OriginTest {
+				scoreTools = append(scoreTools, t)
+			}
+		}
+		scoreAgents = nil
+		for _, a := range inventory.Agents {
+			if pathclass.Classify(a.FilePath) != models.OriginTest {
+				scoreAgents = append(scoreAgents, a)
+			}
+		}
+		scoreSubagents = nil
+		for _, s := range inventory.Subagents {
+			if pathclass.Classify(s.FilePath) != models.OriginTest {
+				scoreSubagents = append(scoreSubagents, s)
+			}
+		}
+		scoreSkills = nil
+		for _, s := range inventory.Skills {
+			if pathclass.Classify(s.FilePath) != models.OriginTest {
+				scoreSkills = append(scoreSkills, s)
+			}
+		}
+		scoreFindings = nil
+		for _, f := range findings {
+			if f.Origin != models.OriginTest {
+				scoreFindings = append(scoreFindings, f)
+			}
+		}
+		scoreSettings = nil
+		for _, c := range inventory.ClaudeSettings {
+			if pathclass.Classify(c.FilePath) != models.OriginTest {
+				scoreSettings = append(scoreSettings, c)
+			}
+		}
+		scoreAgentOptions = nil
+		for _, o := range inventory.ClaudeAgentOptions {
+			if pathclass.Classify(o.FilePath) != models.OriginTest {
+				scoreAgentOptions = append(scoreAgentOptions, o)
+			}
+		}
+	}
+	// The SDK list the report states is a claim about this repository, so it is
+	// derived from production surfaces only. inventory.SDKsDetected stays as
+	// discovered and is NOT narrowed: it selects which rule packs load, and
+	// narrowing it would drop the packs that produce test-path findings
+	// altogether — those are meant to be reported and de-weighted, not
+	// deleted. Without this split a Go repo that vendors Python fixtures
+	// reports sdks: [google_adk, langchain, openai_agents] on the strength of
+	// its own test corpus. --include-test-paths restores the old behaviour,
+	// because the score* slices are then unfiltered.
+	reportedSDKs := deriveSDKsDetected(scoreTools, scoreAgents, scoreSubagents, scoreSettings, scoreAgentOptions)
+
+	surfaces, overall := analysis.Score(scoreTools, scoreAgents, scoreSubagents, scoreSkills, scoreFindings)
+	projected := analysis.Project(scoreTools, scoreAgents, scoreSubagents, scoreSkills, scoreFindings)
 
 	// Coverage: how many AST-targeted source files we actually parsed vs. how
 	// many we attempted. Discovery skips files it cannot read or parse (one bad
@@ -536,7 +643,7 @@ func Run(cfg Config) (models.ScanResult, error) {
 		ScanID:              scanID(idLabel, profile.Manifest, cfg.RulesVersion, rules.SupportedSchemaVersion, cfg.RulesOrigin.Tag(), vulnDBVersion),
 		Repo:                repoLabel,
 		Languages:           profile.Languages,
-		SDKs:                inventory.SDKsDetected,
+		SDKs:                reportedSDKs,
 		HasShellInvocations: inventory.HasShellInvocations,
 		Manifest:            profile.Manifest,
 		Tools:               tools,
@@ -546,6 +653,8 @@ func Run(cfg Config) (models.ScanResult, error) {
 		Subagents:           inventory.Subagents,
 		Skills:              inventory.Skills,
 		Dependencies:        inventory.Dependencies,
+		Observability:       inventory.ObservabilitySignals,
+		Entrypoints:         inventory.Entrypoints,
 		Vulnerabilities:     vulns,
 		Secrets:             secrets,
 		SlashCommands:       inventory.SlashCommands,
@@ -588,7 +697,7 @@ func deriveSDKsDetected(tools []models.ToolDef, agents []models.AgentDef, subage
 			seen[models.SDKMCP] = true
 		case models.KindADKFunctionTool:
 			seen[models.SDKGoogleADK] = true
-		case models.KindLangChainTool:
+		case models.KindLangChainTool, models.KindLangGraphNode:
 			seen[models.SDKLangChain] = true
 		case models.KindCrewAITool:
 			seen[models.SDKCrewAI] = true
@@ -668,11 +777,22 @@ var tracingProcessorFuncs = map[string]bool{
 	"set_trace_processors": true,
 }
 
-// disablesDefaultTracing reports whether a parsed file installs a custom trace
-// processor or references the tracing-disable env var. It inspects typed AST
-// nodes — call-function names and string literals — rather than substring-
-// scanning raw source, so a mention inside a comment or an unrelated identifier
-// no longer produces a false signal (the inventory-owns-AST-facts contract).
+// tracingDisableFuncs are OpenAI Agents SDK calls that disable tracing outright
+// when their first positional argument is the literal True — the SDK's
+// module-level `set_tracing_disabled(True)` switch.
+var tracingDisableFuncs = map[string]bool{
+	"set_tracing_disabled": true,
+}
+
+// disablesDefaultTracing reports whether a parsed file disables or replaces
+// OpenAI Agents SDK default tracing, by any of four documented mechanisms:
+// installing a custom trace processor (add_trace_processor /
+// set_trace_processors), referencing the OPENAI_AGENTS_DISABLE_TRACING env
+// var, calling set_tracing_disabled(True), or constructing
+// RunConfig(tracing_disabled=True). It inspects typed AST nodes — call-function
+// names, call arguments, and string literals — rather than substring-scanning
+// raw source, so a mention inside a comment or an unrelated identifier no
+// longer produces a false signal (the inventory-owns-AST-facts contract).
 func disablesDefaultTracing(pf analysis.ParsedFile) bool {
 	found := false
 	astutil.Walk(pf.Tree.RootNode(), func(n *sitter.Node) bool {
@@ -691,7 +811,19 @@ func disablesDefaultTracing(pf analysis.ParsedFile) bool {
 			if i := strings.LastIndex(name, "."); i >= 0 {
 				name = name[i+1:]
 			}
-			if tracingProcessorFuncs[name] {
+			switch {
+			case tracingProcessorFuncs[name]:
+				found = true
+				return false
+			case tracingDisableFuncs[name] && callFirstPositionalArgIsTrue(n):
+				found = true
+				return false
+			case name == "RunConfig" && callKeywordArgIsTrue(n, "tracing_disabled", pf.Source):
+				// Matches both the inline Runner.run(agent, run_config=RunConfig(...))
+				// form and an assigned-variable form (cfg = RunConfig(...)) — the
+				// walk finds the RunConfig(...) construction wherever it appears in
+				// the file, with no dataflow needed to connect it back to the run
+				// call.
 				found = true
 				return false
 			}
@@ -707,6 +839,42 @@ func disablesDefaultTracing(pf analysis.ParsedFile) bool {
 		return true
 	})
 	return found
+}
+
+// callFirstPositionalArgIsTrue reports whether callNode's first positional
+// argument (i.e. not a keyword argument) is the literal True.
+func callFirstPositionalArgIsTrue(callNode *sitter.Node) bool {
+	args := callNode.ChildByFieldName("arguments")
+	if args == nil {
+		return false
+	}
+	if args.NamedChildCount() == 0 {
+		return false
+	}
+	first := args.NamedChild(0)
+	return first != nil && first.Type() == "true"
+}
+
+// callKeywordArgIsTrue reports whether callNode has a keyword argument named
+// kwarg whose value is the literal True.
+func callKeywordArgIsTrue(callNode *sitter.Node, kwarg string, src []byte) bool {
+	args := callNode.ChildByFieldName("arguments")
+	if args == nil {
+		return false
+	}
+	for i := 0; i < int(args.NamedChildCount()); i++ {
+		child := args.NamedChild(i)
+		if child.Type() != "keyword_argument" {
+			continue
+		}
+		name := astutil.NodeText(child.ChildByFieldName("name"), src)
+		if name != kwarg {
+			continue
+		}
+		value := child.ChildByFieldName("value")
+		return value != nil && value.Type() == "true"
+	}
+	return false
 }
 
 // languagesLabel renders a stable, comma-separated language list for progress.

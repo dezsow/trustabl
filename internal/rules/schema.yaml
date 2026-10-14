@@ -8,7 +8,7 @@
 # To author a new rule:
 #   1. Read this file end-to-end.
 #   2. Copy fields from the annotated example below into a new entry under
-#      <category>/<topic>.yaml in the external trustabl-rules repository
+#      <category>/<topic>.yaml in the external agent-reliability-rules repository
 #      (Phase-1 interim copy: testdata/rules-fixture/<category>/<topic>.yaml).
 #   3. Use the predicate reference (bottom of this file) to express your
 #      match condition.
@@ -32,7 +32,8 @@ policy:
 
   category: claude_sdk                      # REQUIRED. Inherited by every rule in this file. Allowed:
                                             #   claude_sdk | openai_sdk | openshell | google_adk | mcp |
-                                            #   langchain | crewai | pydantic_ai | vercel_ai | autogen | claude_skill.
+                                            #   langchain | crewai | pydantic_ai | vercel_ai | autogen | claude_skill |
+                                            #   observability | raw_llm_sdk | agent_config.
 
   description: >                            # REQUIRED. Multi-line ok. Describe the policy's intent.
     Rules that govern outbound network calls made from inside agent tools.
@@ -89,7 +90,7 @@ rules:
                                             #           applies_to accepts: claude_sdk_tool, openai_tool,
                                             #           mcp_tool, adk_function_tool, shell_invocation, unknown,
                                             #           langchain_tool, crewai_tool, pydantic_ai_tool,
-                                            #           vercel_ai_tool, autogen_tool.
+                                            #           vercel_ai_tool, autogen_tool, langgraph_node.
                                             #   agent — fires per AgentDef (Agent/SandboxAgent/AgentDefinition/
                                             #           ADK/query() constructor call). applies_to accepts:
                                             #           openai_agent, openai_sandbox_agent,
@@ -107,7 +108,9 @@ rules:
                                             #           claude_skill.
                                             #   repo  — fires once per scan. applies_to accepts:
                                             #           claude_sdk, openai_agents, google_adk, openshell, mcp,
-                                            #           langchain, crewai, pydantic_ai, vercel_ai, autogen.
+                                            #           langchain, crewai, pydantic_ai, vercel_ai, autogen,
+                                            #           raw_llm_sdk (bare anthropic/openai client usage),
+                                            #           agent_config (pre-trust harness config; no SDK gate).
                                             # (Authoritative per-scope applies_to set: internal/rules/loader.go
                                             #  appliesToByScope — the lists here are a human summary of it.)
 
@@ -171,10 +174,22 @@ rules:
 #   has_shell_call:         body calls subprocess.* / os.system / os.popen / os.spawn*
 #   has_code_exec_call:     body calls the eval/exec/compile builtins (bare callee,
 #                           so re.compile and other attribute calls are not flagged)
-#   has_print_call:         body calls the print builtin (bare callee, so pprint and
-#                           other callees containing "print" are not flagged)
+#   has_print_call:         body writes to stdout for diagnostics. Python: calls
+#                           the print builtin (bare callee, so pprint and other
+#                           callees containing "print" are not flagged).
+#                           TypeScript/JavaScript: calls console.log /
+#                           console.info / console.debug / process.stdout.write.
+#                           console.warn, console.error and process.stderr.write
+#                           are deliberately NOT flagged — Node routes them to
+#                           stderr, which is the remediation (and on an MCP stdio
+#                           server the only safe destination, since stdout carries
+#                           the JSON-RPC frames).
 #   has_write_call:         body opens a file 'w'/'a'/'x', or shutil.copy/copy2/move/rmtree
 #   has_dynamic_url_call:   HTTP call where the URL is a non-literal (param/f-string)
+#   has_unpinned_scheme_url_call: HTTP call with a non-literal URL that does not
+#                           start with a literal https:// prefix (f-string / template
+#                           / concat / .format / % forms are recognized; an identifier
+#                           URL is unpinned). Pair with the SSRF allow-list gate.
 #   has_http_call_without_timeout: (TypeScript only) a fetch/axios/got/undici call
 #                           with no signal/timeout/abortSignal option — an unbounded
 #                           HTTP call that can hang the agent's run loop. Python
@@ -286,6 +301,10 @@ rules:
 #   agent_kwarg_missing: [kwarg, dotted.path, ...]
 #       True when a kwarg is absent OR present with literal `None`.
 #       (Asymmetric with `agent_kwarg_present`, which tests pure presence.)
+#       One exception: a kwarg named by AgentDef.InstrumentedBy (set when a
+#       process-wide instrumentation call such as logfire.instrument_pydantic_ai()
+#       covers the agent) is treated as set, so `instrument` / `callbacks` are not
+#       reported missing on a covered agent. Every other kwarg is unaffected.
 #
 #   agent_kwarg_list_empty: [kwarg, ...]
 #       Fires when ANY of the listed list kwargs is absent or an empty list [].
@@ -346,6 +365,78 @@ rules:
 #       resolvable to it by variable name, and none of those calls set
 #       usage_limits. Same silence rule as agent_run_call_max_turns_missing.
 #
+#   agent_mcp_server_kwarg_missing: {classes: [MCPServerStdio, ...], kwarg: tool_filter}
+#       Returns true if the agent wires at least one MCP server of any class in
+#       `classes` whose `kwarg` is absent OR present with literal None. `kwarg`
+#       supports dotted paths. Requires the MCP server ref to be resolved (the
+#       def carries the captured kwargs) — an unresolved/external ref is
+#       skipped, not counted as missing. `classes` is a list (unlike
+#       agent_hosted_tool_kwarg_present's single `class`) because
+#       MCPServerStdio/Sse/StreamableHttp all share tool_filter as the same
+#       allow-list mechanism, so one rule checks all three. Positive logic
+#       (not a negated `_present` predicate, and no separate
+#       agent_uses_*_class clause needed): finding a ref whose class is in the
+#       list already proves the agent uses it, and with multiple wired servers
+#       negating a presence check would go silent as soon as ANY one sets the
+#       kwarg, masking the others that don't.
+#
+#   agent_file_url_force_download: bool
+#       Pydantic AI only. Returns true if discovery stamped
+#       AgentDef.FileURLForceDownload as "True" or "allow-local" — a
+#       FileUrl / ImageUrl / AudioUrl / VideoUrl / DocumentUrl constructor
+#       in the agent's file set force_download to a host-side download
+#       (True) or a private-IP-allowing download ('allow-local'). Silent
+#       when the field is empty (kwarg absent or False).
+#
+#   agent_run_call_wall_clock_timeout_missing: true | false
+#       OpenAI Agents SDK, Pydantic AI, Google ADK and AutoGen only. Fires when
+#       this agent has at least one resolvable run call (Runner.run-family /
+#       <agent>.run-family / ADK Runner.run + run_async resolved to the agent
+#       via Runner(agent=) / InMemoryRunner(agent) / AutoGen initiate_chat
+#       (receiver and recipient) + run-family; same-file, non-opaque) and NONE of
+#       them sit structurally inside an
+#       asyncio.wait_for(...) argument or an asyncio.timeout / anyio.move_on_after
+#       / anyio.fail_after `with` block (AgentRunCallDef.WallClockTimeoutWrapped).
+#       An unrelated timeout elsewhere in the file is not credited. For ADK and
+#       AutoGen a non-None abort_signal / cancellation_token kwarg on the run
+#       call also satisfies it. Silent when no run call resolves. Complements
+#       max_turns / usage_limits, which bound step count and spend but not how
+#       long one step can block.
+#
+#   agent_kwargs_observed: true | false
+#       True iff discovery resolved this agent's call site: kwargs were captured
+#       (non-nil) and the call was not opaque (** unpacking). Pair with
+#       agent_kwarg_missing so an absence rule fires only when the call was
+#       genuinely seen to lack the key, not when it was never linked at all
+#       (e.g. a chained StateGraph(...).compile() with no named variable, or a
+#       compiled graph that is used as a subgraph).
+#
+#   agent_checkpointer_in_memory: true | false
+#       True when the agent's checkpointer= (LangGraph compile() /
+#       create_react_agent() / create_agent()) resolves to an in-process saver:
+#       MemorySaver or InMemorySaver, imported from a langgraph module (bare,
+#       `as` alias, or module-qualified), passed as a call
+#       (MemorySaver(serde=...)) or as a same-file variable bound to one. Any
+#       other class, an unresolved name, a saver chosen at runtime, or no
+#       checkpointer at all is false. Used by LC-116.
+#
+#   agent_server_reachable: true | false
+#       True when at least one same-SDK run call of the agent is reachable from
+#       a server entrypoint (FastAPI / Flask route = http; Celery / Dramatiq task
+#       = worker), within the v1 one-hop-per-edge reachability model (inside the
+#       entrypoint, a same-file helper it calls, or an imported helper it calls).
+#       Run calls correlate by AgentVarName and file, including a LangGraph graph
+#       compiled in one module and imported into another (`from graph import
+#       app`). Test paths (tests/, test_*.py, conftest.py, ...) are ignored for
+#       the agent, the run call and the entrypoint. Used by LC-116.
+#
+#   repo_langgraph_platform_config_present: true | false
+#       DUAL-SCOPE (valid at agent and repo scope, like repo_has_observability).
+#       True when the repo ships a langgraph.json at any depth
+#       (RepoInventory.Manifest.JSONFiles) — LangGraph Platform then injects its
+#       own checkpointer. Used by LC-114 and LC-116 to stay silent on Platform
+#       deployments.
+#
 #
 # ━━━ SUBAGENT-SCOPE PREDICATES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # (used only in scope: subagent rules)
@@ -368,12 +459,28 @@ rules:
 #
 #   skill_allows_tool: [Bash, Write, WebFetch, ...]
 #       Fires when allowed-tools pre-approves any of the given Claude Code tool
-#       names (matches the parsed grant Tool, then the raw token).
+#       names (matches the parsed grant Tool, then the raw token). PATTERN-BLIND:
+#       ignores the grant's Pattern, so "Bash(git status:*)" matches identically
+#       to a bare "Bash". Prefer skill_allows_unrestricted_tool when a narrowly-
+#       scoped grant should not count.
+#
+#   skill_allows_unrestricted_tool: [Bash, Write, WebFetch, ...]
+#       Fires when allowed-tools pre-approves any of the given tool names with a
+#       genuinely unrestricted grant. Unlike skill_allows_tool, this consults the
+#       grant's Pattern per Claude Code's own permission-rule semantics: Bash/
+#       PowerShell are unrestricted only for "" / "*" / ":*"; WebFetch only for
+#       "" / "*" (a "domain:example.com" specifier is a real restriction); Edit
+#       only for "" or a catch-all glob ("*", "**", "/**", "//**") — a real path
+#       pattern like "docs/**" is a real restriction. Write and NotebookEdit are
+#       ALWAYS unrestricted regardless of any pattern written in the grant,
+#       because Claude Code accepts but never consults a path specifier on those
+#       two tools (only an Edit rule is checked for file writes).
 #
 #   skill_model_invocable: true
 #       Fires when the model can auto-invoke the skill (disable-model-invocation
-#       is not set). Pair with skill_allows_tool to flag a model-triggerable
-#       side-effecting skill. Bool predicate.
+#       is not set). Pair with skill_allows_unrestricted_tool to flag a
+#       model-triggerable skill with a genuinely unrestricted side-effecting
+#       grant. Bool predicate.
 #
 #   skill_body_has_dynamic_exec: true
 #       Fires when the SKILL.md body uses dynamic-context shell execution (the
@@ -452,6 +559,32 @@ rules:
 #       Fires when SkillDef.Description contains any listed substring,
 #       matched case-insensitively.
 #
+#   skill_text_matches:
+#     fields: [name, description, body]     # subset of these three
+#     terms: [term, term, ...]
+#     require_context: [term, term, ...]    # optional
+#     exclude_context: [term, term, ...]    # optional
+#       Sentence-scoped alternative to the three raw-substring predicates
+#       above, added to fix confirmed false positives in CSKILL-080/081 that
+#       a bare substring match can't distinguish (a term appearing inside an
+#       unrelated word, or a data class merely being NAMED rather than
+#       actually handled). Splits each named field into sentences (on
+#       . ! ? / newline / markdown list-item or heading starts) and matches
+#       terms at word boundaries, with the last word of a multi-word term
+#       allowed one inflection (-s/-es/-ed/-ing; "sign" also matches
+#       "signs"/"signed"/"signing" but not "design"/"assign"/"signal", and a
+#       trailing "e" is dropped before -ed/-ing so "store" matches "storing").
+#       For the name field "-"/"_" are word separators (a slug: "encrypt-
+#       helper" matches "encrypt"); for description/body "-" is a word
+#       character (prose: "case-sensitive" does NOT match "sensitive"). A
+#       sentence fires when it matches a term in terms AND (require_context is
+#       empty, or the sentence ALSO matches a require_context term) AND the
+#       sentence matches no exclude_context term. The literal abbreviations
+#       "e.g." and "i.e." survive the period-based sentence split (they're
+#       normalized before splitting) so they can be used as exclude_context
+#       phrases. This predicate does not change the three raw-substring
+#       predicates above — CSKILL-082..087 keep using those unmodified.
+#
 #
 # ━━━ REPO-SCOPE PREDICATES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # (used only in scope: repo rules; match runs once per scan)
@@ -474,8 +607,102 @@ rules:
 #
 #   repo_uses_default_tracing: true | false
 #       Fires when the scanner's derived UsesDefaultTracing flag matches.
-#       UsesDefaultTracing is true when no add_trace_processor or
-#       OPENAI_AGENTS_DISABLE_TRACING appears anywhere in parsed Python files.
+#       UsesDefaultTracing is false (tracing is NOT on the pure default path)
+#       when any parsed Python file's AST contains one of four documented
+#       disable mechanisms: an add_trace_processor / set_trace_processors call,
+#       an OPENAI_AGENTS_DISABLE_TRACING string literal, a set_tracing_disabled
+#       (True) call, or a RunConfig(tracing_disabled=True) construction
+#       (matched anywhere in the file, so both the inline
+#       Runner.run(agent, run_config=RunConfig(...)) form and an assigned-
+#       variable form are covered without dataflow). The match is AST-scoped
+#       (call-function names, call arguments, string literals) — a mention
+#       inside a comment or an unrelated identifier does not count.
+#   repo_has_observability: true | false
+#       Fires when the repo has (or lacks) any observability signal in code —
+#       an import, init, exporter, or content-capture switch. A declared
+#       dependency alone does NOT satisfy it. Valid at repo scope AND at agent
+#       scope, where it gates "this agent is the outlier" rules.
+#   repo_observability_inspectable: true | false
+#       Fires when the repo contains at least one language the observability
+#       pass parses (python, typescript, javascript). Pair it with
+#       repo_has_observability: false so an absence rule cannot fire on a
+#       Go/C#/PHP/Rust repo where nothing was inspected.
+#   repo_observability_initialized: true | false
+#       Fires when instrumentation is actually switched on (an init call or a
+#       per-agent instrument kwarg), not merely imported.
+#   repo_observability_declared: true | false
+#       Fires when an observability package is DECLARED in a hand-edited
+#       dependency manifest (pyproject.toml, requirements.txt, Pipfile,
+#       package.json) — reads RepoProfile.ObsDeps, the only predicate that
+#       reads recon output instead of code signals. poetry.lock is excluded on
+#       purpose: it lists the transitive closure, so a match there proves
+#       nobody's intent. Pair it with repo_has_observability to separate
+#       "shipped a tracing dep and never wired it" from "never tried".
+#   repo_observability_vendor: [langfuse, otel, ...]
+#       Fires when any signal names one of the listed vendors.
+#   repo_observability_console_only: true | false
+#       Fires when span exporters exist AND all of them write to the console.
+#       False when there are no exporters at all.
+#   repo_observability_captures_content: true | false
+#       Fires when the repo switches on capture of full prompt/response text.
+#   repo_otel_labels_installed: true | false
+#       Fires when agent-reliability-otel-labels is (or is not) present:
+#       declared in a root dependency manifest
+#       (RepoProfile.OtelLabelsDeclaredIn — `agent-reliability-otel-labels` in a
+#       Python manifest, `@trustabl/agent-reliability-otel-labels` in
+#       package.json) OR imported in code. Either is enough. Python and
+#       TypeScript/JavaScript only; the Go binding is not inspected. Pair it
+#       with repo_observability_initialized: true — the library only labels
+#       spans that already exist.
+#       trustabl.* keys written by hand with set_attribute(s) count too.
+#   repo_otel_labels_initialized: true | false
+#       Fires when a run is (or is not) started: a `<run>.mark_start(...)` /
+#       `<run>.markStart(...)` call appears, which stamps the run identity on
+#       the root span. Constructing a Run without it does not count. The call
+#       names count only when the library is imported somewhere in the repo.
+#       trustabl.* keys written by hand with set_attribute(s) count too.
+#   repo_otel_labels_implemented: true | false
+#       Fires when the labels are (or are not) written: `mark_run_end` /
+#       `markRunEnd` is called, AND — when the repo ships at least one tool the
+#       model calls — `mark_tool_span` / `markToolSpan` is called. A tool-less
+#       repo needs only the run end. Proves the calls exist, not that the
+#       labels land: with no current span each call is a silent no-op.
+#       trustabl.* keys written by hand with set_attribute(s) count too.
+#   repo_raw_anthropic_tool_output_in_system: true | false
+#       Fires when a function drives the bare `anthropic` client in a manual
+#       tool-use loop (.messages.create(..., tools=...)) and passes a runtime-
+#       built system= prompt referencing a name tainted by the tool-call input
+#       or its result (RepoInventory.RawAnthropicToolOutputInSystemPrompt).
+#       Same-function name-level heuristic. Category raw_llm_sdk.
+#   repo_raw_openai_tool_output_in_system: true | false
+#       Same for the bare `openai` client: .chat.completions.create(...,
+#       tools=...) plus a {"role": "system"|"developer", "content": <dynamic,
+#       tainted>} dict (RepoInventory.RawOpenAIToolOutputInSystemMessage).
+#   repo_project_mcp_autoenable: true | false
+#       Pre-trust project config (category agent_config). True when a committed
+#       .claude/settings.json sets enableAllProjectMcpServers: true or a
+#       non-empty enabledMcpjsonServers (ProjectConfigFacts.MCPAutoEnable).
+#       Used by AGCFG-004.
+#   repo_project_hook_runs_untrusted_command: true | false
+#       True when a Claude/Gemini project settings hook command runs a
+#       repo-relative script, a curl/wget/nc/bash -c/python -c primitive, or
+#       references .ssh/.aws/.env (ProjectConfigFacts.RiskyHooks). AGCFG-005.
+#   repo_workspace_env_overrides_trust: true | false
+#       True when .gemini/.env or .codex/config.toml (or, narrowly, a root .env)
+#       carries a sandbox/proxy/endpoint/loader override key, or Codex sets
+#       sandbox_mode = "danger-full-access" / approval_policy = "never". Env
+#       files are read for KEY NAMES only; values are never stored.
+#       (ProjectConfigFacts.TrustOverrideEnv). AGCFG-006.
+#   repo_editor_agent_auto_approve: true | false
+#       True when .vscode/settings.json or .cursor/*.json sets any *autoApprove*
+#       or *yolo* key to boolean true (ProjectConfigFacts.EditorAutoApprove).
+#       AGCFG-007.
+#   repo_mcp_config_launches_local_command: true | false
+#       True when a project MCP config (.mcp.json, .cursor/mcp.json,
+#       .vscode/mcp.json, .gemini/settings.json, .codex/config.toml) starts a
+#       server with an interpreter plus inline code or a repo-relative script,
+#       or a command path inside the repo (ProjectConfigFacts.LocalMCPLaunch).
+#       Published packages and remote URL servers are not flagged. MCPCFG-002.
 #   repo_claude_default_mode_is: [bypassPermissions, acceptEdits, ...]
 #       Fires when any discovered .claude/settings.json (or settings.local.json)
 #       declares a defaultMode equal to one of the listed modes. Reads
@@ -496,3 +723,34 @@ rules:
 #       untrustworthy, so their silence isn't evidence of a missing cap. A repo
 #       with zero ClaudeAgentOptions constructions never fires. Used by
 #       CSDK-204.
+#   repo_claude_options_disallowed_tools_missing: true | false
+#       Fires when the repo has at least one non-opaque ClaudeAgentOptions(...)
+#       construction and NONE of them set disallowed_tools. Reads
+#       RepoInventory.ClaudeAgentOptions[].Kwargs (disallowed_tools) via the
+#       same lookup and Opaque-skip rules as
+#       repo_claude_options_max_turns_missing. A repo with zero
+#       ClaudeAgentOptions constructions never fires. Note: a construction that
+#       sets disallowed_tools=[] or disallowed_tools=None still counts as "set"
+#       — the presence check only requires a non-nil Value, the same tri-state
+#       gap max_turns=None already has. Used by CSDK-205.
+#   repo_claude_options_mode_without_kwarg:
+#     modes: [bypassPermissions, ...]
+#     kwarg: disallowed_tools
+#       Fires when a SINGLE discovered ClaudeAgentOptions(...) construction
+#       both sets permission_mode to one of modes AND does not set kwarg at
+#       that SAME site. This is the per-call-site correlation the two
+#       predicates above lack: repo_claude_options_permission_mode_is and
+#       repo_claude_options_disallowed_tools_missing each scan across every
+#       ClaudeAgentOptions in the repo independently, so a repo with two
+#       options objects — one bypassPermissions with no deny-list, one safe
+#       with a deny-list — silences their combination even though the risky
+#       site is real. Unlike repo_claude_options_disallowed_tools_missing,
+#       Opaque (** unpacking) sites are NOT skipped here: a kwarg hidden
+#       inside the unpacked dict simply reads as absent at that site, since an
+#       unreadable deny-list is not a mitigation this engine can credit.
+#       allowed_tools is deliberately NOT part of this predicate family — per
+#       the Agent SDK's own reference docs, allowed_tools only auto-approves
+#       and does NOT restrict which tools can run, so an empty/narrow
+#       allowed_tools alongside bypassPermissions is the maximally dangerous
+#       shape, not a mitigated one (see docs/decisions/tool-allowlist-scope.md).
+#       Used by CSDK-202/CSDK-206.

@@ -76,6 +76,20 @@ const (
 	// not an SDK import, so this category is loaded unconditionally (like
 	// openshell) rather than gated on SDKsDetected.
 	CategoryClaudeSkill DetectorCategory = "claude_skill"
+	// CategoryObservability covers cross-SDK observability quality rules
+	// (OBS-*). Unlike the SDK categories it is not gated on one SDK: its rules
+	// list every SDK token in applies_to because their text is vendor-framed
+	// (Langfuse, OpenTelemetry) rather than SDK-framed.
+	CategoryObservability DetectorCategory = "observability"
+	// CategoryRawLLMSDK covers rules about raw provider-client usage (the bare
+	// `anthropic` / `openai` Python SDKs driving a hand-written tool loop), which
+	// is NOT an agent-framework SDK and has no SDK enum entry. Like observability
+	// it loads unconditionally; each rule's own predicate does the real gating.
+	CategoryRawLLMSDK DetectorCategory = "raw_llm_sdk"
+	// CategoryAgentConfig covers harness config committed to a repo that runs
+	// code or grants authority before the user trusts the folder (AGCFG-*,
+	// MCPCFG-*). Not an SDK; loads unconditionally, the rule predicate gates.
+	CategoryAgentConfig DetectorCategory = "agent_config"
 )
 
 // display order. It is the single source of truth for category membership:
@@ -86,7 +100,8 @@ const (
 var AllCategories = []DetectorCategory{
 	CategoryClaudeSDK, CategoryOpenAISDK, CategoryOpenShell, CategoryGoogleADK,
 	CategoryMCP, CategoryLangChain, CategoryCrewAI, CategoryPydanticAI,
-	CategoryVercelAI, CategoryAutoGen, CategoryClaudeSkill,
+	CategoryVercelAI, CategoryAutoGen, CategoryClaudeSkill, CategoryObservability,
+	CategoryRawLLMSDK, CategoryAgentConfig,
 }
 
 // ValidCategory reports whether c is a category this build recognizes. The rule
@@ -123,6 +138,12 @@ const (
 	KindPydanticAITool ToolKind = "pydantic_ai_tool"
 	KindVercelAITool   ToolKind = "vercel_ai_tool"
 	KindAutoGenTool    ToolKind = "autogen_tool"
+	// KindLangGraphNode is a plain function registered as a LangGraph graph node
+	// via <builder>.add_node(name, func) / add_node(func). It is not a @tool —
+	// no tool-discovery pass sees it — but it runs automatically on every graph
+	// visit with no tool-call boundary, so the tool-scope body predicates are
+	// applied to it. Discovered by DiscoverLangGraphNodes.
+	KindLangGraphNode ToolKind = "langgraph_node"
 )
 
 // Language identifies the source language of a discovered tool. Rules
@@ -211,6 +232,13 @@ const (
 	ComponentClaudeAgentDefinition ComponentKind = "claude_agent_definition" // Python file using AgentDefinition
 	ComponentSkill                 ComponentKind = "skill"
 	ComponentPluginManifest        ComponentKind = "plugin_manifest"
+	// Harness config files that can run code or grant authority before the user
+	// trusts the folder (category agent_config). Surfaced as components so the
+	// pre-auth surface is visible; the facts are parsed by DiscoverProjectConfig.
+	ComponentGeminiSettings ComponentKind = "gemini_settings" // .gemini/settings.json
+	ComponentEditorSettings ComponentKind = "editor_settings" // .vscode/settings.json, .cursor/*.json (not mcp.json)
+	ComponentAgentEnvFile   ComponentKind = "agent_env_file"  // .gemini/.env, root .env (key names only are ever read)
+	ComponentCodexConfig    ComponentKind = "codex_config"    // .codex/config.toml
 )
 
 // AgentComponent is a non-tool agent-related artifact discovered during
@@ -224,6 +252,24 @@ type AgentComponent struct {
 	Language Language      `json:"language,omitempty"` // for code components only; empty for configs / prompts
 	Note     string        `json:"note,omitempty"`     // human-readable hint, e.g. "3 tools registered"
 }
+
+// SurfaceOrigin classifies where a finding's file lives on the
+// production-vs-test axis. The zero value (empty string) is production code —
+// the common case stays unmarked so existing JSON consumers see no change.
+// Set by internal/pathclass.Classify from the finding's FilePath; see that
+// package for the path-shape rules. Consumed by scanner.Run to exclude
+// test-origin findings from Surfaces/OverallScore/ProjectedScores, and by
+// cmd/trustabl's exitCode to exclude them from the CI gate, both only when
+// --include-test-paths is not set. Findings are never dropped for this — the
+// tag only changes whether a finding is scored/gated, never whether it is
+// reported.
+type SurfaceOrigin string
+
+const (
+	// OriginTest marks a finding whose file matched a test-path pattern
+	// (a tests/ directory, a test_*.py / *_test.go / *.spec.ts filename, …).
+	OriginTest SurfaceOrigin = "test"
+)
 
 // Finding is one detector hit on one surface (tool, agent, subagent, or repo).
 type Finding struct {
@@ -243,6 +289,9 @@ type Finding struct {
 	Explanation  string  `json:"explanation"` // "show your work" per doc §7
 	SuggestedFix string  `json:"suggested_fix"`
 	Confidence   float64 `json:"confidence"` // 0..1
+	// Origin is "" for production code and OriginTest for a finding whose
+	// FilePath matched a test-path pattern. See SurfaceOrigin.
+	Origin SurfaceOrigin `json:"origin,omitempty"`
 }
 
 // SurfaceReadiness is the readiness score for one analyzable surface — a single
@@ -275,22 +324,35 @@ type ProjectedScores struct {
 
 // ScanManifest is what the Normalizer produces.
 type ScanManifest struct {
-	RepoRoot               string           `json:"repo_root"`
-	IsRemote               bool             `json:"is_remote"`
-	RemoteURL              string           `json:"remote_url,omitempty"`
-	PythonFiles            []string         `json:"python_files"`
-	TypeScriptFiles        []string         `json:"typescript_files,omitempty"`
-	JavaScriptFiles        []string         `json:"javascript_files,omitempty"`
-	GoFiles                []string         `json:"go_files,omitempty"`
-	CSharpFiles            []string         `json:"csharp_files,omitempty"`
-	PHPFiles               []string         `json:"php_files,omitempty"`
-	RustFiles              []string         `json:"rust_files,omitempty"`
-	YAMLFiles              []string         `json:"yaml_files"`
-	JSONFiles              []string         `json:"json_files,omitempty"`
-	MarkdownFiles          []string         `json:"markdown_files,omitempty"`
+	RepoRoot        string   `json:"repo_root"`
+	IsRemote        bool     `json:"is_remote"`
+	RemoteURL       string   `json:"remote_url,omitempty"`
+	PythonFiles     []string `json:"python_files"`
+	TypeScriptFiles []string `json:"typescript_files,omitempty"`
+	JavaScriptFiles []string `json:"javascript_files,omitempty"`
+	GoFiles         []string `json:"go_files,omitempty"`
+	CSharpFiles     []string `json:"csharp_files,omitempty"`
+	PHPFiles        []string `json:"php_files,omitempty"`
+	RustFiles       []string `json:"rust_files,omitempty"`
+	YAMLFiles       []string `json:"yaml_files"`
+	JSONFiles       []string `json:"json_files,omitempty"`
+	MarkdownFiles   []string `json:"markdown_files,omitempty"`
+	// ConfigFiles holds the non-source harness config files the walk keeps:
+	// any file named .env and .codex/config.toml. Sorted.
+	ConfigFiles            []string         `json:"config_files,omitempty"`
 	HasClaudeSDKDependency bool             `json:"has_claude_sdk_dependency"`
 	HasOpenShellArtifact   bool             `json:"has_openshell_artifact"`
 	Components             []AgentComponent `json:"components,omitempty"`
+}
+
+// SourceFileCount returns the number of source files across every language the
+// inventory step parses (Python, TypeScript, JavaScript, Go, C#, PHP, Rust).
+// This is the count that pairs with the detected-languages label — using a
+// single language's bucket would undercount any multi-language repo. Data files
+// (YAML/JSON/Markdown) are intentionally excluded: they are not AST-parsed.
+func (m ScanManifest) SourceFileCount() int {
+	return len(m.PythonFiles) + len(m.TypeScriptFiles) + len(m.JavaScriptFiles) +
+		len(m.GoFiles) + len(m.CSharpFiles) + len(m.PHPFiles) + len(m.RustFiles)
 }
 
 // SDK identifies a tool/agent SDK we know about.
@@ -320,6 +382,103 @@ type SDKDep struct {
 	Name       string  `json:"name"`
 	Source     string  `json:"source"`
 	Confidence float64 `json:"confidence"`
+}
+
+// ObservabilityVendor identifies an agent-observability backend or
+// instrumentation library. Closed enum. It is ALSO the Phase 2 emitter
+// taxonomy — the runtime trace layer maps each emitter's dialect onto these
+// values, so a new vendor is added here once and serves both phases.
+type ObservabilityVendor string
+
+const (
+	VendorOTel          ObservabilityVendor = "otel"
+	VendorOpenLLMetry   ObservabilityVendor = "openllmetry"
+	VendorOpenInference ObservabilityVendor = "openinference"
+	VendorLangfuse      ObservabilityVendor = "langfuse"
+	VendorLangSmith     ObservabilityVendor = "langsmith"
+	VendorLogfire       ObservabilityVendor = "logfire"
+	VendorBraintrust    ObservabilityVendor = "braintrust"
+	VendorWeave         ObservabilityVendor = "weave"
+	VendorAgentOps      ObservabilityVendor = "agentops"
+	VendorMLflow        ObservabilityVendor = "mlflow"
+	VendorDatadogLLMObs ObservabilityVendor = "datadog_llmobs"
+	VendorOpik          ObservabilityVendor = "opik"
+	VendorNative        ObservabilityVendor = "native"
+)
+
+// ObsSignalKind classifies the STRENGTH of an observability signal. The
+// import-vs-init split is the point of the whole model: an import proves the
+// package is present, only an init proves traces have somewhere to go.
+type ObsSignalKind string
+
+const (
+	ObsSignalImport          ObsSignalKind = "import"
+	ObsSignalInit            ObsSignalKind = "init"
+	ObsSignalExporter        ObsSignalKind = "exporter"
+	ObsSignalContentCapture  ObsSignalKind = "content_capture"
+	ObsSignalInstrumentKwarg ObsSignalKind = "instrument_kwarg"
+)
+
+// ObsDep is one observability package DECLARED in a dependency manifest.
+//
+// It is deliberately NOT folded into RepoProfile.SDKDeps: SDKDeps drives the
+// META-002 "declared but unused in code" drift finding, and an observability
+// package legitimately appears in a manifest while its init lives in a file the
+// pass does not parse. Merging the two would make META-002 fire forever on
+// every repo that declares langfuse.
+type ObsDep struct {
+	Vendor     ObservabilityVendor `json:"vendor"`
+	Source     string              `json:"source"`
+	Confidence float64             `json:"confidence"`
+}
+
+// ObservabilitySignal is one observability fact OBSERVED IN CODE. Detail is a
+// small discriminating token — the imported module, the callee name, the
+// exporter sink, or the kwarg/env var that enables content capture.
+type ObservabilitySignal struct {
+	Vendor    ObservabilityVendor `json:"vendor"`
+	Kind      ObsSignalKind       `json:"kind"`
+	Detail    string              `json:"detail,omitempty"`
+	File      string              `json:"file"`
+	StartLine int                 `json:"start_line"`
+	EndLine   int                 `json:"end_line"`
+	Language  Language            `json:"language"`
+}
+
+// OtelLabelsSignalKind grades how far a repo has got with
+// agent-reliability-otel-labels, the library that adds process-metadata labels
+// to spans the agent already emits. The kinds are the rungs OBS-006..008 walk:
+// present, run started, spans labelled, run end recorded.
+type OtelLabelsSignalKind string
+
+const (
+	OtelLabelsImport   OtelLabelsSignalKind = "import"
+	OtelLabelsRunStart OtelLabelsSignalKind = "run_start"
+	OtelLabelsToolSpan OtelLabelsSignalKind = "tool_span"
+	OtelLabelsRunEnd   OtelLabelsSignalKind = "run_end"
+	// OtelLabelsAttrLiteral is a trustabl.* label key written to a span by
+	// hand (set_attribute / setAttribute), without the library.
+	OtelLabelsAttrLiteral OtelLabelsSignalKind = "attr_literal"
+)
+
+// OtelLabelsSignal is one agent-reliability-otel-labels fact OBSERVED IN CODE.
+//
+// It is deliberately NOT an ObservabilitySignal. The library never creates a
+// span, so folding it into that slice would let an import of it satisfy
+// repo_has_observability and a started Run satisfy
+// repo_observability_initialized — the library would clear its own
+// prerequisite and OBS-001 would misfire on it.
+//
+// The fact fields are zero when they do not apply to the Kind.
+type OtelLabelsSignal struct {
+	Kind      OtelLabelsSignalKind `json:"kind"`
+	File      string               `json:"file"`
+	StartLine int                  `json:"start_line"`
+	EndLine   int                  `json:"end_line"`
+	Language  Language             `json:"language"`
+
+	TestOrigin bool   `json:"test_origin,omitempty"` // all kinds: File classifies as a test
+	Key        string `json:"key,omitempty"`         // attr_literal: the trustabl.* key
 }
 
 // DepRef is one dependency declared in a repo manifest — the agent-path
@@ -379,9 +538,18 @@ type DepVuln struct {
 
 // RepoProfile is the output of the recon step.
 type RepoProfile struct {
-	Languages []Language   `json:"languages"`
-	SDKDeps   []SDKDep     `json:"sdk_deps"`
-	Manifest  ScanManifest `json:"manifest"`
+	Languages []Language `json:"languages"`
+	SDKDeps   []SDKDep   `json:"sdk_deps"`
+	// ObsDeps are observability packages DECLARED in a dependency manifest.
+	// Recon-only: they gate whether the AST observability pass runs, and never
+	// stand in for an observed code signal. Kept out of SDKDeps on purpose —
+	// see the ObsDep doc comment.
+	ObsDeps []ObsDep `json:"obs_deps,omitempty"`
+	// OtelLabelsDeclaredIn lists the root manifests that declare
+	// agent-reliability-otel-labels, sorted. Separate from ObsDeps — see
+	// OtelLabelsSignal.
+	OtelLabelsDeclaredIn []string     `json:"otel_labels_declared_in,omitempty"`
+	Manifest             ScanManifest `json:"manifest"`
 }
 
 // RepoInventory is the output of the inventory step.
@@ -400,7 +568,9 @@ type RepoInventory struct {
 	PluginManifests    []PluginManifest        `json:"plugin_manifests"`
 	ClaudeSettings     []ClaudeSettings        `json:"claude_settings"`
 	ClaudeAgentOptions []ClaudeAgentOptionsDef `json:"claude_agent_options,omitempty"`
+	ProjectConfig      ProjectConfigFacts      `json:"project_config,omitempty"`
 	AgentRunCalls      []AgentRunCallDef       `json:"agent_run_calls,omitempty"`
+	Entrypoints        []EntrypointDef         `json:"entrypoints,omitempty"`
 	SDKsDetected       []SDK                   `json:"sdks_detected"`
 	// HasShellInvocations is true if any discovered ToolDef is a
 	// KindShellInvocation (a Python function whose body calls
@@ -410,6 +580,17 @@ type RepoInventory struct {
 	HasShellInvocations bool         `json:"has_shell_invocations"`
 	Manifest            ScanManifest `json:"manifest"` // convenience copy for repo-scope predicates
 	UsesDefaultTracing  bool         `json:"uses_default_tracing"`
+	// RawAnthropicToolOutputInSystemPrompt / RawOpenAIToolOutputInSystemMessage
+	// are true when a raw-SDK tool loop in one function feeds a tool-call-derived
+	// value into a dynamic system prompt (see DetectRawLLMToolOutputInSystem).
+	RawAnthropicToolOutputInSystemPrompt bool `json:"raw_anthropic_tool_output_in_system_prompt,omitempty"`
+	RawOpenAIToolOutputInSystemMessage   bool `json:"raw_openai_tool_output_in_system_message,omitempty"`
+	// ObservabilitySignals are the observability facts OBSERVED IN CODE, sorted
+	// by (File, StartLine, Vendor, Kind) for determinism.
+	ObservabilitySignals []ObservabilitySignal `json:"observability_signals,omitempty"`
+	// OtelLabelsSignals are the agent-reliability-otel-labels facts OBSERVED IN
+	// CODE, sorted by (File, StartLine, Kind) for determinism.
+	OtelLabelsSignals []OtelLabelsSignal `json:"otel_labels_signals,omitempty"`
 }
 
 // Coverage records how thoroughly the scan actually parsed the repo's source.
@@ -494,37 +675,42 @@ func (o RulesOrigin) Watermark() string {
 
 // ScanResult is the top-level output. JSON-serializable for CI.
 type ScanResult struct {
-	ScanID              string             `json:"scan_id"`
-	Repo                string             `json:"repo"`
-	Languages           []Language         `json:"languages"` // detected by file extension (recon)
-	SDKs                []SDK              `json:"sdks"`      // observed in code (inventory)
-	HasShellInvocations bool               `json:"has_shell_invocations"`
-	Manifest            ScanManifest       `json:"manifest"`
-	Tools               []ToolDef          `json:"tools"`
-	Agents              []AgentDef         `json:"agents"`
-	HostedTools         []HostedToolDef    `json:"hosted_tools"`
-	MCPServers          []MCPServerDef     `json:"mcp_servers"`
-	Subagents           []SubagentDef      `json:"subagents"`
-	Skills              []SkillDef         `json:"skills"`
-	Dependencies        []DepRef           `json:"dependencies"`              // repo-wide declared-dependency BOM (TR-278); not folded into ScanID
-	Vulnerabilities     []DepVuln          `json:"vulnerabilities,omitempty"` // --vuln-scan OSV matches (TR-271); absent on the default path
-	Secrets             []SecretMatch      `json:"secrets,omitempty"`         // --secret-scan hardcoded-credential matches; absent on the default path
-	SlashCommands       []SlashCommandDef  `json:"slash_commands"`
-	PluginManifests     []PluginManifest   `json:"plugin_manifests"`
-	ClaudeSettings      []ClaudeSettings   `json:"claude_settings"`
-	Findings            []Finding          `json:"findings"`
-	Surfaces            []SurfaceReadiness `json:"surfaces"`
-	OverallScore        float64            `json:"overall_score"`
-	ProjectedScores     ProjectedScores    `json:"projected_scores"`
-	RulesSource         string             `json:"rules_source"`                   // repo the rule pack came from
-	RulesVersion        string             `json:"rules_version"`                  // resolved rules commit SHA
-	RulesFromCache      bool               `json:"rules_from_cache"`               // true if rules came from cache (network skipped/unreachable)
-	RulesStale          bool               `json:"rules_stale,omitempty"`          // true if the cached signed bundle's channel statement has expired
-	RulesSchemaVersion  int                `json:"rules_schema_version,omitempty"` // pack manifest's declared schema_version
-	RulesSchemaNewer    bool               `json:"rules_schema_newer,omitempty"`   // pack targets a schema newer than this build supports
-	RulesSkipped        []string           `json:"rules_skipped,omitempty"`        // rule IDs dropped as forward-incompatible (sorted, deduped)
-	RulesOrigin         RulesOrigin        `json:"rules_origin"`                   // provenance of the rules (signed channel / unsigned / custom)
-	Coverage            Coverage           `json:"coverage"`                       // how many source files parsed vs. were skipped
+	ScanID              string          `json:"scan_id"`
+	Repo                string          `json:"repo"`
+	Languages           []Language      `json:"languages"` // detected by file extension (recon)
+	SDKs                []SDK           `json:"sdks"`      // observed in code (inventory)
+	HasShellInvocations bool            `json:"has_shell_invocations"`
+	Manifest            ScanManifest    `json:"manifest"`
+	Tools               []ToolDef       `json:"tools"`
+	Agents              []AgentDef      `json:"agents"`
+	HostedTools         []HostedToolDef `json:"hosted_tools"`
+	MCPServers          []MCPServerDef  `json:"mcp_servers"`
+	Subagents           []SubagentDef   `json:"subagents"`
+	Skills              []SkillDef      `json:"skills"`
+	Dependencies        []DepRef        `json:"dependencies"` // repo-wide declared-dependency BOM (TR-278); not folded into ScanID
+	// Observability reports the instrumentation found in code — the positive
+	// signal, not only the findings. Additive inventory, NOT folded into ScanID
+	// (same treatment as Dependencies).
+	Observability      []ObservabilitySignal `json:"observability,omitempty"`
+	Entrypoints        []EntrypointDef       `json:"entrypoints,omitempty"`     // server entrypoints (Python): a fact only, no rule consumes it yet
+	Vulnerabilities    []DepVuln             `json:"vulnerabilities,omitempty"` // --vuln-scan OSV matches (TR-271); absent on the default path
+	Secrets            []SecretMatch         `json:"secrets,omitempty"`         // --secret-scan hardcoded-credential matches; absent on the default path
+	SlashCommands      []SlashCommandDef     `json:"slash_commands"`
+	PluginManifests    []PluginManifest      `json:"plugin_manifests"`
+	ClaudeSettings     []ClaudeSettings      `json:"claude_settings"`
+	Findings           []Finding             `json:"findings"`
+	Surfaces           []SurfaceReadiness    `json:"surfaces"`
+	OverallScore       float64               `json:"overall_score"`
+	ProjectedScores    ProjectedScores       `json:"projected_scores"`
+	RulesSource        string                `json:"rules_source"`                   // repo the rule pack came from
+	RulesVersion       string                `json:"rules_version"`                  // resolved rules commit SHA
+	RulesFromCache     bool                  `json:"rules_from_cache"`               // true if rules came from cache (network skipped/unreachable)
+	RulesStale         bool                  `json:"rules_stale,omitempty"`          // true if the cached signed bundle's channel statement has expired
+	RulesSchemaVersion int                   `json:"rules_schema_version,omitempty"` // pack manifest's declared schema_version
+	RulesSchemaNewer   bool                  `json:"rules_schema_newer,omitempty"`   // pack targets a schema newer than this build supports
+	RulesSkipped       []string              `json:"rules_skipped,omitempty"`        // rule IDs dropped as forward-incompatible (sorted, deduped)
+	RulesOrigin        RulesOrigin           `json:"rules_origin"`                   // provenance of the rules (signed channel / unsigned / custom)
+	Coverage           Coverage              `json:"coverage"`                       // how many source files parsed vs. were skipped
 	// NoAgentSurfaces marks a scan that found nothing to evaluate: no tools,
 	// agents, subagents or skills. Scoring an empty set yields 1.0, which reads
 	// as a perfect result when in fact nothing was checked, so consumers must be

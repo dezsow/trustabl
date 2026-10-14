@@ -1,6 +1,7 @@
 package rules
 
 import (
+	"path"
 	"regexp"
 	"strings"
 
@@ -9,6 +10,7 @@ import (
 	"github.com/trustabl/trustabl/internal/analysis"
 	"github.com/trustabl/trustabl/internal/analysis/astutil"
 	"github.com/trustabl/trustabl/internal/models"
+	"github.com/trustabl/trustabl/internal/pathclass"
 )
 
 // ─── bool predicates ─────────────────────────────────────────────────────────
@@ -25,7 +27,16 @@ func PredHasTypedParams(t models.ToolDef) bool {
 	return t.HasTypedParams
 }
 
+// PredHasRaise reports whether the tool body raises an uncaught-by-default
+// error. For TypeScript tools it reads the discovery-computed "throws" fact
+// (set by tsHandlerFacts for `throw` statements); the Python AST walk matches
+// "raise_statement", a node type the TS grammar does not have, so without the
+// branch this returned false for every TS tool — a silent miss that would let
+// a TS error-contract rule load and validate but never fire.
 func PredHasRaise(t models.ToolDef, pf analysis.ParsedFile) bool {
+	if models.IsTSOrJS(t.Language) {
+		return t.Facts["throws"] == "true"
+	}
 	root := analysis.FindFunctionNode(t, pf)
 	if root == nil {
 		return false
@@ -33,7 +44,15 @@ func PredHasRaise(t models.ToolDef, pf analysis.ParsedFile) bool {
 	return len(astutil.FindAll(root, "raise_statement")) > 0
 }
 
+// PredHasTryExcept reports whether the tool body wraps work in a structured
+// error handler. For TypeScript tools it reads the discovery-computed
+// "try_catch" fact. The Python path matches "try_statement" on the tool's own
+// function node; the TS fact is scoped to the handler node for the same
+// reason, so a try/catch in a sibling function does not silence the rule.
 func PredHasTryExcept(t models.ToolDef, pf analysis.ParsedFile) bool {
+	if models.IsTSOrJS(t.Language) {
+		return t.Facts["try_catch"] == "true"
+	}
 	root := analysis.FindFunctionNode(t, pf)
 	if root == nil {
 		return false
@@ -116,11 +135,23 @@ func PredHasCodeExecCall(t models.ToolDef, pf analysis.ParsedFile) bool {
 	return found
 }
 
-// PredHasPrintCall reports whether the tool body calls the print builtin. It
-// matches the bare `print` callee only, so pprint() and other callees whose
-// text merely contains "print(" are not flagged — the false positive that
-// substring matching cannot avoid.
+// PredHasPrintCall reports whether the tool body writes diagnostics to stdout.
+// For Python it matches the bare `print` callee only, so pprint() and other
+// callees whose text merely contains "print(" are not flagged — the false
+// positive that substring matching cannot avoid.
+//
+// TypeScript tools carry the signal as a discovery-computed fact (set by
+// tsHandlerFacts for console.log / console.info / console.debug /
+// process.stdout.write). The Python AST walk below looks for the "call"
+// node type, which does not exist in the TS grammar — it uses
+// "call_expression" — so without this branch the predicate was structurally
+// always false for TS and any typescript rule using it could never fire.
+// Branch on language so the Python path stays byte-identical, mirroring
+// PredHasShellCall / PredHasWriteCall.
 func PredHasPrintCall(t models.ToolDef, pf analysis.ParsedFile) bool {
+	if models.IsTSOrJS(t.Language) {
+		return t.Facts["prints_stdout"] == "true"
+	}
 	root := analysis.FindFunctionNode(t, pf)
 	if root == nil {
 		return false
@@ -238,6 +269,46 @@ func PredHasDynamicURLCall(t models.ToolDef, pf analysis.ParsedFile) bool {
 	return found
 }
 
+// PredHasUnpinnedSchemeURLCall reports whether the tool makes an HTTP call whose
+// URL is dynamic and does not begin with a literal https:// prefix (see
+// analysis.URLArgSchemePinned). TypeScript reads the url_scheme_unpinned fact.
+func PredHasUnpinnedSchemeURLCall(t models.ToolDef, pf analysis.ParsedFile) bool {
+	if models.IsTSOrJS(t.Language) {
+		return t.Facts["url_scheme_unpinned"] == "true"
+	}
+	root := analysis.FindFunctionNode(t, pf)
+	if root == nil {
+		return false
+	}
+	aliases := analysis.ResolveClientAliases(root, pf.Source)
+	found := false
+	astutil.Walk(root, func(n *sitter.Node) bool {
+		if found {
+			return false
+		}
+		if n.Type() != "call" {
+			return true
+		}
+		if _, ok := analysis.IsHTTPCallNode(n, pf.Source, aliases); !ok {
+			return true
+		}
+		args := n.ChildByFieldName("arguments")
+		if args == nil || args.NamedChildCount() == 0 {
+			return true
+		}
+		first := args.NamedChild(0)
+		dynamic := first.Type() != "string"
+		for i := 0; !dynamic && i < int(first.NamedChildCount()); i++ {
+			dynamic = first.NamedChild(i).Type() == "interpolation"
+		}
+		if dynamic && !analysis.URLArgSchemePinned(first, pf.Source) {
+			found = true
+		}
+		return !found
+	})
+	return found
+}
+
 // PredHasHTTPCallWithoutTimeout reports whether a TypeScript tool handler makes
 // an HTTP call (fetch / axios / got / undici) with no timeout bound — its
 // options object carries no `signal`, `timeout`, or `abortSignal` key. It is
@@ -255,8 +326,21 @@ func PredHasHTTPCallWithoutTimeout(t models.ToolDef) bool {
 
 // ─── string-list predicates ───────────────────────────────────────────────────
 
+// toolNameForMatch returns the name predicates should match against.
+// Prefer ToolDef.Name when set (OpenAI / Claude / most Python tools). When
+// Name is empty — Vercel AI tools leave it blank because the model-facing
+// name is the agent's tools-record key — fall back to VarName (the binding
+// identifier, e.g. createCharge). Without this, name_has_prefix / name_in
+// never fire on Vercel tools.
+func toolNameForMatch(t models.ToolDef) string {
+	if t.Name != "" {
+		return t.Name
+	}
+	return t.VarName
+}
+
 func PredNameIn(names []string, t models.ToolDef) bool {
-	lower := strings.ToLower(t.Name)
+	lower := strings.ToLower(toolNameForMatch(t))
 	for _, n := range names {
 		if lower == strings.ToLower(n) {
 			return true
@@ -266,7 +350,7 @@ func PredNameIn(names []string, t models.ToolDef) bool {
 }
 
 func PredNameHasPrefix(prefixes []string, t models.ToolDef) bool {
-	lower := strings.ToLower(t.Name)
+	lower := strings.ToLower(toolNameForMatch(t))
 	for _, p := range prefixes {
 		if strings.HasPrefix(lower, strings.ToLower(p)) {
 			return true
@@ -602,6 +686,12 @@ func PredAgentKwargPresent(paths []string, a models.AgentDef) bool {
 
 func PredAgentKwargMissing(paths []string, a models.AgentDef) bool {
 	for _, p := range paths {
+		// A process-wide instrumentation call (AgentDef.InstrumentedBy) stands
+		// in for exactly the kwarg it names, so that kwarg is not missing even
+		// when absent or None. Any other kwarg is judged as usual.
+		if a.InstrumentedBy != nil && a.InstrumentedBy.Kwarg == p {
+			continue
+		}
 		kw := lookupKwarg(a, p)
 		if kw == nil {
 			return true // absent
@@ -780,6 +870,36 @@ func PredAgentUsesHostedToolClass(classes []string, a models.AgentDef) bool {
 	return false
 }
 
+// PredAgentMCPServerKwargMissing fires when the agent wires at least one MCP
+// server of any of the named Classes whose Kwarg is absent, or present but
+// explicitly None (mirroring PredAgentKwargMissing's None-counts-as-missing
+// rule). Positive logic, not `not: ..._kwarg_present`: with multiple wired
+// servers, negating a presence check would go silent as soon as ANY one of
+// them sets the kwarg, masking the others that don't. Requires Resolved — an
+// unresolved/external ref's kwargs cannot be inspected, so it is skipped
+// rather than counted as missing. Finding a ref whose Class matches doubles
+// as the "agent actually uses this class" check other predicate pairs need a
+// separate agent_uses_*_class clause for — no such clause is needed here.
+func PredAgentMCPServerKwargMissing(expr MCPServerKwargExpr, a models.AgentDef) bool {
+	classes := make(map[string]bool, len(expr.Classes))
+	for _, c := range expr.Classes {
+		classes[c] = true
+	}
+	for _, ref := range a.MCPServerRefs {
+		if !classes[ref.Class] || ref.Resolved == nil {
+			continue
+		}
+		kw := lookupKwargInTree(ref.Resolved.Kwargs, expr.Kwarg)
+		if kw == nil {
+			return true // absent
+		}
+		if kw.Value != nil && kw.Value.Kind == models.ExprLiteralNone {
+			return true // present but explicitly None — ineffective
+		}
+	}
+	return false
+}
+
 // PredAgentIsSubagentOfAny returns true if the agent under test appears as
 // a Resolved target in any other agent's HandoffRefs in the inventory.
 // Matching is by Name+FilePath (Resolved is a pointer to a specific def in
@@ -812,20 +932,68 @@ func PredAgentIsSubagentOfAny(a models.AgentDef, inv models.RepoInventory) bool 
 // with no VarName, or with no matching run call at all, never fires — no
 // resolvable execution site is not evidence that one is missing a cap.
 func agentRunCallMissingKwarg(a models.AgentDef, inv models.RepoInventory, sdk models.SDK, kwarg string) bool {
-	if a.SDK != sdk || a.VarName == "" {
+	return agentRunCallUnsatisfied(a, inv, []models.SDK{sdk}, func(rc models.AgentRunCallDef) bool {
+		node := lookupKwargInTree(rc.Kwargs, kwarg)
+		return node != nil && node.Value != nil
+	})
+}
+
+// agentRunCallUnsatisfied is the shared correlation + silence logic behind the
+// run-call predicates: match this agent's same-SDK, same-file, non-opaque run
+// calls by AgentVarName, and fire only when at least one exists and NONE
+// satisfies the check.
+func agentRunCallUnsatisfied(a models.AgentDef, inv models.RepoInventory, sdks []models.SDK, satisfied func(models.AgentRunCallDef) bool) bool {
+	sdkOK := false
+	for _, s := range sdks {
+		if a.SDK == s {
+			sdkOK = true
+		}
+	}
+	if !sdkOK || a.VarName == "" {
 		return false
 	}
 	matched := false
 	for _, rc := range inv.AgentRunCalls {
-		if rc.SDK != sdk || rc.Opaque || rc.FilePath != a.FilePath || rc.AgentVarName != a.VarName {
+		if rc.SDK != a.SDK || rc.Opaque || rc.FilePath != a.FilePath || rc.AgentVarName != a.VarName {
 			continue
 		}
 		matched = true
-		if node := lookupKwargInTree(rc.Kwargs, kwarg); node != nil && node.Value != nil {
+		if satisfied(rc) {
 			return false
 		}
 	}
 	return matched
+}
+
+// wallClockCancelKwarg is the per-SDK run-call kwarg that carries a caller-
+// controlled cancellation, credited as a deadline hook alongside the structural
+// asyncio timeout: ADK Runner.run_async(abort_signal=) and the AutoGen v0.4
+// agent.run(cancellation_token=). The other SDKs have no such kwarg.
+var wallClockCancelKwarg = map[models.SDK]string{
+	models.SDKGoogleADK: "abort_signal",
+	models.SDKAutoGen:   "cancellation_token",
+}
+
+// PredAgentRunCallWallClockTimeoutMissing fires when this OpenAI Agents SDK,
+// Pydantic AI, Google ADK or AutoGen agent has a resolvable run call and NONE of
+// its run calls sit inside a wall-clock timeout (asyncio.wait_for /
+// asyncio.timeout / anyio.move_on_after / anyio.fail_after) or, for ADK and
+// AutoGen, pass a non-None abort_signal / cancellation_token. Same correlation
+// and silence rules as agentRunCallMissingKwarg; the check is the structural
+// AgentRunCallDef.WallClockTimeoutWrapped fact rather than a kwarg.
+func PredAgentRunCallWallClockTimeoutMissing(a models.AgentDef, inv models.RepoInventory) bool {
+	sdks := []models.SDK{models.SDKOpenAIAgents, models.SDKPydanticAI, models.SDKGoogleADK, models.SDKAutoGen}
+	return agentRunCallUnsatisfied(a, inv, sdks, func(rc models.AgentRunCallDef) bool {
+		if rc.WallClockTimeoutWrapped {
+			return true
+		}
+		if kw := wallClockCancelKwarg[rc.SDK]; kw != "" {
+			if node := lookupKwargInTree(rc.Kwargs, kw); node != nil && node.Value != nil && node.Value.Kind != models.ExprLiteralNone {
+				return true
+			}
+		}
+		return false
+	})
 }
 
 // PredAgentRunCallMaxTurnsMissing fires when this OpenAI Agents SDK agent has
@@ -841,6 +1009,20 @@ func PredAgentRunCallMaxTurnsMissing(a models.AgentDef, inv models.RepoInventory
 // rules.
 func PredAgentRunCallUsageLimitsMissing(a models.AgentDef, inv models.RepoInventory) bool {
 	return agentRunCallMissingKwarg(a, inv, models.SDKPydanticAI, "usage_limits")
+}
+
+// PredAgentFileURLForceDownload fires when this Pydantic AI agent sits in a
+// file that constructs a FileUrl-family object with force_download set to
+// True or 'allow-local'. Discovery stamps the normalized value on
+// AgentDef.FileURLForceDownload; this predicate just reads it. Silent when
+// the field is empty (absent or False).
+func PredAgentFileURLForceDownload(a models.AgentDef) bool {
+	switch a.FileURLForceDownload {
+	case "True", "allow-local":
+		return true
+	default:
+		return false
+	}
 }
 
 // ─── subagent predicates ──────────────────────────────────────────────────────
@@ -903,6 +1085,10 @@ func PredSkillBodyHasInjectionMarker(s models.SkillDef) bool {
 // PredSkillAllowsTool reports whether the skill pre-approves any of names via
 // allowed-tools. It matches the parsed grant's Tool first (so "Bash(git *)"
 // matches "Bash") then the raw allowed-tools tokens.
+//
+// This predicate does NOT consult the grant's Pattern — "Bash(git status:*)"
+// matches identically to a bare "Bash". Use PredSkillAllowsUnrestrictedTool
+// when a narrowly-scoped grant should not count.
 func PredSkillAllowsTool(s models.SkillDef, names []string) bool {
 	want := make(map[string]bool, len(names))
 	for _, n := range names {
@@ -921,17 +1107,82 @@ func PredSkillAllowsTool(s models.SkillDef, names []string) bool {
 	return false
 }
 
+// skillGrantIsUnrestricted reports whether a parsed ToolGrant places no real
+// constraint on what it authorizes, per Claude Code's own permission-rule
+// semantics (see code.claude.com/docs/en/permissions):
+//
+//   - Bash / PowerShell: unrestricted only for an empty, "*", or ":*" pattern
+//     — Bash(git status:*) is a genuine command-prefix restriction.
+//   - Edit (the tool Claude Code actually consults for file-path rules; see
+//     below): unrestricted only for an empty pattern or a catch-all glob
+//     ("*", "**", "/**", "//**"), never a real gitignore-style path pattern
+//     like "docs/**".
+//   - WebFetch: unrestricted only for an empty or "*" pattern — a
+//     "domain:example.com" specifier is a genuine restriction.
+//   - Write and NotebookEdit: ALWAYS unrestricted, regardless of any pattern
+//     written in the grant. Claude Code accepts a path specifier on these
+//     tools but never consults it — only an Edit rule is checked for file
+//     writes (it warns at startup that a Write/NotebookEdit path rule is
+//     dead). So "Write(src/**)" grants exactly as much as bare "Write".
+func skillGrantIsUnrestricted(g models.ToolGrant) bool {
+	pattern := strings.TrimSpace(g.Pattern)
+	switch g.Tool {
+	case "Write", "NotebookEdit":
+		return true
+	case "Bash", "PowerShell":
+		switch pattern {
+		case "", "*", ":*":
+			return true
+		}
+		return false
+	case "Edit":
+		switch pattern {
+		case "", "*", "**", "/**", "//**":
+			return true
+		}
+		return false
+	case "WebFetch":
+		switch pattern {
+		case "", "*":
+			return true
+		}
+		return false
+	default:
+		return pattern == ""
+	}
+}
+
 // PredSkillAllowsUnrestrictedShell reports whether the skill pre-approves
 // unrestricted shell via allowed-tools — a bare `Bash` grant or a wildcard
 // pattern (`Bash(*)` / `Bash(:*)`). allowed-tools is an auto-approval list, not a
 // sandbox, so this lets the skill run any shell command without prompting.
 func PredSkillAllowsUnrestrictedShell(s models.SkillDef) bool {
 	for _, g := range s.ToolGrants {
-		if g.Tool != "Bash" {
-			continue
+		if g.Tool == "Bash" && skillGrantIsUnrestricted(g) {
+			return true
 		}
-		switch strings.TrimSpace(g.Pattern) {
-		case "", "*", ":*":
+	}
+	return false
+}
+
+// PredSkillAllowsUnrestrictedTool reports whether the skill pre-approves any
+// of names via allowed-tools with a genuinely unrestricted grant — unlike
+// PredSkillAllowsTool, a narrowly-scoped grant (Bash(git status:*),
+// Edit(docs/**), WebFetch(domain:example.com)) does not count. A raw
+// allowed-tools token with no parsed grant (s.AllowedTools fallback) is
+// treated as unrestricted, since a bare token is unrestricted by definition.
+func PredSkillAllowsUnrestrictedTool(s models.SkillDef, names []string) bool {
+	want := make(map[string]bool, len(names))
+	for _, n := range names {
+		want[n] = true
+	}
+	for _, g := range s.ToolGrants {
+		if want[g.Tool] && skillGrantIsUnrestricted(g) {
+			return true
+		}
+	}
+	for _, t := range s.AllowedTools {
+		if want[t] {
 			return true
 		}
 	}
@@ -1004,14 +1255,16 @@ func PredSkillBundledFileHasHardcodedSecret(s models.SkillDef) bool {
 var sideEffectingSkillTools = []string{"Bash", "Write", "Edit", "WebFetch", "NotebookEdit"}
 
 // PredSkillDescriptionToolMismatch reports whether the skill's description
-// explicitly claims to be read-only / side-effect-free while it pre-approves a
-// side-effecting tool (or unrestricted shell) — the metadata then understates
-// the real capability, which is the signal a reviewer relies on.
+// explicitly claims to be read-only / side-effect-free while it pre-approves an
+// unrestricted side-effecting tool grant — the metadata then understates the
+// real capability, which is the signal a reviewer relies on. A narrowly-scoped
+// grant (Bash(git status:*), Edit(docs/**)) does not misrepresent the
+// description, so it is not counted.
 func PredSkillDescriptionToolMismatch(s models.SkillDef) bool {
 	if !skillReadOnlyClaimRe.MatchString(s.Description) {
 		return false
 	}
-	return PredSkillAllowsUnrestrictedShell(s) || PredSkillAllowsTool(s, sideEffectingSkillTools)
+	return PredSkillAllowsUnrestrictedTool(s, sideEffectingSkillTools)
 }
 
 func PredSkillHasDescription(s models.SkillDef) bool {
@@ -1070,6 +1323,138 @@ func PredSkillDescriptionHasText(needles []string, s models.SkillDef) bool {
 	desc := strings.ToLower(s.Description)
 	for _, n := range needles {
 		if strings.Contains(desc, strings.ToLower(n)) {
+			return true
+		}
+	}
+	return false
+}
+
+// skillSentenceSplitRe splits skill text into sentences on terminal
+// punctuation, newlines, and markdown list-item / heading starts — the same
+// granularity a human reviewer reads a SKILL.md at. It intentionally
+// over-splits (e.g. on a decimal point) rather than under-split: a false
+// sentence boundary only costs PredSkillTextMatches a same-sentence
+// require_context hit, which is a false negative on an already-narrow
+// predicate, not a false positive.
+var skillSentenceSplitRe = regexp.MustCompile(`(?m)[.!?\n]+|^\s*[-*+]\s+|^\s*#{1,6}\s+`)
+
+// skillAbbreviationReplacer strips the internal periods from "e.g." and
+// "i.e." (case already normalized to lower by the caller) before sentence
+// splitting, so the split on "." above does not fragment an abbreviation —
+// and, applied identically to a term, lets a rule list "e.g." as a literal
+// exclude_context phrase and have it survive to be matched.
+var skillAbbreviationReplacer = strings.NewReplacer("e.g.", "eg", "i.e.", "ie")
+
+// skillWordCharProse and skillWordCharSlug classify which runes count as
+// "inside a word" for boundary matching, per SkillTextMatchExpr's field-
+// dependent boundary rule: a skill name is a kebab/snake slug where "-"/"_"
+// are separators ("encrypt-helper" must match "encrypt"), while description
+// and body are prose where "-" is a word character ("case-sensitive" must
+// NOT match "sensitive").
+func skillWordCharProse(r rune) bool {
+	return r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+}
+
+func skillWordCharSlug(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+}
+
+// skillSurfaceForms returns term plus its common verb/noun inflections
+// (-s, -es, -ed, -ing), so a term like "sign" or "store" also matches
+// "signs"/"signing" or "stores"/"storing" in skill text. A term ending in
+// "e" drops it before "-ed"/"-ing" (store -> storing/stored, not
+// storeing/storeed) — the standard English spelling rule for those verbs.
+// Bogus forms this generates for a non-verb term (e.g. "tokenes") are
+// harmless: they simply never occur in real text, so they never match.
+func skillSurfaceForms(term string) []string {
+	forms := []string{term}
+	if strings.HasSuffix(term, "e") && len(term) > 1 {
+		stem := term[:len(term)-1]
+		forms = append(forms, stem+"ed", stem+"ing")
+	} else {
+		forms = append(forms, term+"ed", term+"ing")
+	}
+	forms = append(forms, term+"s", term+"es")
+	return forms
+}
+
+// skillSentenceHasTerm reports whether sentence contains an exact,
+// word-boundary-delimited (per isWordChar) occurrence of term or one of its
+// inflected surface forms (skillSurfaceForms) — e.g. "sign" matches "signs"/
+// "signed"/"signing" but not "design"/"assign"/"signal", since those fail
+// the boundary check or don't equal any generated form. Both sentence and
+// term are matched case-insensitively; callers pass already-lowercased,
+// abbreviation-normalized input (see skillAbbreviationReplacer).
+func skillSentenceHasTerm(sentence, term string, isWordChar func(rune) bool) bool {
+	runes := []rune(sentence)
+	for _, form := range skillSurfaceForms(term) {
+		formRunes := []rune(form)
+		n, m := len(runes), len(formRunes)
+		for start := 0; start+m <= n; start++ {
+			if start > 0 && isWordChar(runes[start-1]) {
+				continue
+			}
+			if string(runes[start:start+m]) != form {
+				continue
+			}
+			end := start + m
+			if end == n || !isWordChar(runes[end]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// skillTextMatchesAny reports whether any term in terms has a word-boundary
+// hit anywhere in text (already-lowercased), using isWordChar for the
+// field's boundary rule.
+func skillTextMatchesAny(text string, terms []string, isWordChar func(rune) bool) bool {
+	for _, t := range terms {
+		term := skillAbbreviationReplacer.Replace(strings.ToLower(t))
+		if skillSentenceHasTerm(text, term, isWordChar) {
+			return true
+		}
+	}
+	return false
+}
+
+// PredSkillTextMatches implements skill_text_matches: sentence-scoped,
+// word-boundary text matching with optional same-sentence context, built to
+// fix confirmed false positives in the raw-substring skill text predicates
+// (PredSkillBodyHasText / PredSkillNameHasText / PredSkillDescriptionHasText)
+// without changing those predicates' behavior for the other rules that still
+// use them. See SkillTextMatchExpr's doc comment for the exact semantics.
+func PredSkillTextMatches(e SkillTextMatchExpr, s models.SkillDef) bool {
+	for _, field := range e.Fields {
+		var text string
+		isWordChar := skillWordCharProse
+		switch field {
+		case "name":
+			text = s.Name
+			isWordChar = skillWordCharSlug
+		case "description":
+			text = s.Description
+		case "body":
+			text = s.Body
+		default:
+			continue
+		}
+		text = skillAbbreviationReplacer.Replace(strings.ToLower(text))
+		for _, sentence := range skillSentenceSplitRe.Split(text, -1) {
+			sentence = strings.TrimSpace(sentence)
+			if sentence == "" {
+				continue
+			}
+			if !skillTextMatchesAny(sentence, e.Terms, isWordChar) {
+				continue
+			}
+			if len(e.RequireContext) > 0 && !skillTextMatchesAny(sentence, e.RequireContext, isWordChar) {
+				continue
+			}
+			if len(e.ExcludeContext) > 0 && skillTextMatchesAny(sentence, e.ExcludeContext, isWordChar) {
+				continue
+			}
 			return true
 		}
 	}
@@ -1155,24 +1540,374 @@ func PredRepoClaudeOptionsPermissionModeIs(modes []string, inv models.RepoInvent
 	return false
 }
 
-// PredRepoClaudeOptionsMaxTurnsMissing fires when the repo constructs at least
-// one ClaudeAgentOptions(...) and NO such construction sets max_turns. This is
-// an absence check across every construction, not a per-call value match: a
-// single options object that sets an explicit cap silences the rule for the
-// repo. Constructions marked Opaque (built with ** unpacking) are skipped —
-// their kwarg set is untrustworthy, so their silence is not evidence of a
-// missing cap. A repo with no ClaudeAgentOptions at all never fires: there is
-// no session config to flag.
-func PredRepoClaudeOptionsMaxTurnsMissing(inv models.RepoInventory) bool {
+// repoClaudeOptionsMissingKwarg fires when the repo constructs at least one
+// ClaudeAgentOptions(...) and NO such construction sets kwarg. This is an
+// absence check across every construction, not a per-call value match: a
+// single options object that sets the kwarg silences the rule for the repo.
+// Constructions marked Opaque (built with ** unpacking) are skipped — their
+// kwarg set is untrustworthy, so their silence is not evidence of a missing
+// value. A repo with no ClaudeAgentOptions at all never fires: there is no
+// session config to flag. Shared by PredRepoClaudeOptionsMaxTurnsMissing and
+// PredRepoClaudeOptionsDisallowedToolsMissing — mirrors the shape
+// agentRunCallMissingKwarg uses for the agent-run-call family.
+func repoClaudeOptionsMissingKwarg(inv models.RepoInventory, kwarg string) bool {
 	concrete := 0
 	for _, opt := range inv.ClaudeAgentOptions {
 		if opt.Opaque {
 			continue
 		}
 		concrete++
-		if node := lookupKwargInTree(opt.Kwargs, "max_turns"); node != nil && node.Value != nil {
+		if node := lookupKwargInTree(opt.Kwargs, kwarg); node != nil && node.Value != nil {
 			return false
 		}
 	}
 	return concrete > 0
+}
+
+// PredRepoClaudeOptionsMaxTurnsMissing fires when the repo constructs at least
+// one ClaudeAgentOptions(...) and NO such construction sets max_turns. See
+// repoClaudeOptionsMissingKwarg for the absence-check and Opaque-skip rules.
+func PredRepoClaudeOptionsMaxTurnsMissing(inv models.RepoInventory) bool {
+	return repoClaudeOptionsMissingKwarg(inv, "max_turns")
+}
+
+// PredRepoClaudeOptionsDisallowedToolsMissing fires when the repo constructs
+// at least one ClaudeAgentOptions(...) and NO such construction sets
+// disallowed_tools. Claude SDK's allowed_tools only auto-approves — it does
+// not restrict which tools can run — so the risk signal is the absence of a
+// deny-list, not an empty allow-list. See repoClaudeOptionsMissingKwarg for
+// the absence-check and Opaque-skip rules. Note: a construction that sets
+// disallowed_tools=[] (empty list) or disallowed_tools=None still counts as
+// "set" here, since the presence check only requires a non-nil Value — this
+// mirrors the same tri-state limitation PredRepoClaudeOptionsMaxTurnsMissing
+// already has for max_turns=None.
+func PredRepoClaudeOptionsDisallowedToolsMissing(inv models.RepoInventory) bool {
+	return repoClaudeOptionsMissingKwarg(inv, "disallowed_tools")
+}
+
+// PredRepoHasObservability reports whether the repo has ANY observability
+// signal — import, init, exporter, or content capture. A declared dependency
+// alone is deliberately not enough: recon's ObsDeps gate the AST pass, they do
+// not stand in for code.
+func PredRepoHasObservability(want bool, inv models.RepoInventory) bool {
+	return (len(inv.ObservabilitySignals) > 0) == want
+}
+
+// directObsDepManifests are the dependency manifests a developer edits by hand.
+// poetry.lock is deliberately excluded: a lock file enumerates the TRANSITIVE
+// closure, so an observability package lands there without anyone choosing it —
+// promoting that to a finding would blame a repo for its framework's
+// dependencies.
+var directObsDepManifests = map[string]bool{
+	"pyproject.toml":   true,
+	"requirements.txt": true,
+	"Pipfile":          true,
+	"package.json":     true,
+}
+
+// PredRepoObservabilityDeclared reports whether an observability package is
+// DECLARED in a hand-edited dependency manifest, whatever the code does with it.
+//
+// This is the one predicate that reads recon output (RepoProfile.ObsDeps) rather
+// than code signals, and it exists for a single distinction: a repo that ships
+// an observability dependency and never wires it is not the same as a repo that
+// never tried. The first believes it has coverage. Pair it with
+// repo_has_observability to separate the two.
+func PredRepoObservabilityDeclared(want bool, p models.RepoProfile) bool {
+	declared := false
+	for _, d := range p.ObsDeps {
+		if directObsDepManifests[d.Source] {
+			declared = true
+			break
+		}
+	}
+	return declared == want
+}
+
+// PredRepoObservabilityInspectable reports whether the repo contains at least
+// one language the observability pass actually parses (Python, TypeScript,
+// JavaScript).
+//
+// This is the honesty guard behind every absence rule. Without it, a Go-only or
+// Rust-only repo produces zero signals for the trivial reason that nothing
+// looked — and "we did not look" would be reported as "you have no
+// observability".
+func PredRepoObservabilityInspectable(want bool, inv models.RepoInventory) bool {
+	m := inv.Manifest
+	inspectable := len(m.PythonFiles) > 0 || len(m.TypeScriptFiles) > 0 || len(m.JavaScriptFiles) > 0
+	return inspectable == want
+}
+
+// PredRepoObservabilityInitialized reports whether instrumentation is actually
+// switched on: an init call or a per-agent instrument kwarg. An import is not
+// initialization — that gap is exactly what OBS-001 fires on.
+func PredRepoObservabilityInitialized(want bool, inv models.RepoInventory) bool {
+	found := false
+	for _, s := range inv.ObservabilitySignals {
+		if s.Kind == models.ObsSignalInit || s.Kind == models.ObsSignalInstrumentKwarg {
+			found = true
+			break
+		}
+	}
+	return found == want
+}
+
+// PredRepoObservabilityVendor reports whether any signal names one of the
+// listed vendors. Lets a rule's fix text speak about the vendor actually in use.
+func PredRepoObservabilityVendor(vendors []string, inv models.RepoInventory) bool {
+	for _, s := range inv.ObservabilitySignals {
+		for _, v := range vendors {
+			if string(s.Vendor) == v {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// PredRepoObservabilityConsoleOnly reports whether the repo constructs span
+// exporters AND every one of them writes to the console. No exporters at all is
+// false — that is the absence case, not the console-only case.
+func PredRepoObservabilityConsoleOnly(want bool, inv models.RepoInventory) bool {
+	var exporters, console int
+	for _, s := range inv.ObservabilitySignals {
+		if s.Kind != models.ObsSignalExporter {
+			continue
+		}
+		exporters++
+		if s.Detail == "console" {
+			console++
+		}
+	}
+	consoleOnly := exporters > 0 && exporters == console
+	return consoleOnly == want
+}
+
+// PredRepoObservabilityCapturesContent reports whether the repo switches on
+// capture of full prompt/response text into a tracing backend.
+func PredRepoObservabilityCapturesContent(want bool, inv models.RepoInventory) bool {
+	found := false
+	for _, s := range inv.ObservabilitySignals {
+		if s.Kind == models.ObsSignalContentCapture {
+			found = true
+			break
+		}
+	}
+	return found == want
+}
+
+// hasOtelLabelsSignal reports whether any agent-reliability-otel-labels signal
+// has the kind.
+func hasOtelLabelsSignal(inv models.RepoInventory, kind models.OtelLabelsSignalKind) bool {
+	for _, s := range inv.OtelLabelsSignals {
+		if s.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// otelLabelsRungKeys are the hand-written label keys that prove each rung:
+// any key proves the labels are present; trustabl.run_id proves a run is
+// started; trustabl.exit_reason proves the run end is recorded;
+// trustabl.tool.input_fp or trustabl.tool.attempt proves a tool span is
+// labelled. A nil entry means any key.
+var otelLabelsRungKeys = map[models.OtelLabelsSignalKind]map[string]bool{
+	models.OtelLabelsImport:   nil,
+	models.OtelLabelsRunStart: {"trustabl.run_id": true},
+	models.OtelLabelsRunEnd:   {"trustabl.exit_reason": true},
+	models.OtelLabelsToolSpan: {"trustabl.tool.input_fp": true, "trustabl.tool.attempt": true},
+}
+
+// hasOtelLabelsRung reports whether the repo reached a rung, through a library
+// call or through the label keys written by hand.
+func hasOtelLabelsRung(inv models.RepoInventory, kind models.OtelLabelsSignalKind) bool {
+	if hasOtelLabelsSignal(inv, kind) {
+		return true
+	}
+	keys, ok := otelLabelsRungKeys[kind]
+	if !ok {
+		return false
+	}
+	for _, s := range inv.OtelLabelsSignals {
+		if s.Kind == models.OtelLabelsAttrLiteral && (keys == nil || keys[s.Key]) {
+			return true
+		}
+	}
+	return false
+}
+
+// PredRepoOtelLabelsInstalled reports whether agent-reliability-otel-labels is
+// present in the repo at all: declared in a root dependency manifest, or
+// imported in code. Either is enough. Recon reads only the root manifests, so a
+// monorepo that declares the library in a nested manifest is visible only
+// through its import. trustabl.* keys written by hand count too (see
+// otelLabelsRungKeys).
+func PredRepoOtelLabelsInstalled(want bool, p models.RepoProfile, inv models.RepoInventory) bool {
+	installed := len(p.OtelLabelsDeclaredIn) > 0 || hasOtelLabelsRung(inv, models.OtelLabelsImport)
+	return installed == want
+}
+
+// PredRepoOtelLabelsInitialized reports whether a run is actually started:
+// Run.mark_start(root) is called somewhere, which is what stamps the run
+// identity on the root span. Constructing a Run, or labelling spans without
+// ever marking the start, is not initialization — the labels then belong to no
+// run. trustabl.* keys written by hand count too (see otelLabelsRungKeys).
+func PredRepoOtelLabelsInitialized(want bool, inv models.RepoInventory) bool {
+	return hasOtelLabelsRung(inv, models.OtelLabelsRunStart) == want
+}
+
+// toolSpanKinds are the tool kinds an agent framework emits a tool-execution
+// span for. A bare shell-invoking function and a LangGraph node are ToolDefs
+// too, but the model does not call them as tools, so they carry no tool span
+// for agent-reliability-otel-labels to label.
+var toolSpanKinds = map[models.ToolKind]bool{
+	models.KindClaudeSDKTool:   true,
+	models.KindOpenAITool:      true,
+	models.KindMCPTool:         true,
+	models.KindADKFunctionTool: true,
+	models.KindLangChainTool:   true,
+	models.KindCrewAITool:      true,
+	models.KindPydanticAITool:  true,
+	models.KindVercelAITool:    true,
+	models.KindAutoGenTool:     true,
+}
+
+// PredRepoOtelLabelsImplemented reports whether the labels a started run
+// exists to carry are actually written: the run's end is recorded
+// (mark_run_end), and — when the repo ships at least one tool the model calls —
+// a tool span is labelled (mark_tool_span). A tool-less repo has no tool span
+// to label, so recording the run end is the whole job there.
+//
+// This proves the calls exist, not that the labels land: with no current span
+// inside a tool every call is a silent no-op, which no static check can see. trustabl.* keys written by hand count too
+// (see otelLabelsRungKeys).
+func PredRepoOtelLabelsImplemented(want bool, inv models.RepoInventory) bool {
+	implemented := hasOtelLabelsRung(inv, models.OtelLabelsRunEnd)
+	if implemented {
+		for _, t := range inv.Tools {
+			if toolSpanKinds[t.Kind] {
+				implemented = hasOtelLabelsRung(inv, models.OtelLabelsToolSpan)
+				break
+			}
+		}
+	}
+	return implemented == want
+}
+
+// PredRepoClaudeOptionsModeWithoutKwarg fires when a SINGLE discovered
+// ClaudeAgentOptions(...) construction both sets permission_mode to one of
+// e.Modes and does not set e.Kwarg. This correlates the two facts at the
+// same construction site, unlike PredRepoClaudeOptionsPermissionModeIs and
+// repoClaudeOptionsMissingKwarg, which each read across every
+// ClaudeAgentOptions in the repo independently: a repo with two options
+// objects — one bypassPermissions with no deny-list, one safe with a
+// deny-list — would silence the repo-wide combination of those two
+// predicates even though the risky site is real. See ClaudeOptionsModeKwargExpr's
+// doc comment in schema.go.
+//
+// Unlike repoClaudeOptionsMissingKwarg, this predicate does NOT skip Opaque
+// (built with ** unpacking) constructions — it simply reads whichever kwargs
+// were captured explicitly at that call site. A kwarg hidden inside the
+// unpacked dict is therefore invisible and reads as absent (a deny-list this
+// engine cannot see is not one it can credit as bounding the tool surface),
+// while permission_mode or e.Kwarg written explicitly alongside the unpack
+// is read normally. This deliberately differs from repoClaudeOptionsMissingKwarg's
+// Opaque-skip, which exists because that helper answers "is any kwarg missing
+// ANYWHERE in the repo" — an unreadable site there could silently be the one
+// that sets it, so it's excluded rather than guessed at. This predicate
+// instead answers "is THIS specific risky site unmitigated", where an
+// unreadable deny-list is correctly treated as no mitigation at all.
+func PredRepoClaudeOptionsModeWithoutKwarg(e ClaudeOptionsModeKwargExpr, inv models.RepoInventory) bool {
+	for _, opt := range inv.ClaudeAgentOptions {
+		modeNode := lookupKwargInTree(opt.Kwargs, "permission_mode")
+		if modeNode == nil || modeNode.Value == nil {
+			continue
+		}
+		val := modeNode.Value.Text
+		if modeNode.Value.Kind == models.ExprLiteralString {
+			val = strings.Trim(val, `"'`)
+		}
+		modeMatches := false
+		for _, m := range e.Modes {
+			if val == m {
+				modeMatches = true
+				break
+			}
+		}
+		if !modeMatches {
+			continue
+		}
+		kwargNode := lookupKwargInTree(opt.Kwargs, e.Kwarg)
+		if kwargNode == nil || kwargNode.Value == nil {
+			return true // matching mode, no (or unreadable-opaque) kwarg at this site
+		}
+	}
+	return false
+}
+
+// PredAgentKwargsObserved is true iff discovery resolved this agent's call site:
+// its kwargs were captured (non-nil) and the call was not opaque (** unpacking).
+// It separates "resolved, and genuinely has no such key" from "never linked at
+// all" (e.g. a chained StateGraph(...).compile() with no named variable) so an
+// absence rule can stay silent on the latter.
+func PredAgentKwargsObserved(a models.AgentDef) bool {
+	return a.Kwargs != nil && !a.Opaque
+}
+
+// PredAgentCheckpointerInMemory is true when this agent's checkpointer= resolves
+// to an in-process LangGraph saver (MemorySaver / InMemorySaver). Any other
+// class, an unresolved name, a runtime-selected saver and no checkpointer at
+// all are false: discovery never guesses (see AgentDef.CheckpointerClass).
+func PredAgentCheckpointerInMemory(a models.AgentDef) bool {
+	return analysis.IsLangGraphInMemoryCheckpointer(a.CheckpointerClass)
+}
+
+// PredAgentServerReachable is true when at least one run call of this agent is
+// reachable from a server entrypoint (HTTP route or worker task;
+// AgentRunCallDef.ServerReachable, one hop per edge). Run calls correlate by
+// same SDK and AgentVarName, and by file: the call's AgentFilePath when it was
+// resolved across files, else the call's own file. An agent with no VarName
+// never fires.
+//
+// Test paths are excluded (pathclass.Classify): an agent defined in a test
+// file, a run call in a test file, and a run call stamped by an entrypoint in a
+// test file (a FastAPI test app) do not count. A test harness is not a
+// production server path. The exclusion is local to this predicate; entrypoint
+// and run-call discovery stay unfiltered.
+func PredAgentServerReachable(a models.AgentDef, inv models.RepoInventory) bool {
+	if a.VarName == "" || pathclass.Classify(a.FilePath) == models.OriginTest {
+		return false
+	}
+	for _, rc := range inv.AgentRunCalls {
+		if rc.SDK != a.SDK || rc.AgentVarName != a.VarName || rc.ServerReachable == nil {
+			continue
+		}
+		defining := rc.AgentFilePath
+		if defining == "" {
+			defining = rc.FilePath
+		}
+		if defining != a.FilePath {
+			continue
+		}
+		if pathclass.Classify(rc.FilePath) == models.OriginTest || pathclass.Classify(rc.ServerReachable.FilePath) == models.OriginTest {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// PredRepoLangGraphPlatformConfigPresent reports whether the repo ships a
+// langgraph.json (any depth). A LangGraph Platform deployment injects its own
+// checkpointer, so a compile() with no checkpointer= is intended there. Dual
+// scope: evaluated from the inventory's manifest copy in both EvaluateAgent
+// and EvaluateRepo.
+func PredRepoLangGraphPlatformConfigPresent(inv models.RepoInventory) bool {
+	for _, p := range inv.Manifest.JSONFiles {
+		if path.Base(strings.ReplaceAll(p, "\\", "/")) == "langgraph.json" {
+			return true
+		}
+	}
+	return false
 }

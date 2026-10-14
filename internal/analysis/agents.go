@@ -285,6 +285,7 @@ func ResolveEdges(inv *models.RepoInventory, parsed []ParsedFile) {
 							SDK:       models.SDKOpenAIAgents,
 							Language:  models.LanguagePython,
 							Location:  aliasDef.Location,
+							Kwargs:    aliasDef.Kwargs,
 						})
 						a.MCPServerRefs = append(a.MCPServerRefs, models.MCPServerRef{
 							Class:    aliasDef.Class,
@@ -442,14 +443,21 @@ func ResolveEdges(inv *models.RepoInventory, parsed []ParsedFile) {
 		// → SDKOpenAIAgents, TSADKHostedToolClasses → SDKGoogleADK,
 		// IsVercelHostedTool → SDKVercelAI. Python
 		// hosted-tool refs (handled by the classify block above) carry a
-		// valid DefIndex already and are skipped by the first guard. The
-		// Location is approximated to the agent's call site — the precise
-		// factory-call line is not currently carried on HostedToolRef.
+		// valid DefIndex already and are skipped by the first guard.
+		// TS OpenAI refs carry a fully-formed def on ref.Pending (precise
+		// factory-call Location + captured kwargs) — materialized verbatim.
+		// TS ADK / Vercel refs have no Pending yet, so their Location is still
+		// approximated to the agent's call site and they carry no kwargs.
 		// DefIndex set here is the pre-sort index; the post-sort remap
 		// below re-points .Resolved via the sort permutation.
 		for j := range a.HostedToolRefs {
 			ref := &a.HostedToolRefs[j]
 			if ref.DefIndex >= 0 {
+				continue
+			}
+			if ref.Pending != nil {
+				inv.HostedTools = append(inv.HostedTools, *ref.Pending)
+				ref.DefIndex = len(inv.HostedTools) - 1
 				continue
 			}
 			// Recognize either TS OpenAI factories or TS ADK hosted classes.
@@ -737,6 +745,7 @@ func exprFromNode(n *sitter.Node, src []byte) *models.KwargTree {
 		// Also carry the kwargs on the Expr itself, so list elements (which keep
 		// only the Expr, not this KwargTree) retain a hosted-tool call's kwargs.
 		e.CallKwargs = children
+		e.CallArgs = positionalCallArgs(n, src)
 		return &models.KwargTree{Value: e, Children: children}
 	}
 	// For a dict literal passed as a kwarg value
@@ -784,6 +793,29 @@ func nilToEmpty(t *models.KwargTree) *models.KwargTree {
 		return &models.KwargTree{Children: map[string]*models.KwargTree{}}
 	}
 	return t
+}
+
+// positionalCallArgs returns the positional (non-keyword) arguments of a call
+// node, in source order. Keyword arguments and **unpacks are skipped. Used to
+// unwrap NativeTool(<inner>(...)) so the inner constructor's kwargs are
+// reachable on the list-item Expr.
+func positionalCallArgs(n *sitter.Node, src []byte) []models.Expr {
+	args := n.ChildByFieldName("arguments")
+	if args == nil {
+		return nil
+	}
+	var out []models.Expr
+	for i := 0; i < int(args.NamedChildCount()); i++ {
+		child := args.NamedChild(i)
+		if child == nil || child.Type() == "keyword_argument" || child.Type() == "dictionary_splat" {
+			continue
+		}
+		tree := exprFromNode(child, src)
+		if tree != nil && tree.Value != nil {
+			out = append(out, *tree.Value)
+		}
+	}
+	return out
 }
 
 func discoverGuardrailsInFile(pf ParsedFile) []models.GuardrailDef {
@@ -916,14 +948,18 @@ func buildImportsByFile(parsed []ParsedFile) map[string]map[string]importBinding
 			if n.Type() != "import_from_statement" {
 				return true
 			}
-			module := astutil.NodeText(n.ChildByFieldName("module_name"), pf.Source)
+			modNode := n.ChildByFieldName("module_name")
+			module := astutil.NodeText(modNode, pf.Source)
 			for i := 0; i < int(n.ChildCount()); i++ {
 				child := n.Child(i)
+				// Skip the module_name node itself by position, not by text:
+				// `from graph import graph` imports a name equal to its module.
+				if modNode != nil && child.StartByte() == modNode.StartByte() {
+					continue
+				}
 				if child.Type() == "dotted_name" {
 					name := astutil.NodeText(child, pf.Source)
-					if name != module {
-						m[name] = importBinding{module: module, name: name}
-					}
+					m[name] = importBinding{module: module, name: name}
 				} else if child.Type() == "aliased_import" {
 					orig := astutil.NodeText(child.ChildByFieldName("name"), pf.Source)
 					alias := astutil.NodeText(child.ChildByFieldName("alias"), pf.Source)

@@ -73,9 +73,14 @@ checksum:
   algorithm: sha256
 
 release:
-  github:
-    owner: trustabl
-    name: trustabl
+  # No `github:` target here on purpose. GoReleaser infers the repository
+  # from the git remote, which actions/checkout sets to the repository the
+  # workflow is running in, so this follows a rename automatically.
+  #
+  # A hardcoded owner/name is a POST to api.github.com/repos/OWNER/REPO/
+  # releases. GitHub answers a renamed repository with a 301, and Go's HTTP
+  # client does not replay a POST body across a redirect — so the failure
+  # would land AFTER the tag was already public.
   draft: false
   prerelease: auto
   mode: replace
@@ -89,8 +94,8 @@ brews:
       owner: trustabl
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
-    homepage: "https://github.com/trustabl/trustabl"
-    description: "Static analyzer for agent reliability"
+    homepage: "https://github.com/trustabl/agent-reliability-analyzer"
+    description: "Find and fix agent reliability issues"
     license: "Apache-2.0"
     install: |
       bin.install "trustabl"
@@ -105,8 +110,8 @@ scoops:
       owner: trustabl
       name: scoop-bucket
       token: "{{ .Env.SCOOP_BUCKET_GITHUB_TOKEN }}"
-    homepage: "https://github.com/trustabl/trustabl"
-    description: "Static analyzer for agent reliability"
+    homepage: "https://github.com/trustabl/agent-reliability-analyzer"
+    description: "Find and fix agent reliability issues"
     license: Apache-2.0
 
 # Docker is NOT built here: this goreleaser run executes on a macOS runner

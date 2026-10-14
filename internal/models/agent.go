@@ -32,6 +32,11 @@ type Expr struct {
 	// In-memory carrier so hosted-tool discovery can attach a call's kwargs to
 	// the HostedToolDef; not serialized.
 	CallKwargs map[string]*KwargTree `json:"-"`
+	// CallArgs holds positional arguments of a call expression, in source
+	// order. Used to unwrap NativeTool(<inner>(...)) so the inner tool's
+	// kwargs (e.g. force_download=True) land on HostedToolDef.Kwargs.
+	// In-memory only; not serialized.
+	CallArgs []Expr `json:"-"`
 }
 
 type ExprKind string
@@ -82,6 +87,34 @@ type AgentDef struct {
 	InputGuards    []GuardrailRef  `json:"input_guards"`
 	OutputGuards   []GuardrailRef  `json:"output_guards"`
 	Opaque         bool            `json:"opaque"` // true if Agent(**config) or tools=non-literal
+	// FileURLForceDownload is the most-dangerous force_download value observed
+	// on a FileUrl-family constructor (FileUrl / ImageUrl / AudioUrl /
+	// VideoUrl / DocumentUrl) in this agent's file. Empty if none set a
+	// non-default value. Normalized to "True" or "allow-local". In-memory
+	// only — PYD-104 reads it; not serialized.
+	FileURLForceDownload string `json:"-"`
+	// InstrumentedBy records a process-wide instrumentation call in the repo
+	// (e.g. logfire.instrument_pydantic_ai(), Agent.instrument_all()) that turns
+	// on the tracing this agent's native instrumentation kwarg would. nil when
+	// no such call covers this agent's SDK and language. agent_kwarg_missing
+	// reads it: the kwarg it names is treated as set. Set by
+	// analysis.ApplyGlobalInstrumentation.
+	InstrumentedBy *GlobalInstrumentation `json:"instrumented_by,omitempty"`
+	// CheckpointerClass is the class of the checkpointer= passed to a LangGraph
+	// compile() / create_react_agent() / create_agent() call (e.g. "MemorySaver",
+	// "PostgresSaver"), resolved through a langchain / langgraph import. Empty
+	// when there is no checkpointer, or when it is a name or factory discovery
+	// cannot resolve. In-memory only — LC-116 reads it; not serialized.
+	CheckpointerClass string `json:"-"`
+}
+
+// GlobalInstrumentation is the process-wide call that stands in for an
+// agent's native instrumentation kwarg.
+type GlobalInstrumentation struct {
+	Kwarg string `json:"kwarg"` // the native kwarg it stands in for ("instrument", "callbacks")
+	Call  string `json:"call"`  // the matched callee pattern, e.g. "logfire.instrument_pydantic_ai"
+	File  string `json:"file"`
+	Line  int    `json:"line"`
 }
 
 type GuardrailKind string
@@ -121,6 +154,12 @@ type HostedToolRef struct {
 	Class    string         `json:"class"`
 	Resolved *HostedToolDef `json:"-"`
 	DefIndex int            `json:"-"` // pre-sort index into inv.HostedTools; remapped after sort. -1 = not resolvable via inventory remap.
+	// Pending is a fully-formed HostedToolDef captured at TS discovery time —
+	// precise call-site Location and captured factory kwargs. ResolveEdges
+	// materializes it into inv.HostedTools verbatim instead of synthesizing a
+	// bare def from Class alone. nil for Python refs (which already carry a
+	// valid DefIndex) and for TS SDKs that do not yet capture factory kwargs.
+	Pending *HostedToolDef `json:"-"`
 }
 
 // MCPServerDef is one discovered MCP server. Source of truth for class
@@ -306,6 +345,28 @@ type ClaudeSettings struct {
 	HasEnvBlock     bool              `json:"has_env_block"`
 	HasHooks        bool              `json:"has_hooks"`
 	HasSandboxBlock bool              `json:"has_sandbox_block"`
+	// EnableAllProjectMcpServers is the enableAllProjectMcpServers value (nil =
+	// key absent); EnabledMcpjsonServers is enabledMcpjsonServers. Either one
+	// auto-approves the repo's own .mcp.json servers without a trust prompt.
+	EnableAllProjectMcpServers *bool    `json:"enable_all_project_mcp_servers,omitempty"`
+	EnabledMcpjsonServers      []string `json:"enabled_mcpjson_servers,omitempty"`
+}
+
+// ConfigHit is one pre-trust config finding site. Reason is a short, fixed
+// description built from key NAMES and command text only — never an env value.
+type ConfigHit struct {
+	Location
+	Reason string `json:"reason"`
+}
+
+// ProjectConfigFacts are the typed facts behind the agent_config rules
+// (AGCFG-004..007, MCPCFG-002). Each slice is sorted by path, line, reason.
+type ProjectConfigFacts struct {
+	MCPAutoEnable     []ConfigHit `json:"mcp_auto_enable,omitempty"`     // AGCFG-004
+	RiskyHooks        []ConfigHit `json:"risky_hooks,omitempty"`         // AGCFG-005
+	TrustOverrideEnv  []ConfigHit `json:"trust_override_env,omitempty"`  // AGCFG-006
+	EditorAutoApprove []ConfigHit `json:"editor_auto_approve,omitempty"` // AGCFG-007
+	LocalMCPLaunch    []ConfigHit `json:"local_mcp_launch,omitempty"`    // MCPCFG-002
 }
 
 // ClaudeAgentOptionsDef is one ClaudeAgentOptions(...) construction discovered
@@ -323,7 +384,10 @@ type ClaudeAgentOptionsDef struct {
 
 // AgentRunCallDef is one execution call discovered in code that actually runs
 // an agent: a Runner.run/run_sync/run_streamed call (OpenAI Agents SDK) or an
-// <agent>.run/run_sync/run_stream call (Pydantic AI). Execution limits like
+// <agent>.run/run_sync/run_stream call (Pydantic AI), a Runner.run/run_async
+// call resolved to its agent (Google ADK), or an initiate_chat/run-family call
+// (AutoGen / AG2), or an invoke/stream-family call on a compiled LangGraph
+// graph or prebuilt LangGraph agent (LangChain). Execution limits like
 // max_turns or usage_limits are set at this call site, not at the agent's
 // constructor — ClaudeAgentOptionsDef-style construction-site capture can't
 // see them. AgentVarName is the resolved identifier naming the agent this
@@ -339,4 +403,50 @@ type AgentRunCallDef struct {
 	AgentVarName string     `json:"-"`
 	Kwargs       *KwargTree `json:"-"`
 	Opaque       bool       `json:"opaque,omitempty"`
+	// WallClockTimeoutWrapped is true when the call sits structurally inside an
+	// asyncio.wait_for(...) argument or an asyncio.timeout / anyio.move_on_after /
+	// anyio.fail_after `with` block. max_turns / usage_limits bound step count
+	// and token spend but not how long one step can block; this is the only
+	// wall-clock bound discovery can see. In-memory only.
+	WallClockTimeoutWrapped bool `json:"-"`
+	// ServerReachable is non-nil when the call is reachable from a server
+	// entrypoint (HTTP route / worker task) within the v1 one-hop-per-edge
+	// limits documented on analysis.ApplyEntrypointReachability. In-memory
+	// only; read by the agent_server_reachable predicate (LC-116).
+	ServerReachable *EntrypointRef `json:"-"`
+	// AgentFilePath is the file that defines the agent this call runs, when it
+	// was resolved across files (LangGraph: `from graph import app` then
+	// app.invoke(...)). Empty means the agent is defined in the call's own file.
+	// In-memory only.
+	AgentFilePath string `json:"-"`
+}
+
+// EntrypointKind classifies a server entrypoint.
+type EntrypointKind string
+
+const (
+	EntrypointHTTP   EntrypointKind = "http"
+	EntrypointWorker EntrypointKind = "worker"
+)
+
+// EntrypointDef is a function that a server framework invokes on behalf of an
+// external request or job: a FastAPI / Flask route handler, a Celery task or a
+// Dramatiq actor. It is a fact only; see analysis.DiscoverEntrypoints. Location
+// is the function definition (not the decorator).
+type EntrypointDef struct {
+	Location
+	Kind      EntrypointKind `json:"kind"`
+	Framework string         `json:"framework"`       // fastapi | flask | celery | dramatiq
+	Route     string         `json:"route,omitempty"` // first positional string literal of the decorator, else ""
+	FuncName  string         `json:"func_name"`
+}
+
+// EntrypointRef records which entrypoint reaches an agent run call and how.
+type EntrypointRef struct {
+	FilePath  string         `json:"file_path"`
+	Line      int            `json:"start_line"`
+	FuncName  string         `json:"func_name"`
+	Kind      EntrypointKind `json:"kind"`
+	Framework string         `json:"framework"`
+	Via       string         `json:"via"` // "direct" | "same_file" | "import"
 }

@@ -105,11 +105,16 @@ jobs:
         id: tags
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          tags="ghcr.io/trustabl/trustabl:${VERSION}"
+          # Published under BOTH paths. ghcr.io/trustabl/trustabl predates the
+          # repository rename to agent-reliability-analyzer; dropping it would
+          # leave existing `docker pull` users silently pinned to the last image
+          # published before the rename. Retire the old path deliberately, with
+          # notice, rather than by omission here.
+          tags="ghcr.io/trustabl/trustabl:${VERSION},ghcr.io/trustabl/agent-reliability-analyzer:${VERSION}"
           # Only move :latest for a final release, never a pre-release (vX.Y.Z-rc.N).
           case "$GITHUB_REF_NAME" in
             *-*) ;;
-            *) tags="${tags},ghcr.io/trustabl/trustabl:latest" ;;
+            *) tags="${tags},ghcr.io/trustabl/trustabl:latest,ghcr.io/trustabl/agent-reliability-analyzer:latest" ;;
           esac
           echo "tags=${tags}" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v3
@@ -125,3 +130,11 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.tags.outputs.tags }}
+          # The MCP Registry verifies OCI ownership by reading
+          # io.modelcontextprotocol.server.name and matching it against `name` in
+          # server.json. The Dockerfile LABEL only reaches each per-arch image
+          # config; on a multi-arch build the OCI index carries no such
+          # annotation, so set it here too. Keep all three in sync.
+          annotations: |
+            index:io.modelcontextprotocol.server.name=io.github.trustabl/agent-reliability-analyzer
+            manifest:io.modelcontextprotocol.server.name=io.github.trustabl/agent-reliability-analyzer

@@ -77,6 +77,8 @@ func matchCondition(expr rules.MatchExpr) string {
 		return "Any skill containing instruction-override phrasing, invisible Unicode, or encoded blobs."
 	case len(expr.SkillAllowsTool) > 0:
 		return "Any skill pre-approving Bash, Write, Edit, WebFetch, or NotebookEdit in allowed-tools."
+	case len(expr.SkillAllowsUnrestrictedTool) > 0:
+		return "Any skill pre-approving Bash, Write, Edit, WebFetch, or NotebookEdit in allowed-tools with a genuinely unrestricted grant."
 	case expr.SkillModelInvocable != nil:
 		return "Any skill where disable-model-invocation is not set to true."
 	case expr.SkillBundledScriptNetworkEgress != nil:
@@ -99,10 +101,21 @@ func matchCondition(expr rules.MatchExpr) string {
 
 // PolicyStamp is the passive watermark embedded in a GenerateCombined output.
 type PolicyStamp struct {
-	Date          string                    // YYYY-MM-DD
-	RulesSHA      string                    // short (7-char) or full SHA
+	Date          string // YYYY-MM-DD
+	RulesSHA      string // short (7-char) or full SHA
 	SchemaVersion int
 	Categories    []models.DetectorCategory // sorted, controls section order
+	Template      int                       // emitted layout version; >= 1 on a successful parse
+}
+
+// Line renders the stamp comment, delegating to the shared renderer in
+// stamp.go so the multi-SDK generator cannot drift from Stamp.Line().
+func (p PolicyStamp) Line() string {
+	sdks := make([]string, len(p.Categories))
+	for i, c := range p.Categories {
+		sdks[i] = string(c)
+	}
+	return stampLine(p.Date, p.RulesSHA, p.SchemaVersion, sdks, p.Template)
 }
 
 // sortRules sorts a rule slice by severity rank (critical first) then rule ID ascending.
@@ -153,6 +166,60 @@ func emitRuleSection(b *strings.Builder, heading string, rs []rules.RuleDef, sco
 	}
 }
 
+// emitApplyLoop writes the static procedural section that turns the generated
+// skill from a reference document into a working method: after writing an
+// agent surface, check it against the constraints in this document, name the
+// violation by rule ID, apply that rule's directive, and keep a trail of it.
+//
+// The text is constant — it references rule FIELDS (scope, severity, the
+// per-rule Directive) rather than specific rule IDs, so it cannot go stale as
+// rules are added or removed, and GenerateCombined stays a pure function.
+//
+// Authoring constraint: this text is scanned by Trustabl when the generated
+// skill is itself audited, so it must not trip Trustabl's own skill rules.
+// Do not enumerate a fixed list of rules to avoid here — that is how CSKILL-086
+// (persistence verbs: log/store/record/save/...) shipped in step 4 unnoticed.
+// TestGenerateCombined_SkillCompliant evaluates every skill-scoped rule in the
+// rules fixture against the generated output and asserts the exact firing set,
+// so any newly-tripped rule fails the build.
+func emitApplyLoop(b *strings.Builder) {
+	fmt.Fprintf(b, "## How to Apply These Constraints\n\n")
+	fmt.Fprintf(b, "Work against this document; do not assume a definition is correct because it\n")
+	fmt.Fprintf(b, "looks right. After writing or changing any tool, agent, subagent, or skill\n")
+	fmt.Fprintf(b, "definition, run this loop before moving on.\n\n")
+
+	fmt.Fprintf(b, "1. CHECK YOUR WORK\n")
+	fmt.Fprintf(b, "   Re-read the definition you just wrote against every constraint in this\n")
+	fmt.Fprintf(b, "   document whose \"When this applies\" matches it. Check explicitly — do not\n")
+	fmt.Fprintf(b, "   assume the constraint was satisfied.\n\n")
+
+	fmt.Fprintf(b, "2. NAME THE VIOLATION\n")
+	fmt.Fprintf(b, "   State the specific rule ID, not \"this looks wrong\". \"CSDK-005 — this tool\n")
+	fmt.Fprintf(b, "   raises without a structured error contract\" is actionable; \"error handling\n")
+	fmt.Fprintf(b, "   needs work\" is not. If nothing matches, the definition passes; move on.\n\n")
+
+	fmt.Fprintf(b, "3. MATCH THE REPAIR TO THE VIOLATION\n")
+	fmt.Fprintf(b, "   Apply that rule's own Directive. Where the repair goes is set by scope,\n")
+	fmt.Fprintf(b, "   and how to proceed is set by severity:\n\n")
+	fmt.Fprintf(b, "     tool   → change the tool definition\n")
+	fmt.Fprintf(b, "     agent  → change the agent constructor call\n")
+	fmt.Fprintf(b, "     repo   → change project configuration, not code\n\n")
+	fmt.Fprintf(b, "     critical / high  → make the change, then state which rule required it\n")
+	fmt.Fprintf(b, "     medium / low     → apply the directive directly\n\n")
+	fmt.Fprintf(b, "   If the Directive cannot be applied as written — it conflicts with another\n")
+	fmt.Fprintf(b, "   constraint here, or the fix is outside the file you are editing — stop and\n")
+	fmt.Fprintf(b, "   say so rather than approximating it.\n\n")
+
+	fmt.Fprintf(b, "4. KEEP A TRAIL\n")
+	fmt.Fprintf(b, "   Note the rule ID and the change that cleared it. Do not reintroduce a\n")
+	fmt.Fprintf(b, "   pattern you already repaired in this session, and do not re-apply a repair\n")
+	fmt.Fprintf(b, "   that did not clear the violation — report it instead.\n\n")
+
+	fmt.Fprintf(b, "Scope: this loop applies to agent, tool, subagent, and skill definitions —\n")
+	fmt.Fprintf(b, "the surfaces the constraints below govern. It is not a general code-review\n")
+	fmt.Fprintf(b, "procedure.\n\n")
+}
+
 // GenerateCombined produces a combined pre-coding SKILL.md for one or more SDK
 // policy packs. It collects all rule scopes (tool, agent, repo, skill) from
 // each matched pack and organizes output as one ## section per SDK in the
@@ -164,7 +231,15 @@ func emitRuleSection(b *strings.Builder, heading string, rs []rules.RuleDef, sco
 // Output is byte-stable: categories are iterated in stamp.Categories order;
 // within each section rules are sorted by severity (critical first) then rule
 // ID ascending.
-func GenerateCombined(categories []models.DetectorCategory, policies []rules.PolicyFile, stamp PolicyStamp) string {
+//
+// tracing selects the languages and frameworks the Runtime Tracing section
+// covers; its zero value omits the section.
+//
+// ruleLangs drops the rules whose language the SDK is not used in (see
+// RuleLanguages); nil keeps every rule. A listed language that no rule of the
+// pack targets gets a one-line note in that SDK's section, so a gap in
+// coverage reads as a gap rather than as a clean bill.
+func GenerateCombined(categories []models.DetectorCategory, policies []rules.PolicyFile, stamp PolicyStamp, tracing TracingSelection, ruleLangs RuleLanguages) string {
 	// build category set for O(1) membership check
 	catSet := make(map[models.DetectorCategory]bool, len(categories))
 	for _, c := range categories {
@@ -172,12 +247,15 @@ func GenerateCombined(categories []models.DetectorCategory, policies []rules.Pol
 	}
 
 	type sdkSection struct {
-		meta       rules.PolicyMeta
-		tools      []rules.RuleDef
-		agents     []rules.RuleDef
-		subagents  []rules.RuleDef
-		repos      []rules.RuleDef
-		skills     []rules.RuleDef
+		meta      rules.PolicyMeta
+		tools     []rules.RuleDef
+		agents    []rules.RuleDef
+		subagents []rules.RuleDef
+		repos     []rules.RuleDef
+		skills    []rules.RuleDef
+		// typed counts the pack's language-typed rules per listed language,
+		// before filtering, to find the languages the pack has no rules for.
+		typed map[models.Language]int
 	}
 	sections := make(map[models.DetectorCategory]*sdkSection)
 
@@ -185,12 +263,23 @@ func GenerateCombined(categories []models.DetectorCategory, policies []rules.Pol
 		if !catSet[pf.Policy.Category] {
 			continue
 		}
-		sec := sections[pf.Policy.Category]
+		cat := pf.Policy.Category
+		sec := sections[cat]
 		if sec == nil {
-			sec = &sdkSection{meta: pf.Policy}
-			sections[pf.Policy.Category] = sec
+			sec = &sdkSection{meta: pf.Policy, typed: make(map[models.Language]int)}
+			sections[cat] = sec
 		}
 		for _, r := range pf.Rules {
+			if r.Language != "" {
+				for _, l := range ruleLangs[cat] {
+					if r.AppliesToLanguage(l) {
+						sec.typed[l]++
+					}
+				}
+			}
+			if !ruleLangs.keeps(cat, r) {
+				continue
+			}
 			switch r.Scope {
 			case models.ScopeTool:
 				sec.tools = append(sec.tools, r)
@@ -225,18 +314,25 @@ func GenerateCombined(categories []models.DetectorCategory, policies []rules.Pol
 	// --- Frontmatter ---
 	fmt.Fprintf(&b, "---\n")
 	fmt.Fprintf(&b, "name: trustabl-pre-coding\n")
-	fmt.Fprintf(&b, "description: >-\n  Pre-coding reliability constraints for: %s\n", sdkList)
+	// The purpose clause ("used for ...") is load-bearing, not decoration:
+	// CSKILL-085 flags a skill description that states what it touches without
+	// stating why. TestGenerateCombined_SkillCompliant asserts it stays clear.
+	fmt.Fprintf(&b, "description: >-\n  Pre-coding reliability constraints, used for writing and reviewing agent definitions with: %s\n", sdkList)
 	fmt.Fprintf(&b, "allowed-tools: Read\n")
 	fmt.Fprintf(&b, "disable-model-invocation: false\n")
 	fmt.Fprintf(&b, "---\n\n")
 
 	// --- Header ---
 	fmt.Fprintf(&b, "# Trustabl Pre-Coding Reliability Constraints\n\n")
-	fmt.Fprintf(&b, "<!-- generated: %s | rules: %s | schema: %d | sdks: %s -->\n\n",
-		stamp.Date, stamp.RulesSHA, stamp.SchemaVersion, sdkList)
+	if line := stamp.Line(); line != "" {
+		fmt.Fprintf(&b, "%s\n\n", line)
+	}
 	fmt.Fprintf(&b, "Before writing any agent code, apply every constraint below. Rules are\n")
 	fmt.Fprintf(&b, "ordered by severity. A violation here will fire the corresponding finding\n")
 	fmt.Fprintf(&b, "in post-build scan — prevent it now.\n\n")
+
+	emitApplyLoop(&b)
+	emitRuntimeTracing(&b, tracing)
 
 	// --- One section per category, in stamp.Categories order ---
 	for _, cat := range stamp.Categories {
@@ -246,6 +342,16 @@ func GenerateCombined(categories []models.DetectorCategory, policies []rules.Pol
 		}
 		fmt.Fprintf(&b, "---\n\n")
 		fmt.Fprintf(&b, "## %s\n\n", sec.meta.Name)
+		var uncovered []string
+		for _, l := range ruleLangs[cat] {
+			if sec.typed[l] == 0 {
+				uncovered = append(uncovered, languageHeading(l))
+			}
+		}
+		if len(uncovered) > 0 {
+			fmt.Fprintf(&b, "Trustabl has no %s rules for this SDK yet, so only the rules that apply in every language are listed for that code.\n\n",
+				strings.Join(uncovered, " or "))
+		}
 		emitRuleSection(&b, "Tool Rules", sec.tools, models.ScopeTool)
 		emitRuleSection(&b, "Agent Rules", sec.agents, models.ScopeAgent)
 		emitRuleSection(&b, "Subagent Rules", sec.subagents, models.ScopeSubagent)

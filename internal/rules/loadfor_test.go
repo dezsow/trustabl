@@ -76,3 +76,76 @@ rules:
 		t.Errorf("skipped = %v, want [FUT-001]", skipped)
 	}
 }
+
+// The observability pack is cross-SDK: its category is not an SDK, so the
+// SDK-driven pack gate would drop it entirely and OBS-001..003 could never
+// fire. It must load unconditionally (like openshell and claude_skill); its
+// rules stay gated by their own applies_to and predicates.
+func TestLoadFor_LoadsObservabilityPackUnconditionally(t *testing.T) {
+	reg, _, err := rules.LoadFor(fixtureFS(t), []models.SDK{models.SDKOpenAIAgents})
+	if err != nil {
+		t.Fatalf("LoadFor: %v", err)
+	}
+	profile := models.RepoProfile{Languages: []models.Language{models.LanguagePython}}
+	inv := models.RepoInventory{
+		SDKsDetected: []models.SDK{models.SDKOpenAIAgents},
+		Manifest:     models.ScanManifest{PythonFiles: []string{"app.py"}},
+		ObservabilitySignals: []models.ObservabilitySignal{
+			{Vendor: models.VendorLangfuse, Kind: models.ObsSignalImport, File: "app.py", StartLine: 1},
+		},
+	}
+	var sawOBS bool
+	for _, f := range reg.Run(profile, inv, nil, nil) {
+		if f.RuleID == "OBS-001" {
+			sawOBS = true
+		}
+	}
+	if !sawOBS {
+		t.Fatal("OBS-001 did not fire: the observability pack was not loaded by LoadFor")
+	}
+}
+
+// raw_llm_sdk (bare anthropic/openai client usage) has no SDK enum entry, so it
+// must load unconditionally — even with no SDK detected at all — and let each
+// rule's own predicate do the gating (like observability).
+func TestLoadFor_LoadsRawLLMSDKPackUnconditionally(t *testing.T) {
+	reg, _, err := rules.LoadFor(fixtureFS(t), nil)
+	if err != nil {
+		t.Fatalf("LoadFor: %v", err)
+	}
+	profile := models.RepoProfile{Languages: []models.Language{models.LanguagePython}}
+	fired := map[string]bool{}
+	for _, f := range reg.Run(profile, models.RepoInventory{RawAnthropicToolOutputInSystemPrompt: true}, nil, nil) {
+		fired[f.RuleID] = true
+	}
+	if !fired["RAW-001"] || fired["RAW-002"] {
+		t.Fatalf("want RAW-001 only with no SDK detected, got %v", fired)
+	}
+}
+
+// agent_config (pre-trust harness config) reads files that exist with no SDK
+// code in the repo, so it loads unconditionally and the finding is attributed
+// to the first offending config file rather than left file-less.
+func TestLoadFor_LoadsAgentConfigPackUnconditionally(t *testing.T) {
+	reg, _, err := rules.LoadFor(fixtureFS(t), nil)
+	if err != nil {
+		t.Fatalf("LoadFor: %v", err)
+	}
+	inv := models.RepoInventory{ProjectConfig: models.ProjectConfigFacts{
+		EditorAutoApprove: []models.ConfigHit{
+			{Location: models.Location{FilePath: ".vscode/settings.json", Line: 4, EndLine: 4}, Reason: "x"},
+		},
+	}}
+	var got []models.Finding
+	for _, f := range reg.Run(models.RepoProfile{}, inv, nil, nil) {
+		if f.RuleID == "AGCFG-007" {
+			got = append(got, f)
+		}
+	}
+	if len(got) != 1 {
+		t.Fatalf("want AGCFG-007 once with no SDK detected, got %d", len(got))
+	}
+	if got[0].FilePath != ".vscode/settings.json" || got[0].StartLine != 4 {
+		t.Fatalf("finding location = %s:%d, want .vscode/settings.json:4", got[0].FilePath, got[0].StartLine)
+	}
+}

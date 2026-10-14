@@ -1,5 +1,5 @@
 {
-  "repo": "trustabl/trustabl",
+  "repo": "trustabl/agent-reliability-analyzer",
   "unit": "cumulative_release_downloads",
   "history": [
     {
@@ -37,6 +37,34 @@
     {
       "date": "2026-08-24",
       "downloads": 793
+    },
+    {
+      "date": "2026-08-31",
+      "downloads": 1347
+    },
+    {
+      "date": "2026-09-07",
+      "downloads": 1810
+    },
+    {
+      "date": "2026-09-14",
+      "downloads": 2692
+    },
+    {
+      "date": "2026-09-21",
+      "downloads": 3500
+    },
+    {
+      "date": "2026-09-28",
+      "downloads": 3611
+    },
+    {
+      "date": "2026-10-05",
+      "downloads": 6190
+    },
+    {
+      "date": "2026-10-12",
+      "downloads": 13684
     }
   ]
 }

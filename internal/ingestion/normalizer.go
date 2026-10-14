@@ -24,10 +24,132 @@ func Recon(src *Source, onFile func(string)) (models.RepoProfile, error) {
 	langs := languagesFromManifest(manifest)
 	sdks := detectSDKDeps(src.RootPath)
 	return models.RepoProfile{
-		Languages: langs,
-		SDKDeps:   sdks,
-		Manifest:  manifest,
+		Languages:            langs,
+		SDKDeps:              sdks,
+		ObsDeps:              detectObsDeps(src.RootPath),
+		OtelLabelsDeclaredIn: detectOtelLabelsDeps(src.RootPath),
+		Manifest:             manifest,
 	}, nil
+}
+
+// obsDepNeedles maps a manifest substring to the observability vendor it
+// declares. Patterns are lowercase; manifest text is lowercased before matching.
+// Kept separate from detectSDKDeps' needles on purpose — see the ObsDep doc
+// comment for why these must not become SDKDeps.
+var obsDepNeedles = []struct {
+	Vendor  models.ObservabilityVendor
+	Pattern string
+}{
+	{models.VendorOTel, "opentelemetry"},
+	{models.VendorOTel, "@opentelemetry/"},
+	{models.VendorOpenLLMetry, "traceloop-sdk"},
+	{models.VendorOpenLLMetry, "@traceloop/"},
+	{models.VendorOpenInference, "openinference"},
+	{models.VendorOpenInference, "arize-phoenix"},
+	{models.VendorLangfuse, "langfuse"},
+	{models.VendorLangSmith, "langsmith"},
+	{models.VendorLogfire, "logfire"},
+	{models.VendorBraintrust, "braintrust"},
+	{models.VendorWeave, "weave"},
+	{models.VendorAgentOps, "agentops"},
+	{models.VendorMLflow, "mlflow"},
+	{models.VendorDatadogLLMObs, "ddtrace"},
+	{models.VendorOpik, "opik"},
+	// Helicone is deliberately absent: it is a provider base-URL override, not
+	// an importable package, so no AST pass can ever produce a code signal for
+	// it (see DiscoverObservability). Declaring the dep here without any way
+	// to observe it being wired would permanently misfire OBS-005 ("declared
+	// but never wired") on every real Helicone user with no way to clear it.
+	// Deferred until the base-URL-literal detection is implemented.
+}
+
+// obsDepManifests are the fixed-name root manifests the needle scan reads.
+var obsDepManifests = []string{
+	"pyproject.toml", "requirements.txt", "Pipfile", "poetry.lock", "package.json",
+}
+
+// detectObsDeps scans the root dependency manifests for declared observability
+// packages. Recon-only: a declared dep is a PRE-FILTER for the AST pass, never
+// evidence on its own — repo_has_observability is satisfied by code signals.
+func detectObsDeps(root string) []models.ObsDep {
+	seen := make(map[string]bool)
+	var out []models.ObsDep
+	for _, mfile := range obsDepManifests {
+		text, ok := readRootManifestLower(root, mfile)
+		if !ok {
+			continue
+		}
+		for _, n := range obsDepNeedles {
+			if !strings.Contains(text, n.Pattern) {
+				continue
+			}
+			key := string(n.Vendor) + "@" + mfile
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			out = append(out, models.ObsDep{Vendor: n.Vendor, Source: mfile, Confidence: 0.9})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Vendor != out[j].Vendor {
+			return out[i].Vendor < out[j].Vendor
+		}
+		return out[i].Source < out[j].Source
+	})
+	return out
+}
+
+// readRootManifestLower reads one fixed-name root manifest and lowercases it
+// for needle matching. Size-capped before reading: these fixed root paths
+// bypass the manifest walk's gate, so a hostile multi-GiB manifest would
+// otherwise be slurped into memory.
+func readRootManifestLower(root, mfile string) (string, bool) {
+	path := filepath.Join(root, mfile)
+	fi, serr := os.Stat(path)
+	if serr != nil || fi.IsDir() || fi.Size() > maxScannedFileBytes {
+		return "", false
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	return strings.ToLower(string(b)), true
+}
+
+// otelLabelsDepNeedles are the names agent-reliability-otel-labels is declared
+// under: the PyPI distribution and its normalized underscore spelling. The npm
+// package, @trustabl/agent-reliability-otel-labels, contains the first needle.
+// Lowercase; manifest text is lowercased before matching.
+//
+// Kept out of obsDepNeedles on purpose. The library only labels spans that
+// something else already emits, so counting it as an observability vendor
+// would let it satisfy its own prerequisite and would make OBS-005 fire on a
+// repo that declares nothing but this library.
+var otelLabelsDepNeedles = []string{"agent-reliability-otel-labels", "agent_reliability_otel_labels"}
+
+// detectOtelLabelsDeps returns the root manifests that declare
+// agent-reliability-otel-labels, sorted. A lock file counts: unlike the
+// OpenTelemetry packages, nothing pulls the library in transitively, so an
+// entry there means someone installed it. go.mod is not read — the
+// observability pass does not inspect Go, so a Go declaration could never be
+// paired with a code signal.
+func detectOtelLabelsDeps(root string) []string {
+	var out []string
+	for _, mfile := range obsDepManifests {
+		text, ok := readRootManifestLower(root, mfile)
+		if !ok {
+			continue
+		}
+		for _, n := range otelLabelsDepNeedles {
+			if strings.Contains(text, n) {
+				out = append(out, mfile)
+				break
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func languagesFromManifest(m models.ScanManifest) []models.Language {
@@ -54,6 +176,25 @@ func languagesFromManifest(m models.ScanManifest) []models.Language {
 		langs = append(langs, models.LanguageRust)
 	}
 	return langs
+}
+
+// depManifestLanguages maps a fixed-name root dependency manifest to the
+// language whose packages it declares. package.json is a best guess — it
+// could be plain JavaScript.
+var depManifestLanguages = map[string]models.Language{
+	"pyproject.toml":   models.LanguagePython,
+	"requirements.txt": models.LanguagePython,
+	"Pipfile":          models.LanguagePython,
+	"poetry.lock":      models.LanguagePython,
+	"package.json":     models.LanguageTypeScript,
+	"go.mod":           models.LanguageGo,
+}
+
+// ManifestLanguage returns the language a root dependency manifest declares
+// packages for, and false for a manifest this table does not know.
+func ManifestLanguage(name string) (models.Language, bool) {
+	lang, ok := depManifestLanguages[name]
+	return lang, ok
 }
 
 // detectSDKDeps scans pyproject.toml / requirements.txt / Pipfile / poetry.lock /
@@ -87,6 +228,13 @@ func detectSDKDeps(root string) []models.SDKDep {
 			Manifests: []string{"package.json"}},
 		{Name: "google-adk", Pattern: "@google/adk",
 			Manifests: []string{"package.json"}},
+		// Google ADK for Go. Recon-only, like nvidia-nat below: there is no Go
+		// ADK discovery pass, so this name is deliberately NOT in
+		// scanner.depNameToSDK (a mapped name would emit a permanent false
+		// META-002). forge maps it to the google_adk category to select the Go
+		// runtime-tracing recipe.
+		{Name: "google-adk-go", Pattern: "google.golang.org/adk",
+			Manifests: []string{"go.mod"}},
 		// MCP TypeScript SDK. The package id is unambiguous (no Python-substring
 		// hazard), so it scans package.json only. Drives the "declared but
 		// unused" drift signal; actual pack loading is driven by SDKMCP from
@@ -281,6 +429,11 @@ func Normalize(src *Source, onFile func(string)) (models.ScanManifest, error) {
 		// dropped from the manifest. Matching the OS-native `path` here was both
 		// case-sensitive and inconsistent with the rel that gets stored.
 		lower := strings.ToLower(rel)
+		// Harness config the pre-trust rules read: any ".env" file and the Codex
+		// project config. Kept narrow on purpose (pyproject.toml etc. are not).
+		if filepath.Base(lower) == ".env" || lower == ".codex/config.toml" || strings.HasSuffix(lower, "/.codex/config.toml") {
+			manifest.ConfigFiles = append(manifest.ConfigFiles, rel)
+		}
 		switch {
 		case strings.HasSuffix(lower, ".py"):
 			manifest.PythonFiles = append(manifest.PythonFiles, rel)
@@ -324,6 +477,7 @@ func Normalize(src *Source, onFile func(string)) (models.ScanManifest, error) {
 	} {
 		sort.Strings(*fl)
 	}
+	sort.Strings(manifest.ConfigFiles)
 
 	manifest.HasClaudeSDKDependency = detectClaudeSDKDependency(src.RootPath)
 	manifest.HasOpenShellArtifact = detectOpenShellArtifact(manifest.YAMLFiles, src.RootPath)
@@ -340,6 +494,10 @@ func shouldSkipDir(name string) bool {
 		// Agent-config directories — deliberately descend into them
 		// (.claude/ holds agents/skills/commands/settings; .claude-plugin/
 		// holds plugin.json / marketplace.json).
+		return false
+	case ".gemini", ".vscode", ".cursor", ".codex":
+		// Other harnesses' project config (settings, hooks, MCP, env) that takes
+		// effect when the folder is opened — read by the agent_config rules.
 		return false
 	}
 	// Skip other dot-prefixed dirs (build caches, editor metadata, etc.).
@@ -426,12 +584,35 @@ func discoverComponents(root string, m models.ScanManifest, onFile func(string))
 		"mcp.json":                   true,
 		"mcp_servers.json":           true,
 		"claude_desktop_config.json": true,
+		".mcp.json":                  true, // Claude Code project-scoped MCP servers
 	}
 	for _, p := range m.JSONFiles {
 		// Case-insensitive: MCP config names are conventionally lowercase, but a
 		// repo on a case-sensitive FS could ship MCP.json / Claude_Desktop_Config.json.
 		if mcpNames[strings.ToLower(filepath.Base(p))] {
 			out = append(out, models.AgentComponent{Kind: models.ComponentMCPConfig, Path: p})
+		}
+	}
+
+	// Pre-trust harness config (agent_config rules): Gemini settings, editor
+	// settings, agent env files, Codex config. Matched by directory + name.
+	for _, p := range m.JSONFiles {
+		dir, base := filepath.ToSlash(filepath.Dir(p)), filepath.Base(p)
+		switch {
+		case base == "settings.json" && (dir == ".gemini" || strings.HasSuffix(dir, "/.gemini")):
+			out = append(out, models.AgentComponent{Kind: models.ComponentGeminiSettings, Path: p})
+		case base == "settings.json" && (dir == ".vscode" || strings.HasSuffix(dir, "/.vscode")),
+			base != "mcp.json" && (dir == ".cursor" || strings.HasSuffix(dir, "/.cursor")):
+			out = append(out, models.AgentComponent{Kind: models.ComponentEditorSettings, Path: p})
+		}
+	}
+	for _, p := range m.ConfigFiles {
+		dir := filepath.ToSlash(filepath.Dir(p))
+		switch {
+		case filepath.Base(p) == ".env" && (p == ".env" || dir == ".gemini" || strings.HasSuffix(dir, "/.gemini")):
+			out = append(out, models.AgentComponent{Kind: models.ComponentAgentEnvFile, Path: p})
+		case filepath.Base(p) == "config.toml":
+			out = append(out, models.AgentComponent{Kind: models.ComponentCodexConfig, Path: p})
 		}
 	}
 
@@ -529,15 +710,7 @@ func discoverComponents(root string, m models.ScanManifest, onFile func(string))
 	}
 
 	// Dependency manifests at repo root only.
-	depFiles := map[string]models.Language{
-		"pyproject.toml":   models.LanguagePython,
-		"requirements.txt": models.LanguagePython,
-		"Pipfile":          models.LanguagePython,
-		"poetry.lock":      models.LanguagePython,
-		"package.json":     models.LanguageTypeScript, // best-guess; could be JS too
-		"go.mod":           models.LanguageGo,
-	}
-	for name, lang := range depFiles {
+	for name, lang := range depManifestLanguages {
 		if exists(filepath.Join(root, name)) {
 			out = append(out, models.AgentComponent{
 				Kind: models.ComponentDependencyManifest, Path: name, Language: lang,

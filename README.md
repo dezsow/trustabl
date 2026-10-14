@@ -2,18 +2,14 @@
   <img src="assets/github_banner.jpg" alt="Trustabl — open source AI agent reliability" width="100%">
 </p>
 
-Find and automatically fix guardrail gaps, unsafe tools, missing validation, and
-unbounded loops in Claude Agent SDK, OpenAI Agents SDK, Google ADK, LangChain,
-CrewAI, and MCP agents — before production.
-
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License: Apache-2.0"></a>
-  <a href="https://github.com/trustabl/trustabl/releases"><img src="https://img.shields.io/github/v/release/trustabl/trustabl" alt="Latest release"></a>
-  <a href="https://github.com/trustabl/trustabl/releases"><img src="https://img.shields.io/github/downloads/trustabl/trustabl/total?label=downloads&color=2ea043" alt="Total downloads"></a>
-  <a href="https://github.com/trustabl/trustabl/actions/workflows/test.yml"><img src="https://img.shields.io/github/actions/workflow/status/trustabl/trustabl/test.yml?branch=main&amp;label=tests" alt="Tests"></a>
-  <a href="go.mod"><img src="https://img.shields.io/github/go-mod/go-version/trustabl/trustabl" alt="Go version"></a>
+  <a href="https://github.com/trustabl/agent-reliability-analyzer/releases"><img src="https://img.shields.io/github/v/release/trustabl/agent-reliability-analyzer" alt="Latest release"></a>
+  <a href="https://github.com/trustabl/agent-reliability-analyzer/releases"><img src="https://img.shields.io/github/downloads/trustabl/agent-reliability-analyzer/total?label=downloads&color=2ea043" alt="Total downloads"></a>
+  <a href="https://github.com/trustabl/agent-reliability-analyzer/actions/workflows/test.yml"><img src="https://img.shields.io/github/actions/workflow/status/trustabl/agent-reliability-analyzer/test.yml?branch=main&amp;label=tests" alt="Tests"></a>
+  <a href="go.mod"><img src="https://img.shields.io/github/go-mod/go-version/trustabl/agent-reliability-analyzer" alt="Go version"></a>
   <br>
-  <a href="https://github.com/trustabl/trustabl-rules"><img src="https://img.shields.io/badge/rules-206-brightgreen" alt="206 detection rules"></a>
+  <a href="https://github.com/trustabl/agent-reliability-rules"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Ftrustabl%2Fagent-reliability-rules%2Fmain%2Fbadges%2Frules.json" alt="Detection rule count"></a>
   <a href="COVERAGE.md"><img src="https://img.shields.io/badge/SDKs-9-blue" alt="9 SDKs supported"></a>
   <a href="COVERAGE.md"><img src="https://img.shields.io/badge/languages-7-blue" alt="7 languages supported"></a>
   <a href="COVERAGE.md"><img src="https://img.shields.io/badge/scopes-5-blue" alt="5 detection scopes"></a>
@@ -24,6 +20,71 @@ CrewAI, and MCP agents — before production.
 # Trustabl — find and fix AI agent reliability gaps
 
 **Find what will make your AI agent fail — then fix it with one command.**
+
+Deterministic static analysis for agent code, across nine SDKs and seven languages.
+It runs entirely on your machine: no cloud scanner, no account, no code upload, no LLM.
+
+---
+
+<h3 align="center">Trustabl Partners</h3>
+<p align="center">
+  <sub>One engine, nine front doors. Install it from the catalogue you already use.</sub>
+</p>
+
+<table align="center">
+  <tr>
+    <td align="center" width="200">
+      <a href="https://registry.modelcontextprotocol.io/?q=trustabl"><b>MCP Registry</b></a><br>
+      <sub>Scan from any<br>MCP-aware client</sub>
+    </td>
+    <td align="center" width="200">
+      <a href="docs/claude-plugin.md"><b>Claude Directory</b></a><br>
+      <sub>Skills, agent and<br>scanner inside Claude</sub>
+    </td>
+    <td align="center" width="200">
+      <a href="https://www.npmjs.com/package/@trustabl/ai-sdk"><b>npm</b></a> &middot;
+      <a href="https://pypi.org/project/pydantic-ai-trustabl/"><b>PyPI</b></a><br>
+      <sub>A tool your AI SDK or<br>Pydantic AI agent calls</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <a href="https://marketplace.visualstudio.com/items?itemName=trustabl.trustabl"><b>VS Code</b></a><br>
+      <sub>Findings as you<br>write, in the editor</sub>
+    </td>
+    <td align="center">
+      <a href="https://cursor.directory/plugins/trustabl"><b>Cursor</b></a><br>
+      <sub>Same scan, wired<br>in as an MCP server</sub>
+    </td>
+    <td align="center">
+      <a href="https://github.com/trustabl/agent-reliability-analyzer/releases"><b>CLI</b></a><br>
+      <sub>Homebrew, Scoop,<br>Docker or a binary</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <a href="https://github.com/marketplace/actions/trustabl-fix-agent-reliability-issues"><b>GitHub Actions</b></a><br>
+      <sub>Gate the build<br>on a severity threshold</sub>
+    </td>
+    <td align="center">
+      <a href="https://gitlab.com/explore/catalog/trustabl-ai/components"><b>GitLab CI/CD</b></a><br>
+      <sub>Published component<br>in the catalogue</sub>
+    </td>
+    <td align="center">
+      <a href="https://bitbucket.org/hoolisoftware/trustabl-pipe"><b>Bitbucket</b></a><br>
+      <sub>Official pipe, no<br>install step needed</sub>
+    </td>
+  </tr>
+</table>
+
+<p align="center">
+  <sub>
+    Every one of these runs the same deterministic scan on your own machine.<br>
+    See <a href="docs/integrations.md">ecosystem integrations</a> for which agent SDKs are covered.
+  </sub>
+</p>
+
+---
 
 Trustabl scans an agent repository for the gaps that break agents in production:
 tool descriptions too vague for a model to know when to use them, missing retry
@@ -50,7 +111,7 @@ trustabl scan . --format json > scan.json
 trustabl enrich --input scan.json --repo . --diff --apply                     # preview, then fix
 ```
 
-185+ rules · 9 SDKs · 7 languages · human, JSON, or SARIF 2.1.0 output ·
+9 SDKs · 7 languages · human, JSON, or SARIF 2.1.0 output ·
 CI-friendly exit codes · also runs as a local stdio MCP server (`trustabl mcp`).
 
 Deepest coverage for **Claude Agent SDK**, **OpenAI Agents SDK**, **Google ADK**,
@@ -61,6 +122,51 @@ matrix.
 Scanning needs no key and no network. Applying fixes uses your own Anthropic,
 OpenAI, or Google key.
 
+## What a scan looks like
+
+Real output, scanning an agent repo that ships a Claude Agent SDK client, an MCP
+server, a subagent, and two skills:
+
+```console
+$ trustabl scan .
+
+Scan summary
+  Languages:          typescript, javascript
+  SDKs:               claude_agent_sdk
+  Tool definitions:   2    (custom tools with function bodies)
+  Agent tool grants:  14   (tool names the agent may call)
+  MCP servers:        1    (createSdkMcpServer)
+  Subagents:          1    (inbox-searcher)
+  Skills:             2    (action-creator, listener-creator)
+  Findings:           14
+  Overall score:      66%
+
+Surface readiness
+  skill:action-creator          45%  (5 findings)
+  skill:listener-creator        54%  (4 findings)
+  agent:AIClient.queryStream    64%  (2 findings)
+  subagent:inbox-searcher       79%  (1 finding)
+  tool:search_inbox             98%  (1 finding)
+  tool:read_emails             100%  (0 findings)
+
+Findings
+  inbox-searcher
+    [CSDK-201]  HIGH  Subagent is granted Bash  (agent/.claude/agents/inbox-searcher.md:1-5)
+        A subagent with shell access can run arbitrary commands if it is
+        compromised or misdirected.
+        fix: Remove `Bash` from the subagent's `tools:` list unless shell access
+        is essential. Prefer specific tools (Read, Grep, Glob) for read-only roles.
+```
+
+Three things worth noticing:
+
+- **It scores each surface separately.** A repo-wide number hides the problem;
+  `skill:action-creator` at 45% tells you where to look first.
+- **Every finding carries a fix**, not just a complaint — and
+  `trustabl enrich --apply` writes those fixes to source.
+- **The exit code is the CI gate.** `0` when nothing reaches medium severity,
+  `1` when something does, so a pipeline can stop a bad agent from shipping.
+
 ## AI agents pass their demo and fail in production
 
 The failures are rarely exotic. They are the same handful of gaps, over and over:
@@ -68,6 +174,7 @@ The failures are rarely exotic. They are the same handful of gaps, over and over
 - An agent holding shell tools with **no input guardrails**
 - A tool making an HTTP call with **no timeout**, hanging the whole run
 - **Untyped tool parameters**, so the model guesses and guesses wrong
+- **No observability wired at all**, so the first three have no trace to read
 - A tool description so vague the model calls the wrong tool — 56% of MCP tool
   descriptions fail to state their purpose clearly, and 97.1% carry at least one
   description defect (Hasan et al., *MCP Tool Descriptions Are Smelly!*,
@@ -169,7 +276,7 @@ statically configured.
 
 The binary ships with **no embedded rules**. Before the pipeline runs,
 Trustabl resolves its detection rules from a separate git repository
-([`trustabl-rules`](https://github.com/trustabl/trustabl-rules)) —
+([`agent-reliability-rules`](https://github.com/trustabl/agent-reliability-rules)) —
 fetching the latest, caching the clone locally, and falling back to the
 cache when the network is unreachable. This decouples rule updates from
 binary releases: rules can be added or changed without rebuilding the
@@ -280,8 +387,8 @@ Tool/agent AST discovery is wired for:
   superset — and is audited by the same `language: typescript` rule packs).
   TypeScript rule packs ship for the Claude Agent SDK
   (CSDK-010/011/012/013/014/016 tool rules; CSDK-120/130/131 agent rules),
-  OpenAI Agents SDK (OAI-016/017/019/022/024 tool rules; OAI-105 agent rule),
-  Google ADK (ADK-013/015/016 tool rules; ADK-109 agent rule), MCP
+  OpenAI Agents SDK (OAI-016/017/019/022/024 tool rules; OAI-105/116 agent
+  rules), Google ADK (ADK-013/015/016 tool rules; ADK-109 agent rule), MCP
   (MCP-011/012/013/014 tool rules), LangChain (LC-010/011/012/013/014 tool
   rules; LC-111 agent rule), and the Vercel AI SDK (VAI-001..008 tool/agent
   rules; VAI-012 repo rule). A TS repo for any of these no longer produces a
@@ -328,6 +435,12 @@ The rule schema's `language:` field gates per-language rule sets.
   wraps the scan and uploads SARIF to the Security tab for you; for any other
   CI, `--format sarif --output <file>` produces a SARIF 2.1.0 report that feeds
   `github/codeql-action/upload-sarif` or any SARIF-aware step.
+- **Trustabl is open core.** Everything documented here is Apache-2.0 and
+  complete for its job: the scan needs no key and no network, and autofix uses
+  your own LLM key. Policy generation, compliance mapping and signed governance
+  snapshots are Trustabl Console, a separate commercial product. See
+  [docs/open-source-vs-console.md](docs/open-source-vs-console.md) for the full
+  capability split.
 
 ## What it produces
 
@@ -336,7 +449,9 @@ files in the scanned repo. Each run produces a `ScanResult` containing:
 
 - **Findings** — one per rule hit, each with `severity`, `confidence`,
   an `explanation`, a `suggested_fix`, and the location it fired at
-  (tool file/line, agent call site, subagent file, or the manifest).
+  (tool file/line, agent call site, subagent file, or the manifest). A finding
+  in a test-path file carries `"origin": "test"` and is excluded from
+  scoring and the exit code by default — see "Test-path findings" below.
 - **Per-surface readiness scores** (one per discovered tool, agent, subagent,
   or the repo as a whole) and an **overall score** (a breadth-aware,
   badness-weighted mean — weak surfaces pull it down harder, but a single
@@ -344,6 +459,22 @@ files in the scanned repo. Each run produces a `ScanResult` containing:
 - **The discovered inventory** — tools, agents, hosted tools, MCP
   servers, subagents, skills, slash commands, plugin manifests, and
   Claude settings — surfaced at the top level for CI consumers.
+- **Observability signals** (`observability`) — the instrumentation found in
+  code, one record per fact: the vendor (OpenTelemetry, Langfuse, Logfire,
+  Phoenix/OpenInference, OpenLLMetry, Braintrust, Weave, AgentOps, MLflow,
+  Datadog LLM Observability, LangSmith) and whether it is merely **imported** or
+  actually **initialized**, with the file and line. That distinction is the
+  point: a repo that imports a tracing SDK and never starts it looks
+  instrumented in its manifest and produces no traces at all. Detected
+  statically in Python and TypeScript/JavaScript only — Trustabl does not ingest
+  runtime traces.
+
+- **Server entrypoints** (`entrypoints`, omitted when none) — Python functions a
+  server framework invokes for an external request or job: FastAPI and Flask
+  route handlers (`kind: http`, with the literal `route` when present) and Celery
+  tasks / Dramatiq actors (`kind: worker`). A fact only: no rule consumes it yet.
+  Entrypoints under `examples/`, `demo/`, `docs/` and similar directories are not
+  recorded.
 
 ### The summary's tool surface, broken out
 
@@ -426,6 +557,24 @@ terminal (TTY vs pipe, `NO_COLOR`), so the same scan can render with or without
 color. Use `--no-color`, or diff the JSON/SARIF output, when byte-stability
 matters.
 
+### Test-path findings
+
+A finding whose file lives under a test path (`tests/`, `__tests__/`,
+`testdata/`, `test_*.py`, `*_test.go`, `*.spec.ts`, …) is still reported in
+every format — nothing is silently hidden — but by default it is **excluded
+from the readiness score and does not fail the build**: a `WebSearchTool`
+declared in `tests/test_adapter.py` is not the same finding as one shipped in
+a production agent, and scoring them identically made the report
+non-actionable. Each such finding carries `"origin": "test"` in JSON, an
+`origin` property plus a `result.suppressions` entry in SARIF (excluded from
+GitHub code scanning's default alert view, still present in the raw log), and
+renders under a trailing "Test-path findings (not scored)" section in the
+human output instead of mixing into the scored groups above it.
+
+Pass `--include-test-paths` to score and fail on these findings exactly like
+any other — useful if your project ships code that legitimately lives under a
+`tests/`-shaped path.
+
 ### Diagnostics (`--verbose` / `--debug`)
 
 `--verbose` (`-v`) narrates the scan on **stderr**: rule provenance (repo, ref,
@@ -466,7 +615,8 @@ With `--format json`/`sarif` progress is off, so the stderr file is
 diagnostics-only; with `--format human` it also carries the plain `[phase]`
 progress lines.
 
-Exit codes:
+Exit codes (a test-path finding is excluded from this gate unless
+`--include-test-paths` is set — see "Test-path findings" above):
 - `0` — no findings ≥ medium severity (or no findings at all).
 - `1` — at least one finding ≥ medium severity, OR `--strict` with any
   finding present.
@@ -514,12 +664,17 @@ docker run --rm -v "$PWD:/repo" ghcr.io/trustabl/trustabl:latest scan /repo
 ### Direct download
 
 Grab a prebuilt archive for your platform from the
-[Releases page](https://github.com/trustabl/trustabl/releases). Each release
+[Releases page](https://github.com/trustabl/agent-reliability-analyzer/releases). Each release
 includes a `checksums.txt` and a build-provenance attestation; verify with:
 
 ```sh
-gh attestation verify <archive> --repo trustabl/trustabl
+gh attestation verify <archive> --repo trustabl/agent-reliability-analyzer
 ```
+
+> Archives released **before** the repository was renamed verify only under the
+> old slug (`--repo trustabl/trustabl`): the Sigstore certificate binds the
+> repository path as it was at signing time, so the recorded identity cannot
+> follow a rename.
 ## Attestation
 ### Test Usage Example
 #### **Prerequisite and setup:**
@@ -667,11 +822,11 @@ or home config:
 
 ```sh
 # Project-level (scoped to this repo)
-curl -fsSL https://raw.githubusercontent.com/trustabl/trustabl/main/agents/trustabl.md \
+curl -fsSL https://raw.githubusercontent.com/trustabl/agent-reliability-analyzer/main/agents/trustabl.md \
   -o .claude/agents/trustabl.md
 
 # Global (available in every project)
-curl -fsSL https://raw.githubusercontent.com/trustabl/trustabl/main/agents/trustabl.md \
+curl -fsSL https://raw.githubusercontent.com/trustabl/agent-reliability-analyzer/main/agents/trustabl.md \
   -o ~/.claude/agents/trustabl.md
 ```
 
@@ -752,6 +907,12 @@ trustabl scan ./repo --license-scan --bom-out bom.json  # findings + BOM with li
 # credential environment variables (SECRET-ENV-001, medium).
 trustabl scan ./repo --secret-scan
 
+# Test-path findings (a tests/ agent, test_*.py, *.spec.ts, …) are always
+# reported but excluded from scoring and the exit code by default — see
+# "Test-path findings" below. --include-test-paths scores and fails on them
+# like any other finding.
+trustabl scan ./repo --include-test-paths
+
 # JSON output for CI piping
 trustabl scan ./repo --format json
 
@@ -786,11 +947,11 @@ trustabl verify trustabl.json --key cosign.pub --no-tlog   # key-mode, offline
 trustabl rules pull
 
 # Validate a local rule-pack directory against this build's schema (CI gate
-# for the trustabl-rules repo — strict-loads every pack, fails on the first error)
-trustabl rules validate ./trustabl-rules
+# for the agent-reliability-rules repo — strict-loads every pack, fails on the first error)
+trustabl rules validate ./agent-reliability-rules
 
 # Use a custom rules repo, or pin a specific released ruleset (env: TRUSTABL_RULES_REPO).
-# Default pulls the latest reviewed rules from trustabl-rules main; pin a tag for stability.
+# Default pulls the latest reviewed rules from agent-reliability-rules main; pin a tag for stability.
 trustabl scan ./repo --rules-repo https://github.com/org/my-rules
 trustabl scan ./repo --rules-ref v0.1.0
 
@@ -900,6 +1061,20 @@ step: no AST parsing, fast, and safe on any repo. When no manifests are found
 (or none declare a recognized SDK), forge exits `1` and tells you what to pass
 via `--policy`.
 
+**Language detection.** The same manifests tell forge which language each SDK
+is declared in: `pyproject.toml`, `requirements.txt`, `Pipfile` and
+`poetry.lock` mean Python, `package.json` means TypeScript, `go.mod` means Go.
+That selects the language blocks of the Runtime Tracing section. Pass
+`--lang python,typescript,go` to add a language. `--lang` does not select a
+rule pack, so a brand-new repo with no manifest yet needs `--policy` as well
+(see the last example below). The same languages filter
+the rule sections: an SDK declared only in `go.mod` gets only its Go rules
+and the rules that apply in every language, so a Go-only Google ADK repo gets
+the Go tracing recipe, the language-independent ADK rules, and a note that no
+Go-specific ADK rules exist yet. A category given only through `--policy`, or
+also declared in a manifest forge cannot place (such as `composer.json`), keeps
+all of its rules.
+
 ```bash
 # Auto-detect SDKs from the current directory
 trustabl forge
@@ -920,6 +1095,9 @@ trustabl forge --rules-ref v0.3.0
 
 # Backward-compatible: generate only the Agent Skill (CSKILL-*) rules
 trustabl forge --policy claude_skill
+
+# New Go repo with no go.mod yet
+trustabl forge --policy google_adk --lang go
 ```
 
 **Available policy categories** (pass to `--policy`):
@@ -936,6 +1114,8 @@ trustabl forge --policy claude_skill
 | `vercel_ai` | Vercel AI SDK (TypeScript) |
 | `autogen` | AutoGen / AG2 (Python) |
 | `claude_skill` | Claude Code skills (`SKILL.md`) |
+| `raw_llm_sdk` | Bare `anthropic` / `openai` client tool loops (not an agent framework) |
+| `agent_config` | Harness config committed to a repo that runs code or grants authority before the folder is trusted (`.claude/settings.json`, `.mcp.json`, `.gemini/.env`, `.vscode/settings.json`, `.codex/config.toml`) |
 | `openshell` | Shell-invocation tools (no rules in the current pack) |
 
 Multiple categories are comma-separated: `--policy openai_sdk,mcp`.
@@ -944,9 +1124,26 @@ Multiple categories are comma-separated: `--policy openai_sdk,mcp`.
 
 - A frontmatter block (`name: trustabl-pre-coding`, `allowed-tools: Read`,
   `disable-model-invocation: false`).
-- A passive stamp comment embedding the rules SHA, date, schema version, and
-  detected SDK list — so you know exactly which ruleset produced the file
-  and when to regenerate.
+- A passive stamp comment embedding the rules SHA, date, schema version,
+  template (layout) version, and detected SDK list — so you know exactly
+  which ruleset and layout produced the file and when to regenerate.
+- A `## How to Apply These Constraints` apply-loop section, immediately after
+  the stamp: a static four-step procedure telling the model to check each
+  definition it writes against the matching constraints, name any violation
+  by rule ID, apply that rule's directive, and log the repair. This is a
+  self-check the model performs — it does not run `trustabl scan` itself;
+  scanning the resulting code remains a separate step.
+- A `## Runtime Tracing` section: how to make the agent emit OpenTelemetry
+  spans, then how to label them with `agent-reliability-otel-labels` (run
+  identity, step order, tool-call fingerprints, retry count, side-effect class,
+  exit reason). It has a block per selected language (Python, TypeScript, Go)
+  and a verified setup for Google ADK (Python, Go), the Vercel AI SDK (TypeScript),
+  Pydantic AI (Python), the OpenAI Agents SDK (Python, TypeScript),
+  LangChain / LangGraph (Python), CrewAI (Python), AutoGen (Python), and MCP
+  client sessions (Python). Other frameworks get the language block only.
+  Non-OpenTelemetry tracing stacks are not covered. The section is left out
+  when no supported language is found, and when `claude_skill` is the only
+  category (Agent Skills are `SKILL.md` files, not agent code to trace).
 - One `## SDK Name` section per detected SDK, each containing `### Tool Rules`,
   `### Agent Rules`, `### Subagent Rules`, `### Repo Rules`, and
   `### Skill Rules` subsections (empty subsections are omitted).
@@ -955,8 +1152,9 @@ Multiple categories are comma-separated: `--policy openai_sdk,mcp`.
 
 Drop the output into `.claude/skills/trustabl-pre-coding/SKILL.md` in the
 agent repo and Claude Code will invoke it automatically before any agent code
-is written. Re-run `trustabl forge` after adding a new SDK dependency or after
-pulling a rules update to refresh the constraints.
+is written. Re-run `trustabl forge` after adding a new SDK dependency, after
+pulling a rules update, or after upgrading to a forge version with a newer
+template — `trustabl forge check` reports staleness from either cause.
 
 ### Continuous integration
 
@@ -1104,7 +1302,7 @@ scoop install trustabl
 **Install the extension:**
 
 ```bash
-gemini extensions install https://github.com/trustabl/trustabl
+gemini extensions install https://github.com/trustabl/agent-reliability-analyzer
 ```
 
 **Register the MCP server** so Gemini CLI can call `mcp__trustabl__scan`. Add
@@ -1232,13 +1430,13 @@ The scan only **fails** (exit 2) when nothing usable remains:
 | TypeScript discovery | `internal/analysis/ts_discovery.go`, `ts_agents.go`, `ts_mcp_servers.go`, `ts_handler_facts.go`, `ts_openai_tools.go`, `ts_openai_agents.go`, `ts_openai_hosted_tools.go`, `ts_openai_mcp_servers.go`, `ts_openai_guardrails.go`, `ts_openai_sessions.go`, `ts_adk_tools.go`, `ts_adk_agents.go`, `ts_adk_hosted_tools.go`, `astutil/ts.go` |
 | Detector runtime   | `internal/analysis/detectors/`           |
 | Rule source        | `internal/rulesource/` (git fetch + cache + schema-version gate) |
-| Detector rules     | external `trustabl-rules` repo (tests: `testdata/rules-fixture/`) |
+| Detector rules     | external `agent-reliability-rules` repo (tests: `testdata/rules-fixture/`) |
 | Rule engine        | `internal/rules/{schema,loader,evaluator,predicates,rule_detector}.go` |
 | Scoring engine     | `internal/analysis/scoring.go`           |
 | Report renderer    | `internal/review/diff.go` (human), `internal/sarif/render.go` (SARIF), JSON marshal in `cmd/trustabl` |
 | LLM config         | `internal/llm/` (key storage · masking · validation) |
 
-Rule packs live in the separate `trustabl-rules` git repository (grouped
+Rule packs live in the separate `agent-reliability-rules` git repository (grouped
 `{claude_sdk,openai_sdk,google_adk,mcp}/`), resolved at scan time rather
 than embedded in the binary. Naming convention: `CSDK-NNN` for Claude
 Agent SDK rules (CSDK-0xx tool-scope, CSDK-1xx agent + subagent-scope),

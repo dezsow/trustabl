@@ -27,6 +27,17 @@ func tsHandlerFacts(handler *sitter.Node, src []byte) map[string]string {
 			}
 			return true
 		}
+		// Error-contract facts. The Python has_raise / has_try_except
+		// predicates match the "raise_statement" node type, which the TS
+		// grammar does not have — its equivalents are "throw_statement" and
+		// "try_statement". Recording them here lets those predicates branch on
+		// language the way has_shell_call already does.
+		switch n.Type() {
+		case "throw_statement":
+			out["throws"] = "true"
+		case "try_statement":
+			out["try_catch"] = "true"
+		}
 		if n.Type() != "call_expression" {
 			return true
 		}
@@ -42,6 +53,9 @@ func tsHandlerFacts(handler *sitter.Node, src []byte) map[string]string {
 			out["http_call"] = "true"
 			if urlArgIsDynamic(n, src) {
 				out["dynamic_url"] = "true"
+				if !URLArgSchemePinned(firstArg(n), src) {
+					out["url_scheme_unpinned"] = "true"
+				}
 			}
 			if !httpCallHasTimeout(n, src) {
 				out["http_no_timeout"] = "true"
@@ -64,6 +78,13 @@ func tsHandlerFacts(handler *sitter.Node, src []byte) map[string]string {
 			"fs.appendFileSync", "fs.createWriteStream",
 			"fsPromises.writeFile", "fsPromises.appendFile":
 			out["writes_fs"] = "true"
+		case "console.log", "console.info", "console.debug", "process.stdout.write":
+			// STDOUT ONLY. console.warn/console.error and process.stderr.write
+			// are deliberately absent: Node routes them to stderr, which is the
+			// correct destination for diagnostics and — on an MCP stdio server —
+			// the only safe one, since stdout carries the JSON-RPC frames.
+			// Flagging them would report the remediation as the defect.
+			out["prints_stdout"] = "true"
 		case "eval":
 			// Bare `eval` callee only — callee text for `retrieval(x)` is
 			// "retrieval", so this exact-match eliminates the false-positive.
@@ -170,4 +191,13 @@ func httpCallHasTimeout(call *sitter.Node, src []byte) bool {
 		}
 	}
 	return false
+}
+
+// firstArg returns a call's first named argument, or nil.
+func firstArg(call *sitter.Node) *sitter.Node {
+	args := call.ChildByFieldName("arguments")
+	if args == nil || args.NamedChildCount() == 0 {
+		return nil
+	}
+	return args.NamedChild(0)
 }

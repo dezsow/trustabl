@@ -72,6 +72,34 @@ func (e MatchExpr) EvaluateAgent(a models.AgentDef, inv models.RepoInventory) bo
 	if e.AgentRunCallUsageLimitsMissing != nil && PredAgentRunCallUsageLimitsMissing(a, inv) != *e.AgentRunCallUsageLimitsMissing {
 		return false
 	}
+	if e.AgentRunCallWallClockTimeoutMissing != nil && PredAgentRunCallWallClockTimeoutMissing(a, inv) != *e.AgentRunCallWallClockTimeoutMissing {
+		return false
+	}
+	if e.AgentKwargsObserved != nil && PredAgentKwargsObserved(a) != *e.AgentKwargsObserved {
+		return false
+	}
+	if e.AgentCheckpointerInMemory != nil && PredAgentCheckpointerInMemory(a) != *e.AgentCheckpointerInMemory {
+		return false
+	}
+	if e.AgentServerReachable != nil && PredAgentServerReachable(a, inv) != *e.AgentServerReachable {
+		return false
+	}
+	if e.RepoLangGraphPlatformConfigPresent != nil && PredRepoLangGraphPlatformConfigPresent(inv) != *e.RepoLangGraphPlatformConfigPresent {
+		return false
+	}
+	if e.AgentMCPServerKwargMissing != nil && !PredAgentMCPServerKwargMissing(*e.AgentMCPServerKwargMissing, a) {
+		return false
+	}
+	// Cross-scope predicate. EvaluateAgent already receives the inventory, so a
+	// repo-level fact is available here. The agent-scope observability rules gate
+	// on it so they read "this agent is the outlier" rather than repeating the
+	// repo's missing-observability complaint once per agent.
+	if e.RepoHasObservability != nil && !PredRepoHasObservability(*e.RepoHasObservability, inv) {
+		return false
+	}
+	if e.AgentFileURLForceDownload != nil && PredAgentFileURLForceDownload(a) != *e.AgentFileURLForceDownload {
+		return false
+	}
 	return true
 }
 
@@ -111,6 +139,60 @@ func (e MatchExpr) EvaluateRepo(p models.RepoProfile, inv models.RepoInventory) 
 	if e.RepoUsesDefaultTracing != nil && !PredRepoUsesDefaultTracing(*e.RepoUsesDefaultTracing, inv) {
 		return false
 	}
+	if e.RepoHasObservability != nil && !PredRepoHasObservability(*e.RepoHasObservability, inv) {
+		return false
+	}
+	if e.RepoLangGraphPlatformConfigPresent != nil && PredRepoLangGraphPlatformConfigPresent(inv) != *e.RepoLangGraphPlatformConfigPresent {
+		return false
+	}
+	if e.RepoRawAnthropicToolOutputInSystem != nil && inv.RawAnthropicToolOutputInSystemPrompt != *e.RepoRawAnthropicToolOutputInSystem {
+		return false
+	}
+	if e.RepoRawOpenAIToolOutputInSystem != nil && inv.RawOpenAIToolOutputInSystemMessage != *e.RepoRawOpenAIToolOutputInSystem {
+		return false
+	}
+	if e.RepoObservabilityInspectable != nil && !PredRepoObservabilityInspectable(*e.RepoObservabilityInspectable, inv) {
+		return false
+	}
+	if e.RepoObservabilityInitialized != nil && !PredRepoObservabilityInitialized(*e.RepoObservabilityInitialized, inv) {
+		return false
+	}
+	if e.RepoObservabilityDeclared != nil && !PredRepoObservabilityDeclared(*e.RepoObservabilityDeclared, p) {
+		return false
+	}
+	if len(e.RepoObservabilityVendor) > 0 && !PredRepoObservabilityVendor(e.RepoObservabilityVendor, inv) {
+		return false
+	}
+	if e.RepoObservabilityConsoleOnly != nil && !PredRepoObservabilityConsoleOnly(*e.RepoObservabilityConsoleOnly, inv) {
+		return false
+	}
+	if e.RepoObservabilityCapturesContent != nil && !PredRepoObservabilityCapturesContent(*e.RepoObservabilityCapturesContent, inv) {
+		return false
+	}
+	if e.RepoProjectMCPAutoenable != nil && (len(inv.ProjectConfig.MCPAutoEnable) > 0) != *e.RepoProjectMCPAutoenable {
+		return false
+	}
+	if e.RepoProjectHookRunsUntrustedCmd != nil && (len(inv.ProjectConfig.RiskyHooks) > 0) != *e.RepoProjectHookRunsUntrustedCmd {
+		return false
+	}
+	if e.RepoWorkspaceEnvOverridesTrust != nil && (len(inv.ProjectConfig.TrustOverrideEnv) > 0) != *e.RepoWorkspaceEnvOverridesTrust {
+		return false
+	}
+	if e.RepoEditorAgentAutoApprove != nil && (len(inv.ProjectConfig.EditorAutoApprove) > 0) != *e.RepoEditorAgentAutoApprove {
+		return false
+	}
+	if e.RepoMCPConfigLaunchesLocalCommand != nil && (len(inv.ProjectConfig.LocalMCPLaunch) > 0) != *e.RepoMCPConfigLaunchesLocalCommand {
+		return false
+	}
+	if e.RepoOtelLabelsInstalled != nil && !PredRepoOtelLabelsInstalled(*e.RepoOtelLabelsInstalled, p, inv) {
+		return false
+	}
+	if e.RepoOtelLabelsInitialized != nil && !PredRepoOtelLabelsInitialized(*e.RepoOtelLabelsInitialized, inv) {
+		return false
+	}
+	if e.RepoOtelLabelsImplemented != nil && !PredRepoOtelLabelsImplemented(*e.RepoOtelLabelsImplemented, inv) {
+		return false
+	}
 	if len(e.RepoClaudeDefaultModeIs) > 0 && !PredRepoClaudeDefaultModeIs(e.RepoClaudeDefaultModeIs, inv) {
 		return false
 	}
@@ -118,6 +200,12 @@ func (e MatchExpr) EvaluateRepo(p models.RepoProfile, inv models.RepoInventory) 
 		return false
 	}
 	if e.RepoClaudeOptionsMaxTurnsMissing != nil && PredRepoClaudeOptionsMaxTurnsMissing(inv) != *e.RepoClaudeOptionsMaxTurnsMissing {
+		return false
+	}
+	if e.RepoClaudeOptionsDisallowedToolsMissing != nil && PredRepoClaudeOptionsDisallowedToolsMissing(inv) != *e.RepoClaudeOptionsDisallowedToolsMissing {
+		return false
+	}
+	if e.RepoClaudeOptionsModeWithoutKwarg != nil && !PredRepoClaudeOptionsModeWithoutKwarg(*e.RepoClaudeOptionsModeWithoutKwarg, inv) {
 		return false
 	}
 	return true
@@ -193,6 +281,9 @@ func (e MatchExpr) EvaluateSkill(s models.SkillDef, inv models.RepoInventory) bo
 	if len(e.SkillAllowsTool) > 0 && !PredSkillAllowsTool(s, e.SkillAllowsTool) {
 		return false
 	}
+	if len(e.SkillAllowsUnrestrictedTool) > 0 && !PredSkillAllowsUnrestrictedTool(s, e.SkillAllowsUnrestrictedTool) {
+		return false
+	}
 	if e.SkillModelInvocable != nil && PredSkillModelInvocable(s) != *e.SkillModelInvocable {
 		return false
 	}
@@ -236,6 +327,9 @@ func (e MatchExpr) EvaluateSkill(s models.SkillDef, inv models.RepoInventory) bo
 		return false
 	}
 	if len(e.SkillDescriptionHasText) > 0 && !PredSkillDescriptionHasText(e.SkillDescriptionHasText, s) {
+		return false
+	}
+	if e.SkillTextMatches != nil && !PredSkillTextMatches(*e.SkillTextMatches, s) {
 		return false
 	}
 	return true
@@ -305,6 +399,9 @@ func (e MatchExpr) EvaluateTool(t models.ToolDef, pf analysis.ParsedFile) bool {
 	if e.HasDynamicURLCall != nil && PredHasDynamicURLCall(t, pf) != *e.HasDynamicURLCall {
 		return false
 	}
+	if e.HasUnpinnedSchemeURLCall != nil && PredHasUnpinnedSchemeURLCall(t, pf) != *e.HasUnpinnedSchemeURLCall {
+		return false
+	}
 	if e.HasHTTPCallWithoutTimeout != nil && PredHasHTTPCallWithoutTimeout(t) != *e.HasHTTPCallWithoutTimeout {
 		return false
 	}
@@ -365,8 +462,8 @@ var predicatesByScope = map[models.Scope]map[string]bool{
 		"has_raise": true, "has_try_except": true, "has_shell_call": true,
 		"has_code_exec_call": true, "has_print_call": true,
 		"has_write_call": true, "has_dynamic_url_call": true,
-		"has_http_call_without_timeout": true,
-		"name_in":                       true, "name_has_prefix": true, "has_body_text": true,
+		"has_http_call_without_timeout": true, "has_unpinned_scheme_url_call": true,
+		"name_in": true, "name_has_prefix": true, "has_body_text": true,
 		"has_description_text": true, "description_length_lt": true,
 		"param_name_matches": true, "call_without_kwarg": true,
 		"call_uses_unnormalized_path_param": true,
@@ -380,6 +477,17 @@ var predicatesByScope = map[models.Scope]map[string]bool{
 		"agent_is_subagent_of_any":        true,
 		"agent_hosted_tool_kwarg_present": true, "agent_hosted_tool_kwarg_value": true,
 		"agent_run_call_max_turns_missing": true, "agent_run_call_usage_limits_missing": true,
+		// Dual-scope: a repo-level fact used to gate agent-scope observability
+		// rules. EvaluateAgent receives the inventory, so this is free.
+		"repo_has_observability":                    true,
+		"agent_mcp_server_kwarg_missing":            true,
+		"agent_file_url_force_download":             true,
+		"agent_run_call_wall_clock_timeout_missing": true,
+		"agent_kwargs_observed":                     true,
+		"agent_checkpointer_in_memory":              true,
+		"agent_server_reachable":                    true,
+		// Dual-scope (see EvaluateAgent): LangGraph Platform injects a checkpointer.
+		"repo_langgraph_platform_config_present": true,
 	},
 	models.ScopeSubagent: {
 		"subagent_grants_tool": true,
@@ -387,6 +495,7 @@ var predicatesByScope = map[models.Scope]map[string]bool{
 	models.ScopeSkill: {
 		"skill_allows_unrestricted_shell":               true,
 		"skill_allows_tool":                             true,
+		"skill_allows_unrestricted_tool":                true,
 		"skill_model_invocable":                         true,
 		"skill_body_has_dynamic_exec":                   true,
 		"skill_dynamic_exec_touches_network_or_secrets": true,
@@ -402,13 +511,34 @@ var predicatesByScope = map[models.Scope]map[string]bool{
 		"skill_body_has_text":                           true,
 		"skill_name_has_text":                           true,
 		"skill_description_has_text":                    true,
+		"skill_text_matches":                            true,
 	},
 	models.ScopeRepo: {
 		"repo_has_sdk_in_code":   true,
 		"repo_component_present": true, "repo_uses_default_tracing": true,
-		"repo_claude_default_mode_is":            true,
-		"repo_claude_options_permission_mode_is": true,
-		"repo_claude_options_max_turns_missing":  true,
+		"repo_claude_default_mode_is":                  true,
+		"repo_claude_options_permission_mode_is":       true,
+		"repo_claude_options_max_turns_missing":        true,
+		"repo_claude_options_disallowed_tools_missing": true,
+		"repo_claude_options_mode_without_kwarg":       true,
+		"repo_has_observability":                       true,
+		"repo_observability_inspectable":               true,
+		"repo_observability_initialized":               true,
+		"repo_observability_declared":                  true,
+		"repo_observability_vendor":                    true,
+		"repo_observability_console_only":              true,
+		"repo_observability_captures_content":          true,
+		"repo_otel_labels_installed":                   true,
+		"repo_otel_labels_initialized":                 true,
+		"repo_otel_labels_implemented":                 true,
+		"repo_langgraph_platform_config_present":       true,
+		"repo_raw_anthropic_tool_output_in_system":     true,
+		"repo_raw_openai_tool_output_in_system":        true,
+		"repo_project_mcp_autoenable":                  true,
+		"repo_project_hook_runs_untrusted_command":     true,
+		"repo_workspace_env_overrides_trust":           true,
+		"repo_editor_agent_auto_approve":               true,
+		"repo_mcp_config_launches_local_command":       true,
 	},
 }
 
@@ -434,6 +564,7 @@ func (e MatchExpr) setPredicateNames() []string {
 	add(e.HasPrintCall != nil, "has_print_call")
 	add(e.HasWriteCall != nil, "has_write_call")
 	add(e.HasDynamicURLCall != nil, "has_dynamic_url_call")
+	add(e.HasUnpinnedSchemeURLCall != nil, "has_unpinned_scheme_url_call")
 	add(e.HasHTTPCallWithoutTimeout != nil, "has_http_call_without_timeout")
 	add(len(e.NameIn) > 0, "name_in")
 	add(len(e.NameHasPrefix) > 0, "name_has_prefix")
@@ -459,11 +590,18 @@ func (e MatchExpr) setPredicateNames() []string {
 	add(e.AgentHostedToolKwargValue != nil, "agent_hosted_tool_kwarg_value")
 	add(e.AgentRunCallMaxTurnsMissing != nil, "agent_run_call_max_turns_missing")
 	add(e.AgentRunCallUsageLimitsMissing != nil, "agent_run_call_usage_limits_missing")
+	add(e.AgentMCPServerKwargMissing != nil, "agent_mcp_server_kwarg_missing")
+	add(e.AgentFileURLForceDownload != nil, "agent_file_url_force_download")
+	add(e.AgentRunCallWallClockTimeoutMissing != nil, "agent_run_call_wall_clock_timeout_missing")
+	add(e.AgentKwargsObserved != nil, "agent_kwargs_observed")
+	add(e.AgentCheckpointerInMemory != nil, "agent_checkpointer_in_memory")
+	add(e.AgentServerReachable != nil, "agent_server_reachable")
 	// Subagent scope
 	add(len(e.SubagentGrantsTool) > 0, "subagent_grants_tool")
 	// Skill scope
 	add(e.SkillAllowsUnrestrictedShell != nil, "skill_allows_unrestricted_shell")
 	add(len(e.SkillAllowsTool) > 0, "skill_allows_tool")
+	add(len(e.SkillAllowsUnrestrictedTool) > 0, "skill_allows_unrestricted_tool")
 	add(e.SkillModelInvocable != nil, "skill_model_invocable")
 	add(e.SkillBodyHasDynamicExec != nil, "skill_body_has_dynamic_exec")
 	add(e.SkillDynamicExecTouchesNetworkOrSecrets != nil, "skill_dynamic_exec_touches_network_or_secrets")
@@ -479,6 +617,7 @@ func (e MatchExpr) setPredicateNames() []string {
 	add(len(e.SkillBodyHasText) > 0, "skill_body_has_text")
 	add(len(e.SkillNameHasText) > 0, "skill_name_has_text")
 	add(len(e.SkillDescriptionHasText) > 0, "skill_description_has_text")
+	add(e.SkillTextMatches != nil, "skill_text_matches")
 	// Repo scope
 	add(len(e.RepoHasSDKInCode) > 0, "repo_has_sdk_in_code")
 	add(len(e.RepoComponentPresent) > 0, "repo_component_present")
@@ -486,6 +625,26 @@ func (e MatchExpr) setPredicateNames() []string {
 	add(len(e.RepoClaudeDefaultModeIs) > 0, "repo_claude_default_mode_is")
 	add(len(e.RepoClaudeOptionsPermissionModeIs) > 0, "repo_claude_options_permission_mode_is")
 	add(e.RepoClaudeOptionsMaxTurnsMissing != nil, "repo_claude_options_max_turns_missing")
+	add(e.RepoClaudeOptionsDisallowedToolsMissing != nil, "repo_claude_options_disallowed_tools_missing")
+	add(e.RepoClaudeOptionsModeWithoutKwarg != nil, "repo_claude_options_mode_without_kwarg")
+	add(e.RepoProjectMCPAutoenable != nil, "repo_project_mcp_autoenable")
+	add(e.RepoProjectHookRunsUntrustedCmd != nil, "repo_project_hook_runs_untrusted_command")
+	add(e.RepoWorkspaceEnvOverridesTrust != nil, "repo_workspace_env_overrides_trust")
+	add(e.RepoEditorAgentAutoApprove != nil, "repo_editor_agent_auto_approve")
+	add(e.RepoMCPConfigLaunchesLocalCommand != nil, "repo_mcp_config_launches_local_command")
+	add(e.RepoHasObservability != nil, "repo_has_observability")
+	add(e.RepoObservabilityInspectable != nil, "repo_observability_inspectable")
+	add(e.RepoObservabilityInitialized != nil, "repo_observability_initialized")
+	add(e.RepoObservabilityDeclared != nil, "repo_observability_declared")
+	add(e.RepoLangGraphPlatformConfigPresent != nil, "repo_langgraph_platform_config_present")
+	add(e.RepoRawAnthropicToolOutputInSystem != nil, "repo_raw_anthropic_tool_output_in_system")
+	add(e.RepoRawOpenAIToolOutputInSystem != nil, "repo_raw_openai_tool_output_in_system")
+	add(len(e.RepoObservabilityVendor) > 0, "repo_observability_vendor")
+	add(e.RepoObservabilityConsoleOnly != nil, "repo_observability_console_only")
+	add(e.RepoObservabilityCapturesContent != nil, "repo_observability_captures_content")
+	add(e.RepoOtelLabelsInstalled != nil, "repo_otel_labels_installed")
+	add(e.RepoOtelLabelsInitialized != nil, "repo_otel_labels_initialized")
+	add(e.RepoOtelLabelsImplemented != nil, "repo_otel_labels_implemented")
 	return n
 }
 

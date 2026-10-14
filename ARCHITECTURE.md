@@ -120,7 +120,7 @@ Adding a new tool-discovery language requires:
    `ts_mcp_servers.go`).
 3. Per-language predicate implementations in `internal/rules/predicates.go`
    (since AST node types differ across languages).
-4. New rule files under `<category>/` in the external `trustabl-rules`
+4. New rule files under `<category>/` in the external `agent-reliability-rules`
    repository declaring `language: <new>`.
 
 ---
@@ -132,7 +132,7 @@ Adding a new tool-discovery language requires:
 Before the pipeline runs, `cmd/trustabl` resolves the detection rules. The
 binary embeds none; `rulesource.Resolve` fetches them from the rules git
 repository (`DefaultRepoURL`, currently
-`https://github.com/trustabl/trustabl-rules`; overridable with
+`https://github.com/trustabl/agent-reliability-rules`; overridable with
 `--rules-repo` / `TRUSTABL_RULES_REPO`) via go-git and caches the clone under
 `os.UserCacheDir()/trustabl/rules/<sha>/`, with a `current` pointer file
 naming the active commit. The clone lands via a temp dir + atomic rename, and
@@ -190,7 +190,7 @@ engine verifies against — so the digest and signature can never drift. Signing
 code (private-key handling) lives only in `cmd/rulesctl`/`internal/rulepub` and
 never links into the scanner binary, preserving `rulesign`'s verify-only
 guarantee. The CI publish/promote workflow lives in the rules repo
-(`trustabl-rules/.github/workflows/publish.yml`).
+(`agent-reliability-rules/.github/workflows/publish.yml`).
 
 **Bundle path contract.** A rule pack's file paths must be portable so the
 on-disk install always equals the verified digest. `rulesign.ValidateBundlePath`
@@ -383,14 +383,14 @@ flowchart TD
 
     subgraph S1["Step 1 — Recon"]
         recon["ingestion.Recon"]
-        profile[["RepoProfile<br/>Languages · SDKDeps · Manifest · Components"]]
+        profile[["RepoProfile<br/>Languages · SDKDeps · ObsDeps · OtelLabelsDeclaredIn · Manifest · Components"]]
         recon --> profile
     end
 
     subgraph S2["Step 2 — Inventory (per-language AST)"]
-        disc["analysis.DiscoverTools<br/>DiscoverAgents<br/>DiscoverGuardrails<br/>DiscoverSessions<br/>DiscoverSubagents<br/>DiscoverSkills<br/>DiscoverDependencies<br/>DiscoverSlashCommands<br/>DiscoverPlugins<br/>DiscoverClaudeSettings<br/>DiscoverADKAgents<br/>DiscoverADKTools<br/>DiscoverClaudeAgentOptions<br/>LangChain/CrewAI/AutoGen/PydanticAI (Py)<br/>TS: OpenAI/ADK/LangChain/Vercel/MCP-proper<br/>Go/CSharp/PHP/Rust MCP"]
+        disc["analysis.DiscoverTools<br/>DiscoverAgents<br/>DiscoverGuardrails<br/>DiscoverSessions<br/>DiscoverSubagents<br/>DiscoverSkills<br/>DiscoverDependencies<br/>DiscoverSlashCommands<br/>DiscoverPlugins<br/>DiscoverClaudeSettings<br/>DiscoverADKAgents<br/>DiscoverADKTools<br/>DiscoverClaudeAgentOptions<br/>DiscoverAgentRunCalls<br/>DiscoverEntrypoints<br/>ApplyEntrypointReachability<br/>DiscoverLangGraphNodes<br/>DetectRawLLMToolOutputInSystem<br/>DiscoverObservability<br/>LangChain/CrewAI/AutoGen/PydanticAI (Py)<br/>TS: OpenAI/ADK/LangChain/Vercel/MCP-proper<br/>Go/CSharp/PHP/Rust MCP"]
         edges["analysis.ResolveEdges"]
-        inv[["RepoInventory<br/>Tools · Agents · Guardrails · Sessions<br/>SDKsDetected · HasShellInvocations · UsesDefaultTracing<br/>Dependencies (BOM)<br/>MCPServers · Subagents · Skills · SlashCommands<br/>PluginManifests · ClaudeSettings · ClaudeAgentOptions"]]
+        inv[["RepoInventory<br/>Tools · Agents · Guardrails · Sessions<br/>SDKsDetected · HasShellInvocations · UsesDefaultTracing<br/>ObservabilitySignals · OtelLabelsSignals<br/>Dependencies (BOM)<br/>MCPServers · Subagents · Skills · SlashCommands<br/>PluginManifests · ClaudeSettings · ClaudeAgentOptions<br/>AgentRunCalls · Entrypoints"]]
         disc --> edges --> inv
     end
 
@@ -464,6 +464,30 @@ remote repos). `ingestion.Recon` then walks the source tree and returns a
 
 Recon must stay cheap. No tree-sitter parses here.
 
+**Pre-trust harness config (category `agent_config`, `schema_version` 23).**
+The walk descends into `.gemini/`, `.vscode/`, `.cursor/` and `.codex/` (it
+skips every other dot-directory), keeps any file named `.env` and
+`.codex/config.toml` in `ScanManifest.ConfigFiles`, and classifies the results as
+components: `mcp_config` (now also `.mcp.json`, `.cursor/mcp.json`,
+`.vscode/mcp.json`), `gemini_settings`, `editor_settings` (`.vscode/settings.json`,
+`.cursor/*.json` other than `mcp.json`), `agent_env_file` (root `.env`,
+`.gemini/.env`) and `codex_config`. `analysis.DiscoverProjectConfig`
+([project_config.go](internal/analysis/project_config.go)) turns them into
+`RepoInventory.ProjectConfig` (`ProjectConfigFacts`): sorted, deduped
+`ConfigHit{file, line, reason}` lists behind five repo-scope predicates
+(`repo_project_mcp_autoenable`, `repo_project_hook_runs_untrusted_command`,
+`repo_workspace_env_overrides_trust`, `repo_editor_agent_auto_approve`,
+`repo_mcp_config_launches_local_command`) read by AGCFG-004..007 and MCPCFG-002.
+Settings files are parsed as JSONC (comments and trailing commas stripped), Codex
+as TOML. **Env files are read for key names only**: a value is never stored,
+logged or placed in a finding. Root `.env` uses a narrow key set
+(`GEMINI_SANDBOX*`, `*_PROXY_COMMAND`); `.gemini/.env` and `.codex/config.toml`
+also check `*_BASE_URL`, `NODE_OPTIONS` and `LD_PRELOAD`. Unlike other repo-scope
+rules, an `agent_config` finding is attributed to the first path-sorted hit's
+file and line (`configHitLocation` in `rule_detector.go`), so `pathclass` can tag
+a vendored fixture as test-origin. The pack loads unconditionally and the
+`agent_config` `applies_to` token skips the SDK gate.
+
 ### Step 2 — Inventory ([internal/analysis/](internal/analysis/))
 
 For each language recon cleared, do the AST work and produce a `RepoInventory`:
@@ -479,6 +503,128 @@ For each language recon cleared, do the AST work and produce a `RepoInventory`:
   decorated functions.
 - **DiscoverSessions** — finds construction sites for `*Session` classes from
   the agents SDK.
+- **DiscoverObservability** (`observability.go`) — one pass over the parsed
+  Python and TS/JS files emitting a typed `ObservabilitySignal` per
+  observability fact found: the vendor (`otel`, `langfuse`, `logfire`,
+  `openinference`, `openllmetry`, `braintrust`, `weave`, `agentops`, `mlflow`,
+  `datadog_llmobs`, `langsmith`, `opik`, `native`) and a `Kind` grading the
+  evidence — `import` (module imported), `init` (provider set or vendor client
+  constructed), `exporter` (span exporter, normalized to its sink: `console`,
+  `otlp`, `jaeger`, `zipkin`, `memory`), `content_capture` (a switch sending
+  full prompt/response text to the backend), `instrument_kwarg` (a per-agent
+  opt-in). The import-vs-init split is load-bearing: an import alone proves the
+  package is present, only an init proves traces have somewhere to go, and
+  `OBS-001` fires on exactly that gap. TS init matching is import-gated (names
+  like `NodeSDK` are too generic to match ungated); the Python side gates its
+  own generic bare (receiver-less) callee names the same way — `init_logger`
+  and `autolog` only count as evidence when the file also imports `braintrust`
+  / `mlflow` respectively, since an ungated match would fire on any same-named
+  local helper function. Language dispatch is by extension, so Go/C#/PHP/Rust
+  files in `allParsed` contribute nothing rather than being run through the
+  Python matcher. Exporter and content-capture detection (`obsExporterNames`,
+  `obsContentCaptureKwargs`/`obsContentCaptureEnvVars`) is Python-only today —
+  `tsObservabilitySignals` has no equivalent walk — which is why `OBS-002` and
+  `OBS-003` are the only observability rules that set `language: python`
+  explicitly rather than firing across every SDK in their `applies_to`.
+  Wired in `scanner.go` after `ResolveEdges` because it reads `allParsed`
+  (Python + TS/JS), unlike `computeUsesDefaultTracing`, which is Python-only.
+
+  `DiscoverAgentObservabilitySignals` (same file) is the AgentDef-level
+  counterpart, called separately in `scanner.go` and combined with the
+  file-level pass via `analysis.MergeObservabilitySignals` (which re-sorts the
+  union — concatenating two independently-sorted slices does not itself
+  produce a sorted one). It covers the three SDKs whose native "traces are on"
+  evidence lives on the agent constructor kwargs rather than a standalone init
+  call anywhere in the file: Pydantic AI `instrument=True` (bool-literal
+  gated — `instrument=False` is an explicit opt-out, not evidence), Vercel
+  `experimental_telemetry`, and LangChain `callbacks=` (both gated only on
+  present-and-not-`None`, matching the missing-kwarg contract their paired
+  agent-scope outlier rules PYD-107/VAI-101/LC-112 already use). Without this,
+  `repo_observability_initialized`'s `instrument_kwarg` half was unreachable —
+  a Pydantic AI project instrumented only via `instrument=True` would
+  misclassify as "imported but never initialized" and misfire `OBS-001`.
+  Mirrored to `ScanResult.Observability` so a scan can report the positive
+  signal (e.g. `langfuse · init · app/tracing.py:12`), not only findings.
+  Additive inventory — like `Dependencies`, it is **not** folded into `ScanID`.
+
+  **Process-wide instrumentors.** Besides explicit init calls, the Python pass
+  recognizes `logfire.instrument_pydantic_ai` / `instrument_openai_agents` /
+  `instrument_mcp`, `<receiver>.instrument_all()` (Pydantic AI's
+  `Agent.instrument_all()`, counted only in a file importing `pydantic_ai` or
+  `logfire`) and `<X>Instrumentor(...).instrument(...)` (counted only in a file
+  importing `openinference`, `opentelemetry` or `traceloop`; the two-step
+  `i = XInstrumentor(); i.instrument()` is not matched) as init signals. Init
+  evidence alone cannot silence the agent-scope outlier rules, because
+  `agent_kwarg_missing` never reads it, so `analysis.ApplyGlobalInstrumentation`
+  (called in `scanner.go` right after the signals are merged) stamps
+  `AgentDef.InstrumentedBy` on every agent whose SDK and language the call
+  covers — `logfire.instrument_pydantic_ai` and `agent.instrument_all` credit
+  Pydantic AI's `instrument`, `LangChainInstrumentor().instrument()` credits
+  LangChain's `callbacks` — and `PredAgentKwargMissing` treats exactly that
+  kwarg as set. Vercel AI has no process-wide switch (`experimental_telemetry`
+  is per call), so VAI-101 is unaffected. `opik` is a vendor on both the Python
+  and TS sides (and a recon dep needle).
+
+  The **declared** half of the picture comes from recon, not this pass:
+  `detectObsDeps` (`internal/ingestion/normalizer.go`) needle-scans the root
+  dependency manifests into `RepoProfile.ObsDeps`, kept separate from `SDKDeps`
+  so `META-002` cannot fire on a tracing dep. A declared dep never satisfies
+  `repo_has_observability` — that needs a code signal — but
+  `repo_observability_declared` reads it directly, which is what lets `OBS-005`
+  separate "ships a tracing dependency and never wired it" (medium) from "never
+  tried" (the absence rules, low). That predicate counts only hand-edited
+  manifests (`pyproject.toml`, `requirements.txt`, `Pipfile`, `package.json`);
+  `poetry.lock` is excluded because a lock file carries the transitive closure,
+  where a match proves nobody's intent.
+
+- **DiscoverOtelLabels** (`otel_labels.go`) — one pass over the parsed
+  Python and TS/JS files emitting a typed `OtelLabelsSignal` per use of
+  `agent-reliability-otel-labels`, the library that adds process-metadata labels to spans the
+  agent already emits. `Kind` is the rung reached: `import` (`agent_reliability_otel_labels` /
+  `@trustabl/agent-reliability-otel-labels` is imported), `run_start` (`<run>.mark_start(...)` /
+  `<run>.markStart(...)` — receiver required, since it is a method on `Run`),
+  `tool_span` (`mark_tool_span` / `markToolSpan`) and `run_end` (`mark_run_end`
+  / `markRunEnd`). The call names are plausible names for a project's own
+  helpers, so they count only when the library is imported somewhere in the
+  repo; each file's own imports are followed, so a renamed import
+  (`mark_tool_span as mts`, `markToolSpan as label`) still resolves. Every
+  signal carries `TestOrigin` when its file classifies as a test
+  (`pathclass.Classify`). That gate is repo-wide, not per-file: a `Run` is
+  routinely built in one module and started in another that imports nothing.
+  `attr_literal` records a label key written to a span by hand
+  (`set_attribute` / `setAttribute` first argument, or a key of the literal
+  passed to `set_attributes` / `setAttributes`), collected whether or not the
+  library is imported; a bare string elsewhere is not a label. The key table
+  (`otel_labels_keys.go`) is tested against
+  `testdata/forge/otel/otel-spec-keys.json`. The ladder predicates credit
+  these keys rung by rung: any key → installed, `trustabl.run_id` → initialized,
+  `trustabl.exit_reason` → run end, `trustabl.tool.input_fp` /
+  `trustabl.tool.attempt` → tool span.
+  The Go binding is not inspected. Output is sorted (stably) by (File,
+  StartLine, Kind, Key); like `ObservabilitySignals` it is additive inventory
+  and is **not** folded into `ScanID`.
+
+  These signals are deliberately **not** `ObservabilitySignal`s.
+  `agent-reliability-otel-labels` never creates a span, so folding it in would let an import
+  satisfy `repo_has_observability` and a started `Run` satisfy
+  `repo_observability_initialized` — the library would clear its own
+  prerequisite and `OBS-001` would misfire on it. The declared half comes from
+  recon: `detectOtelLabelsDeps` (`internal/ingestion/normalizer.go`) records
+  the root manifests that name the package in
+  `RepoProfile.OtelLabelsDeclaredIn`, separate from `ObsDeps` for the same
+  reason. A lock file counts here, unlike `ObsDeps`, because nothing depends on
+  `agent-reliability-otel-labels` transitively.
+
+  Three repo-scope predicates read these facts and back the `OBS-006..008`
+  ladder, each rule gated on `repo_observability_initialized: true` and firing
+  at the first missing rung: `repo_otel_labels_installed` (declared **or**
+  imported), `repo_otel_labels_initialized` (a `run_start` signal), and
+  `repo_otel_labels_implemented` (a `run_end` signal, plus a `tool_span`
+  signal when the inventory holds at least one tool of a kind a framework emits
+  a tool span for — a bare `shell_invocation` function and a `langgraph_node`
+  do not count). The predicates prove the calls exist, not that labels land:
+  with no current span each call is a silent no-op.
+
 - **DiscoverSubagents** (`subagents.go`) — **hybrid** discovery in two passes.
   Pass 1 reads every `.claude/agents/*.md` component (matched at any path depth
   — monorepos that nest agent projects under `agent/.claude/agents/` or
@@ -515,6 +661,13 @@ For each language recon cleared, do the AST work and produce a `RepoInventory`:
   reads, and any file for a committed secret literal (an AWS/GitHub/Slack/Google
   token or a private-key header) — the payload-in-aux-file surface that scanning
   `SKILL.md` alone misses. No frontmatter or no `name` → skipped.
+  CSKILL-080/081 (claimed crypto operations / sensitive-data handling) use
+  `skill_text_matches`, not the raw-substring `skill_*_has_text` family — a
+  sentence-scoped, word-boundary predicate added to fix confirmed false
+  positives a bare substring match produces (a term inside an unrelated word,
+  or a data class merely being *named* rather than actually handled).
+  CSKILL-082..087 still use the raw-substring predicates unmodified. See
+  `PredSkillTextMatches` in `internal/rules/predicates.go`.
 - **DiscoverDependencies** (`deps.go`) — walks the repo (skipping vendored /
   installed trees: `node_modules`, `vendor`, `.venv`, `target`, …) for the
   primary dependency manifest of each supported language and parses the DECLARED
@@ -593,10 +746,119 @@ For each language recon cleared, do the AST work and produce a `RepoInventory`:
   `ClaudeAgentOptions(...)` construction in parsed Python and captures its
   constructor kwargs into a `ClaudeAgentOptionsDef` (carried on
   `RepoInventory.ClaudeAgentOptions`). This is the claude-agent-sdk session
-  config object; its `permission_mode` is the in-code analogue of
-  settings.json `defaultMode`, read by `repo_claude_options_permission_mode_is`
-  (CSDK-202). Its presence also marks the repo `claude_agent_sdk` so the pack
+  config object. `max_turns` absence is read via the shared
+  `repoClaudeOptionsMissingKwarg` helper — `repo_claude_options_max_turns_missing`
+  (CSDK-204). `repo_claude_options_disallowed_tools_missing` is the same
+  helper's `disallowed_tools` reader, combined with a permissive
+  `permission_mode` for CSDK-205. All kwargs are captured generically onto
+  `Kwargs`, so no discovery change was needed to add the `disallowed_tools`
+  reader. Its presence also marks the repo `claude_agent_sdk` so the pack
   loads for options-only repos.
+  `permission_mode` set to `bypassPermissions` is read at the SAME
+  construction site as `disallowed_tools` by
+  `repo_claude_options_mode_without_kwarg` (`PredRepoClaudeOptionsModeWithoutKwarg`)
+  — CSDK-202 fires when a `bypassPermissions` site has no deny-list at that
+  site, CSDK-206 fires (lower severity) when it does. This per-site
+  correlation exists because `allowed_tools` does NOT restrict which tools
+  can run (it only auto-approves — see the Agent SDK reference), so an
+  empty/narrow `allowed_tools` alongside `bypassPermissions` is the
+  maximally dangerous shape, not a mitigated one; only an explicit
+  `disallowed_tools` deny-list (which denies in every permission mode,
+  including `bypassPermissions`) genuinely bounds the surface. See
+  `docs/decisions/tool-allowlist-scope.md`. The bare repo-wide
+  `repo_claude_options_permission_mode_is` predicate (reading `permission_mode`
+  across every construction independently, with no per-site kwarg
+  correlation) is still used, combined with the new correlated predicate
+  under a `not:`, inside CSDK-206's `match:`.
+- **DiscoverAgentRunCalls** (`agent_run_calls.go`) — captures execution-limit
+  kwargs that live on the *run call*, not the agent constructor. OpenAI
+  Agents SDK: `Runner.run` / `run_sync` / `run_streamed` (object segment
+  must be exactly `Runner`, first positional arg is the agent ident).
+  Pydantic AI: `<agent>.run` / `run_sync` / `run_stream` (receiver is the
+  agent ident; import-gated to `pydantic_ai`). Google ADK: `<runner>.run` /
+  `run_async` where the agent is two hops away — a same-file pre-pass binds each
+  `X = Runner(agent=a, ...)` / `InMemoryRunner(a)` target to its agent ident
+  (the inline `Runner(agent=a).run_async(...)` receiver also resolves; `app=`
+  runners and `run_live` stay unresolved/ignored; import-gated to `google.adk`).
+  AutoGen / AG2: `<agent>.initiate_chat` / `a_initiate_chat` (a record for the
+  receiver *and* the recipient ident) and `<agent>.run` / `a_run` /
+  `run_stream` (import-gated to either AutoGen line). Each hit is an
+  `AgentRunCallDef` on `RepoInventory.AgentRunCalls`. OAI-112
+  (`agent_run_call_max_turns_missing`) and PYD-106
+  (`agent_run_call_usage_limits_missing`) correlate those calls to a
+  same-file `AgentDef.VarName`. Opaque receivers / non-ident agents are
+  skipped, same limitation as other call-capture discoverers. Each
+  `AgentRunCallDef` also carries `WallClockTimeoutWrapped`, set by a structural
+  ancestor walk (`wallclock_timeout.go`, `nodeHasWallClockTimeoutAncestor`): true
+  when the call sits inside an `asyncio.wait_for(...)` argument or the body of an
+  `asyncio.timeout` / `anyio.move_on_after` / `anyio.fail_after` `with` block in
+  the same function — never a same-file text search. OAI-120 / PYD-108 /
+  ADK-113 / AG2-021 (`agent_run_call_wall_clock_timeout_missing`) share the
+  correlation helper `agentRunCallUnsatisfied` with OAI-112 / PYD-106; for ADK
+  and AutoGen the predicate additionally credits a non-None `abort_signal` /
+  `cancellation_token` kwarg on the run call (`wallClockCancelKwarg`). The
+  Vercel AI analogue (VAI-020) is a plain agent-kwarg rule over `abortSignal` /
+  `timeout` and needs no run-call record.
+- **DiscoverEntrypoints / ApplyEntrypointReachability** (`entrypoints.go`) —
+  a **fact only**: no predicate, no rule, no schema change. Python,
+  import-gated: FastAPI (`@<recv>.get/post/put/patch/delete/head/options/
+  websocket/api_route`; recv bound in-file to `FastAPI(...)` / `APIRouter(...)`,
+  or unbound-but-imported in a file that imports fastapi — a small documented
+  FP), Flask (`@<recv>.route/get/...`), Celery (`@app.task`, `@shared_task`) and
+  Dramatiq (`@dramatiq.actor`). Each becomes an `EntrypointDef` on
+  `RepoInventory.Entrypoints` (and `ScanResult.entrypoints` in the JSON report),
+  sorted by (file, line, route, framework). Directories named `examples`, `demo`,
+  `docs`, `samples`, `cookbook`, `tutorial(s)` are skipped by a list local to the
+  detector (`pathclass` is untouched). `__main__` / CLI markers are not recorded.
+  `ApplyEntrypointReachability` runs after `DiscoverAgentRunCalls` and stamps
+  `AgentRunCallDef.ServerReachable` (in-memory, `json:"-"`) when the run call is
+  in the entrypoint (`direct`), in a same-file top-level function it calls
+  (`same_file`), or in a top-level function it calls that was imported by name,
+  absolute or relative (`import`). One hop per edge kind, no call graph, no
+  `m.f()` / method calls / DI; relative imports resolve only to files in the scan
+  set (see the doc comment). The stamp is read by the `agent_server_reachable`
+  predicate (LC-116); the resolver was generalized to `resolveImportedName` so
+  run-call discovery reuses it for cross-file graphs.
+- **LangGraph run calls** (`agent_run_calls.go`, `discoverLangGraphRunCalls`) —
+  SDK `langchain` `AgentRunCallDef`s for `invoke` / `ainvoke` / `stream` /
+  `astream` / `astream_events` / `batch` / `abatch`. The receiver is never an
+  arbitrary identifier: it must be a compiled-graph variable
+  (`app = builder.compile(...)`, from `discoverLangGraphGraphsInFile`'s compile
+  map), the direct chain `builder.compile(...).invoke(...)`, or the variable of a
+  prebuilt `create_react_agent` / `create_agent`. `AgentVarName` is the builder
+  variable. A module-level graph imported into another file (`from graph import
+  app`) is recorded with `AgentFilePath` (in-memory) set to the defining file.
+  `AgentDef.CheckpointerClass` (in-memory) carries the `checkpointer=` class of
+  `compile()` / the prebuilt helpers, resolved through its langgraph import;
+  unresolved names, local classes and conflicting bindings leave it empty.
+  `agent_checkpointer_in_memory` (`MemorySaver` / `InMemorySaver`) and
+  `agent_server_reachable` (a correlated run call with a `ServerReachable`
+  stamp; test paths ignored) back LC-116. Run calls are not in the JSON report.
+- **DiscoverLangGraphNodes** (`langgraph_nodes.go`) — a function registered via
+  `<builder>.add_node("name", func)` / `add_node(func)` is not a `@tool` but runs
+  on every graph visit. Same-file, undecorated, top-level functions are emitted
+  as `ToolDef`s of Kind `langgraph_node` (SDK `langchain`) pointing at the
+  `function_definition`, so the existing body predicates (`has_shell_call`,
+  `has_write_call`, …) work unchanged; lambdas / methods / imports are skipped.
+  LC-115 targets this kind. The raw-`StateGraph` pass (`langgraph_graph.go`) now
+  leaves a resolved `compile()` with a non-nil (possibly empty) `Kwargs` tree and
+  marks `compile(**cfg)` `Opaque`; a compiled graph passed to `add_node` (a
+  subgraph) is left unlinked. `agent_kwargs_observed` (`Kwargs != nil && !Opaque`)
+  lets LC-114 tell "resolved, no checkpointer" from "never linked", and
+  `repo_langgraph_platform_config_present` (a `langgraph.json` in
+  `Manifest.JSONFiles`, dual-scope) silences it on LangGraph Platform repos.
+- **DetectRawLLMToolOutputInSystem** (`raw_llm_tool_loops.go`) — per Python file
+  and per function: the bare `anthropic` / `openai` client in a manual tool loop
+  (`.messages.create(…, tools=…)` / `.chat.completions.create(…, tools=…)`) whose
+  runtime-built system prompt (`system=` for Anthropic; a `{"role": "system" |
+  "developer"}` dict for OpenAI) references a name tainted by the model's
+  tool-call arguments (`.input` / `.arguments`) via same-function name-level
+  assignment propagation. Stamped onto `RepoInventory.RawAnthropicToolOutputInSystemPrompt`
+  / `RawOpenAIToolOutputInSystemMessage` and read by RAW-001 / RAW-002. Bare
+  client usage has no SDK enum entry, so these rules live in the
+  `raw_llm_sdk` category, which `rules.LoadFor` loads unconditionally (like
+  `observability`); the predicates do the gating. Narrow by design — no
+  cross-function/file flow, no Responses API.
 - **DiscoverADKAgents** (`adk_agents.go`) — finds `LlmAgent(...)`,
   `SequentialAgent(...)`, `ParallelAgent(...)`, `LoopAgent(...)`,
   `LanggraphAgent(...)`, and the `Agent(...)` alias (normalized to `LlmAgent`
@@ -609,13 +871,16 @@ For each language recon cleared, do the AST work and produce a `RepoInventory`:
   `Opaque=true`.
 - **DiscoverADKTools** (`adk_agents.go`) — finds `FunctionTool(symbol)` calls
   and resolves the argument to a same-file top-level function definition. Each
-  resolved match emits a `ToolDef` with `Kind=adk_function_tool`. Cross-module
-  resolution is out of scope.
+  resolved match emits a `ToolDef` with `Kind=adk_function_tool`. The call's
+  keyword arguments (e.g. `require_confirmation=True`) are captured as raw text
+  into `ToolDef.Config`, so `tool_decorator_kwarg_*` predicates can read ADK's
+  per-tool options (ADK-020). Cross-module resolution is out of scope.
 - **DiscoverTSTools** (`ts_discovery.go`) — TS Claude SDK `tool(name,
   description, zodSchema, handler, extras?)` factory calls. Captures `Name`
   (arg 0), `Description` (arg 1), `ParamNames` from the Zod schema top-level
   keys, handler body facts via shared `tsHandlerFacts` (`shells_out`,
-  `http_call`, `dynamic_url`), and extras flattened into `Config`. Sets
+  `http_call`, `dynamic_url`, `url_scheme_unpinned`, `http_no_timeout`, `writes_fs`, `code_exec`,
+  `throws`, `try_catch`), and extras flattened into `Config`. Sets
   `VarName` from the enclosing `const x = tool(...)` binding.
 - **DiscoverTSAgents** (`ts_agents.go`) — TS Claude SDK agent shapes:
   one `AgentDef` per `query({...})` call (`Class="QueryMainAgent"`), each
@@ -757,8 +1022,12 @@ For each language recon cleared, do the AST work and produce a `RepoInventory`:
   `CodeExecutionTool` / `WebFetchTool` / `UrlContextTool` / `WebSearchTool` native
   tools under `capabilities=` / `builtin_tools=` (the modern `NativeTool(...)`
   wrapper unwrapped one level) are classified in `pydantic_ai_hosted_tools.go`
-  during `ResolveEdges`. PYD-104 (`force_download`), the bare-`tools=[fn]` ToolDef
-  shape, and the `RunContext` param-strip for PYD-002 are v1 gaps.
+  during `ResolveEdges`, with inner-constructor kwargs (e.g. `force_download`)
+  captured on the `HostedToolDef`. A file-level FileUrl-family walk stamps
+  `AgentDef.FileURLForceDownload` for PYD-104. PYD-106
+  (`agent_run_call_usage_limits_missing`) reads `RepoInventory.AgentRunCalls`
+  for this agent's `usage_limits`, not the constructor. The bare-`tools=[fn]` ToolDef
+  shape and the `RunContext` param-strip for PYD-002 remain v1 gaps.
 - **DiscoverTSVercelTools / DiscoverTSVercelAgents** (`ts_vercel_tools.go`,
   `ts_vercel_agents.go`, `ts_vercel_hosted_tools.go`) — TS Vercel AI SDK,
   import-gated to the bare `ai` core module (the disambiguator from the
@@ -844,7 +1113,9 @@ For each language recon cleared, do the AST work and produce a `RepoInventory`:
   processed for MCP server constructors (`MCPServerStdio`, `MCPServerSse`,
   `MCPServerStreamableHttp`) — both inline calls and aliases bound by
   `async with X() as srv:`. Each match becomes an `MCPServerDef` and an entry in
-  `MCPServerRefs`. After all agents are processed, `inv.HostedTools` and
+  `MCPServerRefs`; the constructor's kwargs (e.g. `tool_filter=`) are captured
+  onto `MCPServerDef.Kwargs` the same way hosted-tool kwargs are (OAI-118 reads
+  this). After all agents are processed, `inv.HostedTools` and
   `inv.MCPServers` are sorted by `(FilePath, Line, Class)` and
   `HostedToolRefs`/`MCPServerRefs.Resolved` pointers are re-resolved to the
   post-sort positions. TS OpenAI tool/MCP/guardrail refs use a Name+VarName
@@ -854,6 +1125,16 @@ For each language recon cleared, do the AST work and produce a `RepoInventory`:
   and the TS HostedTool-materialization step stamps `SDKGoogleADK` for
   classes in `TSADKHostedToolClasses`. HandoffRefs are resolved by a
   language-agnostic pass (mirrors the existing ToolRefs/MCP/guards passes).
+  TS OpenAI hosted-tool refs are the one TS SDK where the materialization step
+  does not synthesize a bare def: `classifyTSOpenAIHostedFactoryCall`
+  (`ts_openai_hosted_tools.go`) captures the factory call's options-object
+  argument into `Kwargs` (via `TSObjectKwargs`) and its own precise call-site
+  `Location` at discovery time, carries it on `HostedToolRef.Pending`, and
+  `ResolveEdges` appends that def to `inv.HostedTools` verbatim instead of
+  building a new one from `Class` + the agent's `Location`. TS ADK and Vercel
+  AI hosted-tool refs still go through the synthesized-def path (agent-line
+  Location, no kwargs) — `Pending` is currently populated only by the OpenAI
+  factory-call discoverer.
 
 **Discovered agent components** (`Components []AgentComponent`).
 
@@ -1048,7 +1329,7 @@ Shipped rules (one row per YAML rule entry):
 | CSDK-009 | tool     | claude_sdk | high     | `claude_sdk/ssrf.yaml`             | Tool fetches a caller-controlled URL (SSRF)                                           |
 | CSDK-101 | agent    | claude_sdk | high     | `claude_sdk/agent_safety.yaml`     | Claude subagent is granted the Bash tool                                              |
 | CSDK-102 | agent    | claude_sdk | high     | `claude_sdk/agent_safety.yaml`     | Claude subagent is granted the WebSearch tool                                         |
-| CSDK-103 | agent    | claude_sdk | high     | `claude_sdk/agent_safety.yaml`     | AgentDefinition sets permissionMode to bypassPermissions                              |
+| CSDK-103 | agent    | claude_sdk | high     | `claude_sdk/agent_safety.yaml`     | AgentDefinition sets permissionMode to bypassPermissions with a broad tool set |
 | CSDK-104 | agent    | claude_sdk | high     | `claude_sdk/agent_safety.yaml`     | Claude subagent is granted filesystem-write built-ins                                 |
 | CSDK-105 | agent    | claude_sdk | high     | `claude_sdk/agent_safety.yaml`     | Claude subagent is granted the WebFetch tool                                          |
 | CSDK-107 | tool     | claude_sdk | high     | `claude_sdk/code_execution.yaml`   | Tool body calls eval/exec/compile on dynamic input                                    |
@@ -1056,15 +1337,19 @@ Shipped rules (one row per YAML rule entry):
 | CSDK-110 | subagent | claude_sdk | high     | `claude_sdk/subagent_safety.yaml`  | Subagent granted the built-in Bash tool                                               |
 | CSDK-111 | subagent | claude_sdk | high     | `claude_sdk/subagent_safety.yaml`  | Subagent granted filesystem-write or web-fetch built-ins                              |
 | CSDK-201 | repo     | claude_sdk | high     | `claude_sdk/repo.yaml`             | Project default permission mode bypasses approvals                                    |
-| CSDK-202 | repo     | claude_sdk | high     | `claude_sdk/repo.yaml`             | Session permission mode bypasses approvals                                            |
+| CSDK-202 | repo     | claude_sdk | high     | `claude_sdk/repo.yaml`             | Session permission mode bypasses approvals with no tool deny-list |
 | CSDK-203 | repo     | claude_sdk | low      | `claude_sdk/repo_hygiene.yaml`     | Claude Agent SDK code with no agent-guidance doc (AGENTS.md/CLAUDE.md)                |
+| CSDK-204 | repo     | claude_sdk | low      | `claude_sdk/repo.yaml`             | Claude Agent SDK session sets no explicit max_turns limit                             |
+| CSDK-205 | repo     | claude_sdk | medium   | `claude_sdk/repo.yaml`             | Claude Agent SDK session auto-approves edits with no tool deny-list                   |
+| CSDK-206 | repo     | claude_sdk | medium   | `claude_sdk/repo.yaml`             | Session bypasses approvals with a deny-list that still leaves a broad surface         |
 | CSDK-010 | tool     | claude_sdk | high     | `claude_sdk/shell_safety.yaml`     | TypeScript tool body spawns a subprocess (`language: typescript`)                     |
 | CSDK-011 | tool     | claude_sdk | high     | `claude_sdk/code_execution.yaml`   | TypeScript tool body calls eval / new Function on dynamic input                       |
 | CSDK-012 | tool     | claude_sdk | high     | `claude_sdk/path_safety.yaml`      | TypeScript tool writes to the filesystem                                               |
 | CSDK-013 | tool     | claude_sdk | high     | `claude_sdk/ssrf.yaml`             | TypeScript tool fetches a caller-controlled URL (SSRF / dynamic URL)                  |
-| CSDK-120 | agent    | claude_sdk | high     | `claude_sdk/agent_safety.yaml`     | TypeScript AgentDefinition sets permissionMode to bypassPermissions                   |
+| CSDK-120 | agent    | claude_sdk | high     | `claude_sdk/agent_safety.yaml`     | TypeScript AgentDefinition sets permissionMode to bypassPermissions with a broad tool set |
 | CSDK-014 | tool     | claude_sdk | low      | `claude_sdk/tool_definition.yaml`  | TypeScript Claude SDK tool has no description                                         |
 | CSDK-016 | tool     | claude_sdk | medium   | `claude_sdk/idempotency.yaml`      | TypeScript Claude SDK mutating tool has no idempotency key                            |
+| CSDK-023 | tool     | claude_sdk | high     | `claude_sdk/side_effect_bounds.yaml` | TypeScript side-effecting tool lets the model choose the recipient or amount with no visible bound |
 | CSDK-130 | agent    | claude_sdk | high     | `claude_sdk/agent_safety.yaml`     | TypeScript query() main agent is granted the Bash tool                                |
 | CSDK-131 | agent    | claude_sdk | high     | `claude_sdk/agent_safety.yaml`     | TypeScript query() main agent is granted filesystem-write or web-fetch built-ins      |
 | OAI-001  | tool     | openai_sdk | low      | `openai_sdk/tool_definition.yaml`  | Tool function has no docstring                                                        |
@@ -1088,6 +1373,8 @@ Shipped rules (one row per YAML rule entry):
 | OAI-019  | tool     | openai_sdk | medium   | `openai_sdk/idempotency.yaml`      | TypeScript mutating tool has no idempotency key                                       |
 | OAI-022  | tool     | openai_sdk | low      | `openai_sdk/tool_definition.yaml`  | TypeScript tool has no description                                                    |
 | OAI-024  | tool     | openai_sdk | medium   | `openai_sdk/network.yaml`          | TypeScript tool builds outbound URL from a non-literal value                          |
+| OAI-030  | tool     | openai_sdk | high     | `openai_sdk/side_effect_bounds.yaml` | Side-effecting tool lets the model choose the recipient or amount with no visible bound |
+| OAI-031  | tool     | openai_sdk | high     | `openai_sdk/side_effect_bounds.yaml` | TypeScript side-effecting tool lets the model choose the recipient or amount with no visible bound |
 | OAI-101  | agent    | openai_sdk | high     | `openai_sdk/agent_safety.yaml`     | Agent has no input_guardrails AND wires shell or filesystem-touching tools            |
 | OAI-102  | agent    | openai_sdk | high     | `openai_sdk/agent_safety.yaml`     | Agent uses tool_use_behavior="stop_on_first_tool"                                     |
 | OAI-103  | agent    | openai_sdk | high     | `openai_sdk/agent_safety.yaml`     | tool_choice="required" combined with reset_tool_choice=False                          |
@@ -1097,6 +1384,7 @@ Shipped rules (one row per YAML rule entry):
 | OAI-109  | agent    | openai_sdk | high     | `openai_sdk/agent_safety.yaml`     | Agent uses WebSearchTool without input_guardrails                                     |
 | OAI-110  | agent    | openai_sdk | high     | `openai_sdk/agent_safety.yaml`     | Agent wires a content-fetching tool without output_guardrails                         |
 | OAI-111  | agent    | openai_sdk | high     | `openai_sdk/approvals.yaml`        | Agent wires a privileged hosted tool without needs_approval                           |
+| OAI-112  | agent    | openai_sdk | low      | `openai_sdk/agent_safety.yaml`     | OpenAI Agents SDK agent has no explicit max_turns limit (`Runner.run` family)         |
 | OAI-201  | repo     | openai_sdk | medium   | `openai_sdk/tracing.yaml`          | Project uses default OpenAI tracing                                                   |
 | OAI-202  | repo     | openai_sdk | low      | `openai_sdk/repo_hygiene.yaml`     | OpenAI Agents project with no agent-guidance doc (AGENTS.md/CLAUDE.md)                |
 | ADK-001  | tool     | google_adk | low      | `google_adk/tool_definition.yaml`  | FunctionTool-wrapped function has no docstring                                        |
@@ -1114,6 +1402,8 @@ Shipped rules (one row per YAML rule entry):
 | ADK-013  | tool     | google_adk | low      | `google_adk/tool_definition.yaml`  | TypeScript FunctionTool has no description                                            |
 | ADK-015  | tool     | google_adk | high     | `google_adk/code_execution.yaml`   | TypeScript FunctionTool body evaluates dynamic code                                   |
 | ADK-016  | tool     | google_adk | high     | `google_adk/ssrf.yaml`             | TypeScript FunctionTool fetches a caller-controlled URL (SSRF)                        |
+| ADK-020  | tool     | google_adk | high     | `google_adk/side_effect_bounds.yaml` | Side-effecting tool lets the model choose the recipient or amount with no visible bound |
+| ADK-021  | tool     | google_adk | high     | `google_adk/side_effect_bounds.yaml` | TypeScript side-effecting tool lets the model choose the recipient or amount with no visible bound |
 | ADK-101  | agent    | google_adk | medium   | `google_adk/agent_safety.yaml`     | LlmAgent has no description                                                           |
 | ADK-102  | agent    | google_adk | high     | `google_adk/agent_safety.yaml`     | Agent with BashTool has no before_tool_callback                                       |
 | ADK-103  | agent    | google_adk | high     | `google_adk/agent_safety.yaml`     | Sub-agent is granted BashTool                                                         |
@@ -1139,6 +1429,7 @@ Shipped rules (one row per YAML rule entry):
 | MCP-012  | tool     | mcp        | high     | `mcp/shell_safety.yaml`            | TypeScript MCP tool spawns a subprocess                                               |
 | MCP-013  | tool     | mcp        | high     | `mcp/ssrf.yaml`                    | TypeScript MCP tool fetches a caller-controlled URL (SSRF)                            |
 | MCP-014  | tool     | mcp        | high     | `mcp/code_execution.yaml`          | TypeScript MCP tool evaluates dynamic code (eval / new Function)                      |
+| MCP-030  | tool     | mcp        | high     | `mcp/side_effect_bounds.yaml`      | Side-effecting tool lets the model choose the recipient or amount with no visible bound |
 | LC-001   | tool     | langchain  | low      | `langchain/tool_definition.yaml`   | LangChain tool has no description                                                     |
 | LC-002   | tool     | langchain  | medium   | `langchain/tool_definition.yaml`   | LangChain tool parameters are not type-annotated                                      |
 | LC-003   | tool     | langchain  | high     | `langchain/shell_safety.yaml`      | LangChain tool body spawns a subprocess                                               |
@@ -1150,6 +1441,7 @@ Shipped rules (one row per YAML rule entry):
 | LC-012   | tool     | langchain  | high     | `langchain/code_execution.yaml`    | TypeScript LangChain tool evaluates dynamic code                                      |
 | LC-013   | tool     | langchain  | high     | `langchain/ssrf.yaml`              | TypeScript LangChain tool fetches a caller-controlled URL (SSRF)                      |
 | LC-014   | tool     | langchain  | medium   | `langchain/tool_behavior.yaml`     | TypeScript LangChain tool returns output directly (`returnDirect`)                    |
+| LC-025   | tool     | langchain  | high     | `langchain/side_effect_bounds.yaml` | Side-effecting tool lets the model choose the recipient or amount with no visible bound |
 | LC-101   | agent    | langchain  | high     | `langchain/agent_safety.yaml`      | LangChain agent wires a code-execution or shell built-in tool                         |
 | LC-102   | agent    | langchain  | medium   | `langchain/agent_safety.yaml`      | LangChain AgentExecutor has no max_iterations limit                                   |
 | LC-111   | agent    | langchain  | medium   | `langchain/agent_safety.yaml`      | TypeScript LangChain AgentExecutor has no maxIterations limit                         |
@@ -1164,6 +1456,34 @@ Shipped rules (one row per YAML rule entry):
 > category allow-list (`internal/rules/loader.go`); `SDKMCP` already routed to
 > the `mcp` category via `LoadFor`, so no other wiring changed.
 
+> **This table is a known-incomplete index, not the enumeration of shipped
+> rules.** It predates several rule packs (Pydantic AI has none listed here,
+> and the OpenAI/MCP/LangChain sections above are missing dozens of rules
+> shipped since this table was last fully reconciled) — re-derive the true
+> count with `grep -rhoE '^\s*-\s*id:\s*\S+' testdata/rules-fixture/*/*.yaml
+> | wc -l` rather than counting rows here, and treat
+> [`COVERAGE.md`](COVERAGE.md)'s per-SDK rule-ID lists as the more current
+> reference. PYD-014 (added alongside OAI-030/031, MCP-030, and LC-025 — see
+> `openai_sdk/side_effect_bounds.yaml` and siblings) is intentionally not
+> added as an isolated row here, since no other Pydantic AI row exists to
+> anchor it. Backfilling this table fully is tracked as separate cleanup, not
+> part of any single rule change.
+
+### Step 4c — Origin classification ([internal/pathclass/](internal/pathclass/))
+
+After every finding is assembled (rule findings, META, and — when opted in —
+vuln/license/secret findings), one pass over `findings` sets
+`Finding.Origin = pathclass.Classify(finding.FilePath)`. `Classify` is a pure
+function of the already-normalized, forward-slash repo-relative path (dir
+segments like `tests/`, `__tests__/`, `fixtures/`; filename patterns like
+`test_*.py`, `*_test.go`, `*.spec.ts`) — no AST, no I/O, so it never touches
+`ScanManifest` and `ScanID` is unaffected. The zero value (`""`) is production;
+`models.OriginTest` marks a test-path finding. This closes the "a `WebSearchTool`
+in `tests/test_adapter.py` reads identically to one shipped in production"
+gap: the finding is still reported (never dropped), but is excluded from
+scoring by default (Step 5) and from the CLI exit-code gate
+(`cmd/trustabl`'s `exitCode`), unless `--include-test-paths` is set.
+
 ### Step 5 — Scoring ([internal/analysis/scoring.go](internal/analysis/scoring.go))
 
 Scoring works per **surface**, where a surface is a single discovered tool,
@@ -1173,6 +1493,33 @@ the surface's `FilePath`, so they attribute to the right row. Each finding
 carries its `Scope` (stamped at emit time), which routes it to its surface; all
 repo-scoped findings pool into one repo surface, created only when at least one
 repo finding exists. Findings with an empty scope (META) are not scored.
+
+By default (`--include-test-paths` not set), `scanner.Run` partitions the
+discovered tools/agents/subagents/skills and the findings list before calling
+`Score`/`Project`, dropping anything whose `FilePath` classifies as
+`models.OriginTest` (Step 4c). `Score`'s signature is unchanged — it still
+takes the four slices explicitly (architecture principle: stay honest about
+what scoring depends on) — the filtering happens at the call site. A
+test-fixture agent therefore creates no surface row and its findings do not
+move `OverallScore`; `ScanResult.Tools`/`.Agents`/`.Findings` stay complete
+regardless — for those, the classification changes what is *scored*, never what
+is *reported*.
+
+`ScanResult.SDKs` is the one reported field that does follow the
+production-only view, because it is a claim about the repository rather than a
+list of what was found. Scanning this repo — a Go repo — reported `sdks:
+[claude_agent_sdk, google_adk, langchain, openai_agents]`, the last three
+entirely on the strength of the Python and TypeScript sample code vendored under
+`testdata/`. `RepoInventory.SDKsDetected` is deliberately NOT narrowed the same
+way: it selects which rule packs load, so filtering it would drop the packs that
+produce test-path findings altogether, deleting findings that are meant to be
+reported and de-weighted. `--include-test-paths` reproduces the previous list
+exactly. `NoAgentSurfaces` is computed from the same production-filtered
+`surfaces` slice as before (`len(surfaces) == 0`) — note that a repo-scoped
+finding (e.g. "uses default tracing") still seeds the repo surface even when
+the SDK usage that triggered it lives only in a test path, since a repo-scoped
+finding's `FilePath` is empty and classifies as production; that repo-level
+risk is genuinely about the whole project, not a specific file.
 
 Per-surface:
 
@@ -1211,7 +1558,12 @@ anything into the scanned repo.
 
 - `Renderer.Render` ([diff.go](internal/review/diff.go)) — produces the human
   scan summary printed to stdout for `--format human`: per-surface readiness, the
-  overall score, the discovered inventory, and the findings list. Color via
+  overall score, the discovered inventory, and the findings list. A finding
+  whose `Origin` is `models.OriginTest` (Step 4c) is excluded from the scored
+  "Findings" groups — those mirror `result.Surfaces`, already production-only
+  — and rendered instead under a trailing "Test-path findings (not scored)"
+  section, so it stays visible without looking equivalent to a production
+  finding. Color via
   lipgloss, disabled with `--no-color`. When `ScanResult.HasShellInvocations`
   is true the summary prints a `Risk surfaces: openshell` block: the count of
   shell-invoking functions, the first three file:line locations
@@ -1242,7 +1594,11 @@ per-result `fixes[]`**, because the SARIF spec requires a `fix` to carry
 described-but-patchless result is both honest and accepted by the Code Scanning
 schema validator, which rejects a `fixes[]` entry lacking `artifactChanges`. Like
 JSON, SARIF is a pure function of `ScanResult`: no clocks, no map-iteration
-leakage, byte-stable per `ScanID`.
+leakage, byte-stable per `ScanID`. A finding with `Origin == models.OriginTest`
+additionally carries `properties.origin: "test"` and a `result.suppressions`
+entry (`kind: "external"`) so GitHub code scanning and other SARIF 2.1.0-aware
+consumers exclude it from the default alert view without the document ever
+dropping the result.
 
 ### Scan attestation (`internal/attest`)
 
@@ -1310,6 +1666,8 @@ classDiagram
         SDKsDetected
         HasShellInvocations
         UsesDefaultTracing
+        AgentRunCalls
+        Entrypoints
     }
     class ToolDef {
         Name
@@ -1330,6 +1688,7 @@ classDiagram
         InputGuards
         OutputGuards
         Opaque
+        InstrumentedBy
     }
     class Finding {
         RuleID
@@ -1338,6 +1697,7 @@ classDiagram
         Confidence
         Explanation
         SuggestedFix
+        Origin : SurfaceOrigin
     }
     class ScanManifest {
         RepoRoot
@@ -1360,10 +1720,13 @@ classDiagram
 RepoProfile {
     Languages []Language   // detected by file extension
     SDKDeps   []SDKDep     // declared deps (from manifests)
+    ObsDeps   []ObsDep     // declared observability deps (from manifests)
+    OtelLabelsDeclaredIn []string // root manifests that declare agent-reliability-otel-labels, sorted
     Manifest  ScanManifest // file inventory + discovered components
 }
 
 SDKDep { Name, Source string; Confidence float64 }
+ObsDep { Vendor ObservabilityVendor; Source string; Confidence float64 }
 SDK = "claude_agent_sdk" | "openai_agents" | "mcp" | "openshell" | "google_adk"
 
 // Inventory output
@@ -1379,11 +1742,17 @@ RepoInventory {
     SlashCommands      []SlashCommandDef
     PluginManifests    []PluginManifest
     ClaudeSettings     []ClaudeSettings
-    ClaudeAgentOptions []ClaudeAgentOptionsDef  // ClaudeAgentOptions(...) session configs (permission_mode, etc.)
+    ClaudeAgentOptions []ClaudeAgentOptionsDef  // ClaudeAgentOptions(...) session configs (permission_mode, max_turns, etc.)
+    AgentRunCalls      []AgentRunCallDef        // Runner.run / agent.run / ADK Runner.run_async / AutoGen initiate_chat call sites (max_turns, usage_limits, WallClockTimeoutWrapped, in-memory ServerReachable stamp)
+    Entrypoints        []EntrypointDef          // Python FastAPI/Flask routes, Celery tasks, Dramatiq actors (fact only; also ScanResult.entrypoints)
     SDKsDetected        []SDK     // observed in code, PLUS claude_agent_sdk when any markdown subagent OR ClaudeAgentOptions(...) is present (drives the policy-selection step)
     HasShellInvocations bool      // any Python function calling subprocess.* / os.system / os.popen ("openshell" risk surface, not an SDK)
     Manifest            ScanManifest
     UsesDefaultTracing  bool
+    RawAnthropicToolOutputInSystemPrompt bool // raw_llm_sdk: RAW-001
+    RawOpenAIToolOutputInSystemMessage   bool // raw_llm_sdk: RAW-002
+    ObservabilitySignals []ObservabilitySignal // vendor + Kind (import/init/exporter/content_capture/instrument_kwarg), sorted by (File, StartLine, Vendor, Kind)
+    OtelLabelsSignals  []OtelLabelsSignal  // agent-reliability-otel-labels use: Kind (import/run_start/tool_span/run_end), sorted by (File, StartLine, Kind)
 }
 
 // deriveSDKsDetected (internal/scanner/scanner.go) folds markdown subagent
@@ -1418,7 +1787,12 @@ AgentDef {
     InputGuards    []GuardrailRef
     OutputGuards   []GuardrailRef
     Opaque         bool           // Agent(**config) or tools=non-literal
+    InstrumentedBy *GlobalInstrumentation // process-wide instrumentation call covering this agent (json instrumented_by, omitted when nil); read by agent_kwarg_missing
 }
+
+// GlobalInstrumentation: the kwarg it stands in for ("instrument" / "callbacks"),
+// the matched call, and its file/line.
+GlobalInstrumentation { Kwarg, Call, File string; Line int }
 
 // KwargTree holds a kwarg value as either a leaf or a nested map
 // (e.g. model_settings.tool_choice parses as Children["model_settings"].Children["tool_choice"]).
@@ -1565,7 +1939,10 @@ ClaudeSettings {
 ClaudeAgentOptionsDef {
     Location                          // file_path = .py path of the ClaudeAgentOptions(...) call
     Kwargs *KwargTree                 // captured constructor kwargs (in-memory; not serialized).
-                                      //   permission_mode read by repo_claude_options_permission_mode_is
+                                      //   permission_mode read by repo_claude_options_permission_mode_is;
+                                      //   max_turns / disallowed_tools absence read by
+                                      //   repo_claude_options_max_turns_missing /
+                                      //   repo_claude_options_disallowed_tools_missing
     Opaque bool                       // true when the call used **unpacking
 }
 
@@ -1665,7 +2042,7 @@ Discipline rules:
 cmd/trustabl/                    CLI entry point (cobra).
 │                                main.go (scan/rules/version) + mcp.go (mcp).
 cmd/rulesctl/                    Rules PUBLISHER tool (keygen/bundle/sign/verify). NOT shipped to users
-│                                (goreleaser builds only cmd/trustabl); used by trustabl-rules CI.
+│                                (goreleaser builds only cmd/trustabl); used by agent-reliability-rules CI.
 internal/
 ├── models/                      Cross-boundary types. JSON-tagged. Zero deps.
 ├── ingestion/                   Importer + Normalizer.
@@ -1675,6 +2052,9 @@ internal/
 │   └── tty.go                   bubbletea model + TTYReporter (interactive).
 ├── logx/                        Leveled --verbose/--debug diagnostics (stderr-only,
 │                                nil-safe, leaf package).
+├── pathclass/                   Test-path classification (Classify(relPath) →
+│                                models.SurfaceOrigin). Pure function, no AST, no
+│                                I/O, leaf package. See architecture §2 Step 4c.
 ├── analysis/
 │   ├── astutil/                 Tiny tree-sitter ergonomic layer (NodeText,
 │   │                            Walk, FindAll, FunctionName, FunctionParams,
@@ -1711,7 +2091,7 @@ internal/
 │   ├── adk_hosted_tools.go      ADK built-in hosted-tool class set + classifier (ADKHostedToolClasses).
 │   ├── ts_discovery.go         TS Claude SDK tool() factory discovery (DiscoverTSTools).
 │   ├── ts_agents.go            TS AgentDef discovery (inline-in-query + typed-const).
-│   ├── ts_handler_facts.go      tsHandlerFacts (shared by all TS tool discovery): shells_out, writes_fs, http_call, dynamic_url (non-literal HTTP URL arg: the SSRF signal).
+│   ├── ts_handler_facts.go      tsHandlerFacts (shared by all TS tool discovery): shells_out, writes_fs, http_call, dynamic_url (non-literal HTTP URL arg: the SSRF signal), url_scheme_unpinned (dynamic URL with no literal `https://` prefix: the HTTPS-pinning signal).
 │   ├── ts_mcp_servers.go       TS MCP server discovery (createSdkMcpServer + 4 config literals).
 │   ├── ts_adk_agents.go         Google ADK TS agent discovery (5 constructors).
 │   ├── ts_adk_hosted_tools.go   Google ADK TS hosted-tool class set (13 classes) + classifier.
@@ -1732,7 +2112,7 @@ internal/
 │   ├── schema.go                PolicyFile / RuleDef / MatchExpr types.
 │   ├── schema_version.go        SupportedSchemaVersion const (engine ↔ pack gate).
 │   ├── loader.go                Validating YAML loader (recursive walk; skips manifest.yaml). Rejects repo_has_sdk_in_code values that are not SDK-enum tokens (catches the claude_sdk-vs-claude_agent_sdk silent never-fire).
-│   ├── predicates.go            One Pred* per detection primitive. TS-aware: PredHasShellCall/PredHasWriteCall/PredHasCodeExecCall/PredHasDynamicURLCall read the shells_out/writes_fs/code_exec/dynamic_url facts for TypeScript and walk the AST for Python; PredHasBodyText uses a [Line, EndLine] span substring fallback (bodyTextFromSpan), kept for textual-absence checks only.
+│   ├── predicates.go            One Pred* per detection primitive. TS-aware: PredHasShellCall/PredHasWriteCall/PredHasCodeExecCall/PredHasDynamicURLCall / PredHasUnpinnedSchemeURLCall read the shells_out/writes_fs/code_exec/dynamic_url/url_scheme_unpinned facts for TypeScript and walk the AST for Python; PredHasBodyText uses a [Line, EndLine] span substring fallback (bodyTextFromSpan), kept for textual-absence checks only.
 │   ├── evaluator.go             MatchExpr.Evaluate — recursive walker.
 │   └── rule_detector.go         RuleDetector adapter + LoadRegistry.
 │                                (No embed.go: rules are not embedded — see rulesource.)
@@ -1759,16 +2139,19 @@ internal/
 │   ├── jsonrpc.go               JSON-RPC 2.0 stdio framing (no third-party SDK).
 │   └── server.go                MCP methods (initialize/tools-list/tools-call) + scan tool.
 ├── forge/                       Pre-coding SKILL.md generator (trustabl forge).
-│   ├── detect.go                DetectCategories (dep-manifest recon → DetectorCategory slice),
-│   │                            MergeCategories (dedup + sort two category slices).
+│   ├── detect.go                Detect (dep-manifest recon → categories + (category, language) pairs),
+│   │                            DetectCategories, MergeCategories (dedup + sort two category slices),
+│   │                            SelectTracing (languages + pairs for the Runtime Tracing section).
+│   ├── tracing.go               emitRuntimeTracing + the languageBlocks / frameworkRecipes tables.
+│   ├── tracingtext/             Embedded markdown text of the Runtime Tracing section.
 │   └── gen.go                   Generate (single-pack skill-scope, kept for compat),
 │                                GenerateCombined (multi-SDK all-scope output),
 │                                matchConditionForScope, Stamp.
 ├── review/                      Human renderer (read-only; no file writes).
 └── inference/                   BYOK inference router (interface + cache).
 
-The YAML rule packs themselves live in the **separate** `trustabl-rules`
-repository (`https://github.com/trustabl/trustabl-rules`), not in this
+The YAML rule packs themselves live in the **separate** `agent-reliability-rules`
+repository (`https://github.com/trustabl/agent-reliability-rules`), not in this
 tree — that is what `trustabl scan` pulls and runs. `testdata/rules-fixture/`
 (with a `manifest.yaml` declaring `schema_version`) is an in-engine **test
 mirror** of those packs, injected via `os.DirFS` so `go test` validates rules
@@ -1809,7 +2192,7 @@ presence flag, so callers can distinguish absent from present-but-`None`.
 
 ## 5. The rules engine: schema, evaluator, loader
 
-YAML rule files live in the external `trustabl-rules` repository (and, for
+YAML rule files live in the external `agent-reliability-rules` repository (and, for
 tests, the interim `testdata/rules-fixture/` copy), grouped first by detector
 category and then by topic. Each file is a single `policy:` block with one or
 more rules:
@@ -1922,7 +2305,7 @@ negation.
 
 ### Rule source ([internal/rulesource/](internal/rulesource/))
 
-The engine embeds no rules. `cmd/trustabl` resolves the `trustabl-rules`
+The engine embeds no rules. `cmd/trustabl` resolves the `agent-reliability-rules`
 repository into an `fs.FS` (see §2 — Rule resolution) and passes it to
 `scanner.Run` via `Config.RulesFS`; the loader walks that FS, skipping the
 top-level `manifest.yaml`. Tests inject `testdata/rules-fixture/` via
@@ -1949,7 +2332,7 @@ From YAML source in the rules repository to a `Finding` emitted at scan time:
 
 ```mermaid
 flowchart LR
-    yaml["trustabl-rules<br/>&lt;sdk&gt;/&lt;topic&gt;.yaml"]
+    yaml["agent-reliability-rules<br/>&lt;sdk&gt;/&lt;topic&gt;.yaml"]
     resolve["rulesource.Resolve<br/>· go-git clone/fetch<br/>· cache fallback<br/>· schema_version gate"]
     fs[("Config.RulesFS<br/>(fs.FS)")]
     loader["rules.Load<br/>· KnownFields(true)<br/>· required-field validation<br/>· severity/category/scope enums<br/>· applies_to-vs-scope check<br/>· match-vs-scope check<br/>· cross-file ID uniqueness"]
@@ -2063,9 +2446,9 @@ trustabl scan <target> [--detectors=…] [--format=human|json|sarif]
                        [--json-out=FILE] [--sarif-out=FILE] [--bom-out=FILE]
                        [--strict] [--no-color] [--no-progress]
                        [--rules-repo=URL] [--rules-ref=REF] [--channel=NAME]
-                       [--no-rules-update] [--vuln-scan]
-trustabl forge [target] [--policy=CATEGORY,…] [--output=PATH|-o PATH]
-                        [--rules-ref=REF]
+                       [--no-rules-update] [--vuln-scan] [--include-test-paths]
+trustabl forge [target] [--policy=CATEGORY,…] [--lang=LANG,…]
+                        [--output=PATH|-o PATH] [--rules-ref=REF]
 trustabl enrich        [-i SCAN_JSON] [-r REPO_ROOT] [-o OUTPUT_FILE]
                        [--diff] [--apply] [--only-enriched] [--rule RULE_ID]
                        [--langsmith] [--langsmith-project NAME]
@@ -2092,14 +2475,18 @@ snapshot and emits CVE/GHSA findings (see §2 — Vulnerability matching);
 `--bom-out=FILE` writes a CycloneDX BOM. `--output`/`-o` writes the report to a
 file instead of stdout (the report is rendered before the file is opened, so
 it is written even when findings raise a nonzero exit code, which is what lets
-a code-scanning workflow upload the SARIF on `if: always()`).
+a code-scanning workflow upload the SARIF on `if: always()`). `--include-test-paths`
+opts a test-path finding (`Finding.Origin == models.OriginTest`; see §2 — Step
+4c) back into `Surfaces`/`OverallScore` and the exit-code gate; by default such
+a finding is still reported in every format, just excluded from scoring and
+from failing the build (see internal/pathclass).
 `trustabl rules pull` downloads the rule packs into the cache without
 scanning. See §2 — Rule resolution. `trustabl capabilities` prints this
 build's rule-evaluation vocabulary (the scopes, predicates, and `applies_to`
 kinds it understands) as JSON — consumed by the rules-CI gate to detect a pack
 that targets a newer engine than this build supports. `trustabl rules validate
 [DIR]` strict-loads a local rule-pack directory against this build's schema (the
-`trustabl-rules` CI gate). `trustabl vulndb pull` pre-downloads the OSV snapshot
+`agent-reliability-rules` CI gate). `trustabl vulndb pull` pre-downloads the OSV snapshot
 for every ecosystem so a later `--vuln-scan` runs offline. `trustabl llm`
 manages the BYOK provider/key/model config consumed by `enrich` (§8.2).
 
@@ -2281,31 +2668,72 @@ writing any SDK code.
 
 **Pipeline** (four steps, no AST):
 
-1. **DetectCategories** (`internal/forge/detect.go`) — calls `ingestion.Resolve`
-   and `ingestion.Recon` against the target directory to obtain
+1. **Detect** (`internal/forge/detect.go`) — calls `ingestion.Resolve` and
+   `ingestion.Recon` against the target directory to obtain
    `RepoProfile.SDKDeps`, then maps each dep name through a local
-   `depCategoryMap` table (9 entries, mirrors `scanner.depNameToSDK`) to
-   produce a sorted, deduplicated `[]models.DetectorCategory`. Returns a
-   non-nil empty slice (not nil) when no SDK is found.
+   `depCategoryMap` table (mirrors `scanner.depNameToSDK`, plus the recon-only
+   `google-adk-go`) to produce a sorted, deduplicated
+   `[]models.DetectorCategory`. Each dep's `Source` manifest is mapped through
+   `ingestion.ManifestLanguage` to a language, yielding `(category, language)`
+   pairs for Python, TypeScript and Go. A category declared in a manifest with
+   no known language (`composer.json`, say) is also recorded in
+   `Detection.Unplaced`. `DetectCategories` returns the categories alone.
 
 2. **MergeCategories** — deduplicates and sorts the auto-detected slice with
    any categories supplied via `--policy`. Explicit additions are additive, not
    overrides — useful when a new SDK is being introduced before its first
    dependency declaration.
 
+   **SelectTracing** then decides what the Runtime Tracing section covers:
+   detected pairs as detected (no cross product). An explicit `--policy`
+   category or `--lang` language widens the selection only when detection did
+   not already place it: a category with no detected pair pairs with every
+   selected language, and a language that was not detected pairs with every
+   category. Repeating something detection already found changes nothing.
+   When `claude_skill` is the only category, `TracingApplies` is false and the
+   selection is empty, so neither the section nor the stderr "pass --lang"
+   note appears. With no category at all forge exits 1 before this step; if
+   `--lang` was given, that message says `--lang` does not select a rule pack.
+
+   **SelectRuleLanguages** decides which languages each category's rules are
+   kept for (`RuleLanguages`): the detected pairs, plus an explicit `--lang`
+   on every listed category, plus an explicit `--policy` category paired with
+   the explicit `--lang` values. It leaves a category unlisted, so all of its
+   rules are kept, when forge does not know every language the SDK is used in:
+   an `Unplaced` category, or a `--policy` category given with no `--lang`.
+
 3. **rulesource.Resolve + rules.LoadLenient** — same resolution path as
    `trustabl scan`, keyed on `--rules-ref`. All policy packs are loaded;
    `GenerateCombined` filters to the requested categories itself.
 
-4. **GenerateCombined** (`internal/forge/gen.go`) — routes each rule into
-   per-category, per-scope buckets (`tools`, `agents`, `subagents`, `repos`,
-   `skills`), emits one `## SDK Name` section per category in
-   `stamp.Categories` order, with `### Tool / Agent / Subagent / Repo / Skill
-   Rules` subsections (empty subsections omitted). Rules within each subsection
-   are sorted by severity (critical first) then rule ID ascending. A passive
-   stamp comment (`<!-- generated: DATE | rules: SHA | schema: VERSION | sdks:
-   LIST -->`) is embedded in the body — not in frontmatter — so the file is
-   scannable to detect staleness.
+4. **GenerateCombined** (`internal/forge/gen.go`) — emits a passive stamp
+   comment (`<!-- generated: DATE | rules: SHA | schema: VERSION | sdks: LIST
+   | template: N -->`) in the body — not in frontmatter — so the file is
+   scannable to detect staleness. `template` is `TemplateVersion` (currently
+   `3`); a stamp with no `template` field predates it and parses as `1`. Right
+   after the stamp, GenerateCombined emits a constant `## How to Apply These
+   Constraints` apply-loop section: a static four-step procedure telling the
+   model to check each definition it writes against the matching constraints,
+   name any violation by rule ID, apply that rule's directive, and log the
+   repair. It then emits `## Runtime Tracing` (`internal/forge/tracing.go`) for
+   the selected languages: Step 1 sets up OpenTelemetry, Step 2 places the
+   `agent-reliability-otel-labels` labels, Step 3 says how to choose their
+   values, Step 4 lists checks. The text is embedded from
+   `internal/forge/tracingtext/`; two small tables (`languageBlocks`,
+   `frameworkRecipes`) fix what exists and in what order. The section is
+   omitted when no selected language has a block. It drops each rule whose
+   `language` the category is not used in, through `RuleDef.AppliesToLanguage`
+   (the scanner's own language gate, so TypeScript keeps JavaScript rules and
+   a rule with no language is always kept), and writes a one-line note under
+   an SDK heading for a listed language that no rule of that pack targets
+   (a Go-only Google ADK repo, today). It then routes each rule into
+   per-category, per-scope buckets
+   (`tools`, `agents`, `subagents`, `repos`, `skills`), emitting one
+   `## SDK Name` section per category in `stamp.Categories` order, with
+   `### Tool / Agent / Subagent / Repo / Skill Rules` subsections (empty
+   subsections omitted). Rules within each subsection are sorted by severity
+   (critical first) then rule ID ascending. `Generate` (below) does not emit
+   the apply-loop section.
 
 **matchConditionForScope** dispatches "When this applies" text by scope: tool →
 "When defining a tool.", agent → "When declaring an agent.", repo → "For any
@@ -2322,7 +2750,7 @@ generated prose accurate for all five scopes without enumerating 15+ predicates.
 
 - `0` — SKILL.md generated and written.
 - `1` — no SDKs detected and no `--policy` given; or an unrecognized `--policy`
-  value.
+  or `--lang` value.
 - `2` — rules fetch / load error (same as `scan`).
 
 The `Generate` function (single-pack, skill-scope-only) is kept for backward

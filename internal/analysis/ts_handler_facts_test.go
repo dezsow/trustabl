@@ -140,3 +140,160 @@ export const t = tool("f", "f", {}, async () => {
 		t.Error("the Vercel-style abortSignal key must count as a timeout bound")
 	}
 }
+
+// ─── prints_stdout ──────────────────────────────────────────────────────────
+// stdout writes only. The stderr counterparts are the remediation, not the
+// defect, and must never set the fact — on an MCP stdio server stderr is the
+// only safe destination, since stdout carries the JSON-RPC frames.
+
+func TestTSHandlerFacts_PrintsStdout_ConsoleLogHits(t *testing.T) {
+	src := `
+import { tool } from "@anthropic-ai/claude-agent-sdk";
+export const t = tool("f", "f", {}, async () => {
+  console.log("looking up order");
+  return { content: [] };
+});
+`
+	if tsToolFacts(t, src)["prints_stdout"] != "true" {
+		t.Error("expected prints_stdout=true for console.log")
+	}
+}
+
+func TestTSHandlerFacts_PrintsStdout_ProcessStdoutWriteHits(t *testing.T) {
+	src := `
+import { tool } from "@anthropic-ai/claude-agent-sdk";
+export const t = tool("f", "f", {}, async () => {
+  process.stdout.write("looking up order\n");
+  return { content: [] };
+});
+`
+	if tsToolFacts(t, src)["prints_stdout"] != "true" {
+		t.Error("expected prints_stdout=true for process.stdout.write")
+	}
+}
+
+func TestTSHandlerFacts_PrintsStdout_ConsoleInfoAndDebugHit(t *testing.T) {
+	for _, callee := range []string{"console.info", "console.debug"} {
+		src := `
+import { tool } from "@anthropic-ai/claude-agent-sdk";
+export const t = tool("f", "f", {}, async () => {
+  ` + callee + `("looking up order");
+  return { content: [] };
+});
+`
+		if tsToolFacts(t, src)["prints_stdout"] != "true" {
+			t.Errorf("expected prints_stdout=true for %s (Node routes it to stdout)", callee)
+		}
+	}
+}
+
+func TestTSHandlerFacts_PrintsStdout_StderrIsSilent(t *testing.T) {
+	for _, callee := range []string{"console.warn", "console.error", "process.stderr.write"} {
+		src := `
+import { tool } from "@anthropic-ai/claude-agent-sdk";
+export const t = tool("f", "f", {}, async () => {
+  ` + callee + `("looking up order");
+  return { content: [] };
+});
+`
+		if tsToolFacts(t, src)["prints_stdout"] == "true" {
+			t.Errorf("%s writes to stderr and must NOT set prints_stdout: it is the remediation, not the defect", callee)
+		}
+	}
+}
+
+func TestTSHandlerFacts_PrintsStdout_UnrelatedCalleeIsSilent(t *testing.T) {
+	src := `
+import { tool } from "@anthropic-ai/claude-agent-sdk";
+export const t = tool("f", "f", {}, async () => {
+  logger.log("looking up order");
+  return { content: [] };
+});
+`
+	if tsToolFacts(t, src)["prints_stdout"] == "true" {
+		t.Error("expected no prints_stdout for logger.log: only the console.* / process.stdout.write callees count")
+	}
+}
+
+func TestTSHandlerFacts_Throws_ThrowStatementHits(t *testing.T) {
+	src := `
+import { tool } from "@anthropic-ai/claude-agent-sdk";
+import { z } from "zod";
+export const t = tool("f", "f", { id: z.string() }, async ({ id }) => {
+  if (!id) throw new Error("id required");
+  return { content: [] };
+});
+`
+	if tsToolFacts(t, src)["throws"] != "true" {
+		t.Error("expected throws=true for a throw statement in the handler")
+	}
+}
+
+func TestTSHandlerFacts_Throws_NoThrowIsSilent(t *testing.T) {
+	src := `
+import { tool } from "@anthropic-ai/claude-agent-sdk";
+import { z } from "zod";
+export const t = tool("f", "f", { id: z.string() }, async ({ id }) => {
+  return { content: [{ type: "text", text: id }] };
+});
+`
+	if tsToolFacts(t, src)["throws"] == "true" {
+		t.Error("a handler with no throw must not set throws")
+	}
+}
+
+func TestTSHandlerFacts_TryCatch_TryStatementHits(t *testing.T) {
+	src := `
+import { tool } from "@anthropic-ai/claude-agent-sdk";
+import { z } from "zod";
+export const t = tool("f", "f", { u: z.string() }, async ({ u }) => {
+  try {
+    const r = await fetch(u);
+    return { content: [] };
+  } catch (e) {
+    return { content: [{ type: "text", text: "error" }] };
+  }
+});
+`
+	if tsToolFacts(t, src)["try_catch"] != "true" {
+		t.Error("expected try_catch=true for a try/catch in the handler")
+	}
+}
+
+func TestTSHandlerFacts_TryCatch_AbsentIsSilent(t *testing.T) {
+	src := `
+import { tool } from "@anthropic-ai/claude-agent-sdk";
+import { z } from "zod";
+export const t = tool("f", "f", { u: z.string() }, async ({ u }) => {
+  const r = await fetch(u);
+  return { content: [] };
+});
+`
+	if tsToolFacts(t, src)["try_catch"] == "true" {
+		t.Error("a handler with no try/catch must not set try_catch")
+	}
+}
+
+// A re-throw from inside a catch block sets BOTH facts, so the shipped
+// `has_raise AND NOT has_try_except` rule shape stays silent on it — matching
+// how the Python path behaves for `raise` inside `except`.
+func TestTSHandlerFacts_ThrowInsideCatch_SetsBothFacts(t *testing.T) {
+	src := `
+import { tool } from "@anthropic-ai/claude-agent-sdk";
+import { z } from "zod";
+export const t = tool("f", "f", { u: z.string() }, async ({ u }) => {
+  try {
+    return { content: [] };
+  } catch (e) {
+    throw new Error("wrapped: " + e);
+  }
+});
+`
+	facts := tsToolFacts(t, src)
+	if facts["throws"] != "true" {
+		t.Errorf("expected throws=true, got facts=%v", facts)
+	}
+	if facts["try_catch"] != "true" {
+		t.Errorf("expected try_catch=true, got facts=%v", facts)
+	}
+}

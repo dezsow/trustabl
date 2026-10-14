@@ -206,6 +206,55 @@ func parseTSOpenAIAgentInline(src string) models.AgentDef {
 	return agents[0]
 }
 
+// parseTSOpenAIAgentInlineResolved parses a TS snippet, discovers its OpenAI
+// Agents SDK agent(s), and runs analysis.ResolveEdges over them before
+// returning the first agent. Unlike parseTSOpenAIAgentInline, this
+// materializes HostedToolRef.Resolved from HostedToolRef.Pending — required
+// for predicates like agent_hosted_tool_kwarg_present, which read
+// ref.Resolved.Kwargs and silently never match against an unresolved ref.
+// Panics (no *testing.T available in package-level case tables).
+func parseTSOpenAIAgentInlineResolved(src string) models.AgentDef {
+	tree, err := astutil.NewTSParser().ParseCtx(context.Background(), nil, []byte(src))
+	if err != nil {
+		panic("parseTSOpenAIAgentInlineResolved parse: " + err.Error())
+	}
+	pf := analysis.ParsedFile{RelPath: "src/a.ts", Tree: tree, Source: []byte(src)}
+	inv := models.RepoInventory{Agents: analysis.DiscoverTSOpenAIAgents([]analysis.ParsedFile{pf}, func(string) {})}
+	if len(inv.Agents) == 0 {
+		panic("parseTSOpenAIAgentInlineResolved: no agent discovered")
+	}
+	analysis.ResolveEdges(&inv, []analysis.ParsedFile{pf})
+	return inv.Agents[0]
+}
+
+// parseTSOpenAIMCPAgentInlineResolved parses a TS snippet, discovers its
+// OpenAI Agents SDK MCP servers (const x = new MCPServerStdio({...})) AND
+// agent(s), then runs analysis.ResolveEdges — required for predicates like
+// agent_mcp_server_kwarg_missing, which read MCPServerRef.Resolved.Kwargs and
+// silently never match an unresolved ref. Unlike
+// parseTSOpenAIAgentInlineResolved, this also seeds inv.MCPServers via
+// DiscoverTSOpenAIMCPServers, mirroring the scanner's own discovery order
+// (scanner.go: MCP servers discovered before ResolveEdges runs) — ResolveEdges
+// itself only resolves mcpServers: [x] refs against defs already in
+// inv.MCPServers, it does not discover them. Panics (no *testing.T available
+// in package-level case tables).
+func parseTSOpenAIMCPAgentInlineResolved(src string) models.AgentDef {
+	tree, err := astutil.NewTSParser().ParseCtx(context.Background(), nil, []byte(src))
+	if err != nil {
+		panic("parseTSOpenAIMCPAgentInlineResolved parse: " + err.Error())
+	}
+	pf := analysis.ParsedFile{RelPath: "src/a.ts", Tree: tree, Source: []byte(src)}
+	inv := models.RepoInventory{
+		MCPServers: analysis.DiscoverTSOpenAIMCPServers([]analysis.ParsedFile{pf}, func(string) {}),
+		Agents:     analysis.DiscoverTSOpenAIAgents([]analysis.ParsedFile{pf}, func(string) {}),
+	}
+	if len(inv.Agents) == 0 {
+		panic("parseTSOpenAIMCPAgentInlineResolved: no agent discovered")
+	}
+	analysis.ResolveEdges(&inv, []analysis.ParsedFile{pf})
+	return inv.Agents[0]
+}
+
 // parseTSADKAgentInline parses a TS snippet and returns the first discovered
 // Google ADK agent. Panics (no *testing.T available in package-level case
 // tables).
@@ -381,6 +430,186 @@ def foo(x: str) -> dict:
 	}
 }
 
+// ─── has_raise / has_try_except on TypeScript ─────────────────────────────────
+
+// tsErrorContractCases covers one snippet per TS discovery path. All six share
+// tsHandlerFacts, so a regression in the fact walk would surface here rather
+// than in whichever pack happened to ship the first TS error-contract rule.
+var tsErrorContractCases = []struct {
+	name     string
+	kind     models.ToolKind
+	throwing string
+	caught   string
+}{
+	{
+		name: "claude_sdk",
+		kind: models.KindClaudeSDKTool,
+		throwing: `
+import { tool } from "@anthropic-ai/claude-agent-sdk";
+import { z } from "zod";
+export const t = tool("f", "f", { id: z.string() }, async ({ id }) => {
+  if (!id) throw new Error("id required");
+  return { content: [] };
+});
+`,
+		caught: `
+import { tool } from "@anthropic-ai/claude-agent-sdk";
+import { z } from "zod";
+export const t = tool("f", "f", { id: z.string() }, async ({ id }) => {
+  try {
+    return { content: [{ type: "text", text: id }] };
+  } catch (e) {
+    return { content: [{ type: "text", text: "error" }] };
+  }
+});
+`,
+	},
+	{
+		name: "langchain",
+		kind: models.KindLangChainTool,
+		throwing: `
+import { tool } from "@langchain/core/tools";
+import { z } from "zod";
+export const t = tool(async (i) => {
+  if (!i.id) throw new Error("id required");
+  return i.id;
+}, { name: "lookup", description: "Look up.", schema: z.object({ id: z.string() }) });
+`,
+		caught: `
+import { tool } from "@langchain/core/tools";
+import { z } from "zod";
+export const t = tool(async (i) => {
+  try {
+    return i.id;
+  } catch (e) {
+    return JSON.stringify({ error: "failed", retryable: false });
+  }
+}, { name: "lookup", description: "Look up.", schema: z.object({ id: z.string() }) });
+`,
+	},
+	{
+		name: "vercel_ai",
+		kind: models.KindVercelAITool,
+		throwing: `
+import { tool } from "ai";
+import { z } from "zod";
+export const t = tool({ description: "look up", inputSchema: z.object({ id: z.string() }), execute: async ({ id }) => {
+  if (!id) throw new Error("id required");
+  return id;
+} });
+`,
+		caught: `
+import { tool } from "ai";
+import { z } from "zod";
+export const t = tool({ description: "look up", inputSchema: z.object({ id: z.string() }), execute: async ({ id }) => {
+  try {
+    return id;
+  } catch (e) {
+    return { error: "failed" };
+  }
+} });
+`,
+	},
+	{
+		name: "openai_agents",
+		kind: models.KindOpenAITool,
+		throwing: `
+import { tool } from "@openai/agents";
+export const t = tool({ name: "f", description: "f", parameters: {}, execute: async () => {
+  throw new Error("boom");
+} });
+`,
+		caught: `
+import { tool } from "@openai/agents";
+export const t = tool({ name: "f", description: "f", parameters: {}, execute: async () => {
+  try {
+    return "ok";
+  } catch (e) {
+    return "error";
+  }
+} });
+`,
+	},
+	{
+		name: "mcp",
+		kind: models.KindMCPTool,
+		throwing: `
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+const server = new McpServer({ name: "s", version: "1.0.0" });
+server.registerTool("search", { description: "Search the docs", inputSchema: { q: z.string() } }, async ({ q }) => {
+  if (!q) throw new Error("q required");
+  return { content: [] };
+});
+`,
+		caught: `
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+const server = new McpServer({ name: "s", version: "1.0.0" });
+server.registerTool("search", { description: "Search the docs", inputSchema: { q: z.string() } }, async ({ q }) => {
+  try {
+    return { content: [] };
+  } catch (e) {
+    return { content: [{ type: "text", text: "error" }], isError: true };
+  }
+});
+`,
+	},
+}
+
+// Before PredHasRaise branched on language it returned false for every TS tool
+// — the Python path matches the "raise_statement" node type, which the TS
+// grammar does not have. A TS error-contract rule would have loaded, validated
+// and never fired, which reads as coverage rather than as a gap.
+func TestPred_HasRaise_TypeScript_Throw(t *testing.T) {
+	for _, tc := range tsErrorContractCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tool, pf := parseTSTool(t, tc.throwing, tc.kind)
+			if !rules.PredHasRaise(tool, pf) {
+				t.Errorf("expected HasRaise true for a TS throw (facts=%v)", tool.Facts)
+			}
+			if rules.PredHasTryExcept(tool, pf) {
+				t.Errorf("expected HasTryExcept false with no try/catch (facts=%v)", tool.Facts)
+			}
+		})
+	}
+}
+
+func TestPred_HasTryExcept_TypeScript_Caught(t *testing.T) {
+	for _, tc := range tsErrorContractCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tool, pf := parseTSTool(t, tc.caught, tc.kind)
+			if !rules.PredHasTryExcept(tool, pf) {
+				t.Errorf("expected HasTryExcept true for a TS try/catch (facts=%v)", tool.Facts)
+			}
+			if rules.PredHasRaise(tool, pf) {
+				t.Errorf("expected HasRaise false with no throw (facts=%v)", tool.Facts)
+			}
+		})
+	}
+}
+
+// A re-throw from inside a catch satisfies both predicates, so the shipped
+// `has_raise AND NOT has_try_except` shape stays silent — the same outcome the
+// Python path gives for a `raise` inside an `except`.
+func TestPred_TypeScript_ThrowInsideCatch_SatisfiesBoth(t *testing.T) {
+	tool, pf := parseTSTool(t, `
+import { tool } from "@anthropic-ai/claude-agent-sdk";
+import { z } from "zod";
+export const t = tool("f", "f", { id: z.string() }, async ({ id }) => {
+  try {
+    return { content: [] };
+  } catch (e) {
+    throw new Error("wrapped: " + e);
+  }
+});
+`, models.KindClaudeSDKTool)
+	if !rules.PredHasRaise(tool, pf) {
+		t.Errorf("expected HasRaise true for the re-throw (facts=%v)", tool.Facts)
+	}
+	if !rules.PredHasTryExcept(tool, pf) {
+		t.Errorf("expected HasTryExcept true for the enclosing try (facts=%v)", tool.Facts)
+	}
+}
+
 // ─── name_in ──────────────────────────────────────────────────────────────────
 
 func TestPred_NameIn_Hit(t *testing.T) {
@@ -410,6 +639,19 @@ func TestPred_NameHasPrefix_Miss(t *testing.T) {
 	tool := models.ToolDef{Name: "get_order"}
 	if rules.PredNameHasPrefix([]string{"create_", "send_"}, tool) {
 		t.Error("expected NameHasPrefix miss")
+	}
+}
+
+func TestPred_NameHasPrefix_FallsBackToVarName(t *testing.T) {
+	// Vercel AI tools leave Name empty; the binding identifier is VarName.
+	tool := models.ToolDef{VarName: "createCharge"}
+	if !rules.PredNameHasPrefix([]string{"create", "send"}, tool) {
+		t.Error("expected NameHasPrefix hit via VarName when Name is empty")
+	}
+	tool.Name = "get_order"
+	tool.VarName = "createCharge"
+	if rules.PredNameHasPrefix([]string{"create", "send"}, tool) {
+		t.Error("Name must win over VarName when both are set")
 	}
 }
 
@@ -1364,5 +1606,440 @@ func TestPredSubagentGrantsTool(t *testing.T) {
 	}
 	if !rules.PredSubagentGrantsTool(parametered, []string{"Bash"}) {
 		t.Errorf("expected true: Bash(npm run *) grants Bash via ToolGrants")
+	}
+}
+
+// TestPredSkillAllowsUnrestrictedTool exercises the per-tool "unrestricted"
+// table: Bash/PowerShell and WebFetch/Edit have real pattern-argument
+// restrictions Claude Code enforces, while Write and NotebookEdit accept a
+// path specifier but never consult it — so any grant on those two tools is
+// unrestricted regardless of pattern.
+func TestPredSkillAllowsUnrestrictedTool(t *testing.T) {
+	names := []string{"Bash", "Write", "Edit", "WebFetch", "NotebookEdit"}
+	skillWith := func(grant models.ToolGrant) models.SkillDef {
+		return models.SkillDef{Name: "x", ToolGrants: []models.ToolGrant{grant}}
+	}
+
+	cases := []struct {
+		name  string
+		grant models.ToolGrant
+		want  bool
+	}{
+		// Bash: unrestricted only for "", "*", ":*".
+		{"bare Bash", models.ToolGrant{Tool: "Bash"}, true},
+		{"Bash(*)", models.ToolGrant{Tool: "Bash", Pattern: "*"}, true},
+		{"Bash(:*)", models.ToolGrant{Tool: "Bash", Pattern: ":*"}, true},
+		{"Bash(git status:*)", models.ToolGrant{Tool: "Bash", Pattern: "git status:*"}, false},
+		{"Bash(npm run *)", models.ToolGrant{Tool: "Bash", Pattern: "npm run *"}, false},
+
+		// Edit: unrestricted only for "" or a catch-all glob.
+		{"bare Edit", models.ToolGrant{Tool: "Edit"}, true},
+		{"Edit(*)", models.ToolGrant{Tool: "Edit", Pattern: "*"}, true},
+		{"Edit(**)", models.ToolGrant{Tool: "Edit", Pattern: "**"}, true},
+		{"Edit(/**)", models.ToolGrant{Tool: "Edit", Pattern: "/**"}, true},
+		{"Edit(//**)", models.ToolGrant{Tool: "Edit", Pattern: "//**"}, true},
+		{"Edit(docs/**)", models.ToolGrant{Tool: "Edit", Pattern: "docs/**"}, false},
+		{"Edit(src/**/*.ts)", models.ToolGrant{Tool: "Edit", Pattern: "src/**/*.ts"}, false},
+
+		// WebFetch: unrestricted only for "" or "*".
+		{"bare WebFetch", models.ToolGrant{Tool: "WebFetch"}, true},
+		{"WebFetch(*)", models.ToolGrant{Tool: "WebFetch", Pattern: "*"}, true},
+		{"WebFetch(domain:example.com)", models.ToolGrant{Tool: "WebFetch", Pattern: "domain:example.com"}, false},
+
+		// Write / NotebookEdit: ALWAYS unrestricted — Claude Code never
+		// consults a path rule written for these tools.
+		{"bare Write", models.ToolGrant{Tool: "Write"}, true},
+		{"Write(src/**)", models.ToolGrant{Tool: "Write", Pattern: "src/**"}, true},
+		{"bare NotebookEdit", models.ToolGrant{Tool: "NotebookEdit"}, true},
+		{"NotebookEdit(notebooks/**)", models.ToolGrant{Tool: "NotebookEdit", Pattern: "notebooks/**"}, true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rules.PredSkillAllowsUnrestrictedTool(skillWith(tc.grant), names)
+			if got != tc.want {
+				t.Errorf("PredSkillAllowsUnrestrictedTool(%+v) = %v, want %v", tc.grant, got, tc.want)
+			}
+		})
+	}
+
+	// A skill with only a raw allowed-tools token (no parsed ToolGrants) is
+	// treated as unrestricted, since a bare token is unrestricted by
+	// definition — mirrors PredSkillAllowsTool's raw-token fallback.
+	raw := models.SkillDef{Name: "raw", AllowedTools: []string{"Bash"}}
+	if !rules.PredSkillAllowsUnrestrictedTool(raw, names) {
+		t.Errorf("expected true: raw AllowedTools token %q falls back to unrestricted", "Bash")
+	}
+}
+
+// TestPredSkillDescriptionToolMismatch_ScopedGrantIsSilent guards the
+// CSKILL-060 fix end-to-end: a scoped grant must not trip the description
+// mismatch even though the description makes a read-only claim.
+func TestPredSkillDescriptionToolMismatch_ScopedGrantIsSilent(t *testing.T) {
+	scoped := models.SkillDef{
+		Name:        "scoped-reader",
+		Description: "Read-only: summarizes git history. Cannot modify anything.",
+		ToolGrants:  []models.ToolGrant{{Tool: "Bash", Pattern: "git status:*"}},
+	}
+	if rules.PredSkillDescriptionToolMismatch(scoped) {
+		t.Errorf("expected false: Bash(git status:*) is a scoped grant, not a mismatch")
+	}
+
+	unrestricted := models.SkillDef{
+		Name:        "sneaky",
+		Description: "Read-only: summarizes the diff. Cannot run commands.",
+		ToolGrants:  []models.ToolGrant{{Tool: "Bash", Pattern: "*"}},
+	}
+	if !rules.PredSkillDescriptionToolMismatch(unrestricted) {
+		t.Errorf("expected true: Bash(*) is unrestricted and contradicts the read-only claim")
+	}
+}
+
+func TestPredRepoObservability(t *testing.T) {
+	none := models.RepoInventory{
+		Manifest: models.ScanManifest{PythonFiles: []string{"a.py"}},
+	}
+	if rules.PredRepoHasObservability(true, none) {
+		t.Error("empty signals must not satisfy has_observability=true")
+	}
+	if !rules.PredRepoObservabilityInspectable(true, none) {
+		t.Error("a repo with Python files is inspectable")
+	}
+
+	importOnly := none
+	importOnly.ObservabilitySignals = []models.ObservabilitySignal{
+		{Vendor: models.VendorLangfuse, Kind: models.ObsSignalImport},
+	}
+	if !rules.PredRepoHasObservability(true, importOnly) {
+		t.Error("an import signal satisfies has_observability")
+	}
+	if rules.PredRepoObservabilityInitialized(true, importOnly) {
+		t.Error("an import alone must NOT count as initialized")
+	}
+
+	initialized := none
+	initialized.ObservabilitySignals = []models.ObservabilitySignal{
+		{Vendor: models.VendorLangfuse, Kind: models.ObsSignalInit},
+	}
+	if !rules.PredRepoObservabilityInitialized(true, initialized) {
+		t.Error("an init signal satisfies initialized")
+	}
+	if !rules.PredRepoObservabilityVendor([]string{"langfuse"}, initialized) {
+		t.Error("vendor predicate must match langfuse")
+	}
+	if rules.PredRepoObservabilityVendor([]string{"otel"}, initialized) {
+		t.Error("vendor predicate must not match an absent vendor")
+	}
+
+	kwarg := none
+	kwarg.ObservabilitySignals = []models.ObservabilitySignal{
+		{Vendor: models.VendorLogfire, Kind: models.ObsSignalInstrumentKwarg},
+	}
+	if !rules.PredRepoObservabilityInitialized(true, kwarg) {
+		t.Error("a per-agent instrument kwarg counts as initialized")
+	}
+}
+
+// A repo in a language the observability pass does not parse must not be read
+// as "has no observability" — nothing looked.
+func TestPredRepoObservabilityInspectable_UninspectableLanguage(t *testing.T) {
+	goOnly := models.RepoInventory{
+		Manifest: models.ScanManifest{GoFiles: []string{"main.go"}},
+	}
+	if rules.PredRepoObservabilityInspectable(true, goOnly) {
+		t.Error("a Go-only repo is NOT inspectable — absence rules must not fire there")
+	}
+	tsOnly := models.RepoInventory{
+		Manifest: models.ScanManifest{TypeScriptFiles: []string{"app.ts"}},
+	}
+	if !rules.PredRepoObservabilityInspectable(true, tsOnly) {
+		t.Error("a TypeScript repo is inspectable")
+	}
+}
+
+func TestPredRepoObservabilityConsoleOnly(t *testing.T) {
+	consoleOnly := models.RepoInventory{
+		ObservabilitySignals: []models.ObservabilitySignal{
+			{Vendor: models.VendorOTel, Kind: models.ObsSignalExporter, Detail: "console"},
+		},
+	}
+	if !rules.PredRepoObservabilityConsoleOnly(true, consoleOnly) {
+		t.Error("a lone console exporter is console-only")
+	}
+	mixed := models.RepoInventory{
+		ObservabilitySignals: []models.ObservabilitySignal{
+			{Vendor: models.VendorOTel, Kind: models.ObsSignalExporter, Detail: "console"},
+			{Vendor: models.VendorOTel, Kind: models.ObsSignalExporter, Detail: "otlp"},
+		},
+	}
+	if rules.PredRepoObservabilityConsoleOnly(true, mixed) {
+		t.Error("console + otlp is NOT console-only")
+	}
+	if rules.PredRepoObservabilityConsoleOnly(true, models.RepoInventory{}) {
+		t.Error("no exporters at all must not read as console-only")
+	}
+}
+
+func TestPredRepoObservabilityDeclared(t *testing.T) {
+	direct := models.RepoProfile{ObsDeps: []models.ObsDep{
+		{Vendor: models.VendorLangfuse, Source: "requirements.txt", Confidence: 0.9},
+	}}
+	if !rules.PredRepoObservabilityDeclared(true, direct) {
+		t.Error("a dep declared in requirements.txt satisfies the predicate")
+	}
+	if rules.PredRepoObservabilityDeclared(true, models.RepoProfile{}) {
+		t.Error("no declared dep must not satisfy the predicate")
+	}
+
+	// The whole point of the direct-manifest filter: a lock file enumerates the
+	// transitive closure, so a hit there is not evidence anyone chose to
+	// instrument. Promoting it would blame a repo for its framework's deps.
+	lockOnly := models.RepoProfile{ObsDeps: []models.ObsDep{
+		{Vendor: models.VendorOTel, Source: "poetry.lock", Confidence: 0.9},
+	}}
+	if rules.PredRepoObservabilityDeclared(true, lockOnly) {
+		t.Error("a poetry.lock-only declaration must NOT count as declared")
+	}
+	if !rules.PredRepoObservabilityDeclared(false, lockOnly) {
+		t.Error("declared:false must hold for a lock-file-only declaration")
+	}
+
+	// A direct declaration still counts when a lock-file entry sits beside it.
+	both := models.RepoProfile{ObsDeps: []models.ObsDep{
+		{Vendor: models.VendorOTel, Source: "poetry.lock"},
+		{Vendor: models.VendorLangfuse, Source: "pyproject.toml"},
+	}}
+	if !rules.PredRepoObservabilityDeclared(true, both) {
+		t.Error("a direct declaration alongside a lock entry still counts")
+	}
+}
+
+func TestPredRepoObservabilityCapturesContent(t *testing.T) {
+	inv := models.RepoInventory{
+		ObservabilitySignals: []models.ObservabilitySignal{
+			{Vendor: models.VendorOTel, Kind: models.ObsSignalContentCapture, Detail: "include_content"},
+		},
+	}
+	if !rules.PredRepoObservabilityCapturesContent(true, inv) {
+		t.Error("a content_capture signal satisfies the predicate")
+	}
+	if rules.PredRepoObservabilityCapturesContent(true, models.RepoInventory{}) {
+		t.Error("no capture signal must not satisfy the predicate")
+	}
+}
+
+func TestPredAgentCheckpointerInMemory(t *testing.T) {
+	for class, want := range map[string]bool{
+		"MemorySaver": true, "InMemorySaver": true,
+		"PostgresSaver": false, "AsyncPostgresSaver": false, "SqliteSaver": false,
+		"RedisSaver": false, "MongoDBSaver": false, "": false,
+	} {
+		a := models.AgentDef{SDK: models.SDKLangChain, Class: "StateGraph", CheckpointerClass: class}
+		if got := rules.PredAgentCheckpointerInMemory(a); got != want {
+			t.Errorf("class %q: got %v, want %v", class, got, want)
+		}
+	}
+}
+
+func TestPredAgentServerReachable(t *testing.T) {
+	ep := func(file string) *models.EntrypointRef {
+		return &models.EntrypointRef{FilePath: file, Kind: models.EntrypointHTTP, Framework: "fastapi", Via: "direct"}
+	}
+	agent := models.AgentDef{SDK: models.SDKLangChain, Class: "StateGraph", Location: models.Location{FilePath: "graph.py"}, VarName: "builder"}
+	rc := func(file, agentFile string, ref *models.EntrypointRef) models.AgentRunCallDef {
+		return models.AgentRunCallDef{SDK: models.SDKLangChain, Location: models.Location{FilePath: file},
+			AgentVarName: "builder", AgentFilePath: agentFile, ServerReachable: ref}
+	}
+	cases := []struct {
+		name string
+		a    models.AgentDef
+		rcs  []models.AgentRunCallDef
+		want bool
+	}{
+		{"same file, reachable", agent, []models.AgentRunCallDef{rc("graph.py", "", ep("graph.py"))}, true},
+		{"cross file, reachable", agent, []models.AgentRunCallDef{rc("api.py", "graph.py", ep("api.py"))}, true},
+		{"one of two calls reachable", agent, []models.AgentRunCallDef{rc("graph.py", "", nil), rc("api.py", "graph.py", ep("api.py"))}, true},
+		{"opaque run call still counts", agent, []models.AgentRunCallDef{func() models.AgentRunCallDef {
+			r := rc("graph.py", "", ep("graph.py"))
+			r.Opaque = true
+			return r
+		}()}, true},
+		{"not reachable", agent, []models.AgentRunCallDef{rc("graph.py", "", nil)}, false},
+		{"no run calls", agent, nil, false},
+		{"cross-file call names a different defining file", agent, []models.AgentRunCallDef{rc("api.py", "other.py", ep("api.py"))}, false},
+		{"same-file correlation needs the agent's file", agent, []models.AgentRunCallDef{rc("api.py", "", ep("api.py"))}, false},
+		{"other var name", agent, []models.AgentRunCallDef{{SDK: models.SDKLangChain, Location: models.Location{FilePath: "graph.py"}, AgentVarName: "x", ServerReachable: ep("graph.py")}}, false},
+		{"other SDK", agent, []models.AgentRunCallDef{{SDK: models.SDKPydanticAI, Location: models.Location{FilePath: "graph.py"}, AgentVarName: "builder", ServerReachable: ep("graph.py")}}, false},
+		{"agent with no VarName", models.AgentDef{SDK: models.SDKLangChain, Location: models.Location{FilePath: "graph.py"}}, []models.AgentRunCallDef{rc("graph.py", "", ep("graph.py"))}, false},
+		{"run call under tests/", agent, []models.AgentRunCallDef{rc("tests/test_api.py", "graph.py", ep("tests/test_api.py"))}, false},
+		{"entrypoint in conftest.py", agent, []models.AgentRunCallDef{rc("graph.py", "", ep("conftest.py"))}, false},
+		{"agent in a test_*.py file", models.AgentDef{SDK: models.SDKLangChain, Location: models.Location{FilePath: "test_graph.py"}, VarName: "builder"},
+			[]models.AgentRunCallDef{rc("test_graph.py", "", ep("test_graph.py"))}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := rules.PredAgentServerReachable(c.a, models.RepoInventory{AgentRunCalls: c.rcs}); got != c.want {
+				t.Errorf("got %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestRunCallPredicates_IgnoreLangGraphRunCalls guards the leak path for the
+// LangGraph run-call records added for LC-116: every pre-existing run-call
+// predicate is SDK-gated, so a LangChain run call (even one sharing a same-file
+// VarName with another SDK's agent) must not change its result.
+func TestRunCallPredicates_IgnoreLangGraphRunCalls(t *testing.T) {
+	lgCall := models.AgentRunCallDef{SDK: models.SDKLangChain, Callee: "agent.invoke",
+		Location: models.Location{FilePath: "main.py"}, AgentVarName: "agent",
+		ServerReachable: &models.EntrypointRef{FilePath: "main.py", Kind: models.EntrypointHTTP, Framework: "fastapi"}}
+	inv := models.RepoInventory{AgentRunCalls: []models.AgentRunCallDef{lgCall}}
+	for _, sdk := range []models.SDK{models.SDKOpenAIAgents, models.SDKPydanticAI, models.SDKGoogleADK, models.SDKAutoGen, models.SDKLangChain} {
+		a := models.AgentDef{SDK: sdk, Location: models.Location{FilePath: "main.py"}, VarName: "agent"}
+		if rules.PredAgentRunCallMaxTurnsMissing(a, inv) {
+			t.Errorf("%s: max_turns predicate fired on a LangGraph run call", sdk)
+		}
+		if rules.PredAgentRunCallUsageLimitsMissing(a, inv) {
+			t.Errorf("%s: usage_limits predicate fired on a LangGraph run call", sdk)
+		}
+		if rules.PredAgentRunCallWallClockTimeoutMissing(a, inv) {
+			t.Errorf("%s: wall-clock predicate fired on a LangGraph run call", sdk)
+		}
+		if sdk != models.SDKLangChain && rules.PredAgentServerReachable(a, inv) {
+			t.Errorf("%s: server-reachable credited a LangGraph run call to another SDK's agent", sdk)
+		}
+	}
+}
+
+func TestPredRepoOtelLabelsInstalled(t *testing.T) {
+	declared := models.RepoProfile{OtelLabelsDeclaredIn: []string{"requirements.txt"}}
+	if !rules.PredRepoOtelLabelsInstalled(true, declared, models.RepoInventory{}) {
+		t.Error("a manifest declaration satisfies installed")
+	}
+
+	// The root manifests are all recon reads, so a monorepo that declares the
+	// library in a nested manifest is only visible through its import.
+	imported := models.RepoInventory{OtelLabelsSignals: []models.OtelLabelsSignal{
+		{Kind: models.OtelLabelsImport, File: "svc/agent.py"},
+	}}
+	if !rules.PredRepoOtelLabelsInstalled(true, models.RepoProfile{}, imported) {
+		t.Error("an import in code satisfies installed without a root-manifest declaration")
+	}
+
+	if rules.PredRepoOtelLabelsInstalled(true, models.RepoProfile{}, models.RepoInventory{}) {
+		t.Error("neither declared nor imported must not read as installed")
+	}
+	if !rules.PredRepoOtelLabelsInstalled(false, models.RepoProfile{}, models.RepoInventory{}) {
+		t.Error("installed:false must hold when the library is absent")
+	}
+}
+
+func TestPredRepoOtelLabelsInitialized(t *testing.T) {
+	started := models.RepoInventory{OtelLabelsSignals: []models.OtelLabelsSignal{
+		{Kind: models.OtelLabelsImport},
+		{Kind: models.OtelLabelsRunStart},
+	}}
+	if !rules.PredRepoOtelLabelsInitialized(true, started) {
+		t.Error("a run_start signal satisfies initialized")
+	}
+
+	// Labelling spans without ever stamping the run on the root span leaves
+	// every label unattached to a run: that is not an initialized run.
+	labelsOnly := models.RepoInventory{OtelLabelsSignals: []models.OtelLabelsSignal{
+		{Kind: models.OtelLabelsImport},
+		{Kind: models.OtelLabelsToolSpan},
+		{Kind: models.OtelLabelsRunEnd},
+	}}
+	if rules.PredRepoOtelLabelsInitialized(true, labelsOnly) {
+		t.Error("tool-span and run-end calls without mark_start must not read as initialized")
+	}
+	if !rules.PredRepoOtelLabelsInitialized(false, labelsOnly) {
+		t.Error("initialized:false must hold when no run is started")
+	}
+}
+
+func TestPredRepoOtelLabelsImplemented(t *testing.T) {
+	sig := func(kinds ...models.OtelLabelsSignalKind) []models.OtelLabelsSignal {
+		var out []models.OtelLabelsSignal
+		for _, k := range kinds {
+			out = append(out, models.OtelLabelsSignal{Kind: k})
+		}
+		return out
+	}
+	withTool := []models.ToolDef{{Name: "search", Kind: models.KindOpenAITool}}
+
+	full := models.RepoInventory{
+		Tools:             withTool,
+		OtelLabelsSignals: sig(models.OtelLabelsRunStart, models.OtelLabelsToolSpan, models.OtelLabelsRunEnd),
+	}
+	if !rules.PredRepoOtelLabelsImplemented(true, full) {
+		t.Error("tool spans labelled and the run end recorded is implemented")
+	}
+
+	noToolLabels := models.RepoInventory{
+		Tools:             withTool,
+		OtelLabelsSignals: sig(models.OtelLabelsRunStart, models.OtelLabelsRunEnd),
+	}
+	if rules.PredRepoOtelLabelsImplemented(true, noToolLabels) {
+		t.Error("a repo that ships tools and never labels a tool span is not implemented")
+	}
+
+	noRunEnd := models.RepoInventory{
+		Tools:             withTool,
+		OtelLabelsSignals: sig(models.OtelLabelsRunStart, models.OtelLabelsToolSpan),
+	}
+	if rules.PredRepoOtelLabelsImplemented(true, noRunEnd) {
+		t.Error("a run whose end is never recorded is not implemented")
+	}
+
+	// An agent with no tools has no tool span to label, so the run end is all
+	// there is to implement. Demanding mark_tool_span would be unclearable.
+	toolless := models.RepoInventory{
+		OtelLabelsSignals: sig(models.OtelLabelsRunStart, models.OtelLabelsRunEnd),
+	}
+	if !rules.PredRepoOtelLabelsImplemented(true, toolless) {
+		t.Error("a tool-less repo that records the run end is implemented")
+	}
+
+	// A bare shell-invoking function is a ToolDef but not a tool the model
+	// calls: no framework emits a tool span for it.
+	shellOnly := models.RepoInventory{
+		Tools:             []models.ToolDef{{Name: "run", Kind: models.KindShellInvocation}},
+		OtelLabelsSignals: sig(models.OtelLabelsRunStart, models.OtelLabelsRunEnd),
+	}
+	if !rules.PredRepoOtelLabelsImplemented(true, shellOnly) {
+		t.Error("a shell_invocation function must not create a tool-span obligation")
+	}
+}
+
+// trustabl.* keys written by hand credit the presence ladder rung by rung.
+func TestPredRepoOtelLabels_HandWrittenKeysCredit(t *testing.T) {
+	attr := func(keys ...string) models.RepoInventory {
+		var sigs []models.OtelLabelsSignal
+		for _, k := range keys {
+			sigs = append(sigs, models.OtelLabelsSignal{Kind: models.OtelLabelsAttrLiteral, Key: k})
+		}
+		return models.RepoInventory{
+			Tools:             []models.ToolDef{{Name: "search", Kind: models.KindOpenAITool}},
+			OtelLabelsSignals: sigs,
+		}
+	}
+	if !rules.PredRepoOtelLabelsInstalled(true, models.RepoProfile{}, attr("trustabl.step_index")) {
+		t.Error("any hand-written key means the labels are present")
+	}
+	if rules.PredRepoOtelLabelsInitialized(true, attr("trustabl.step_index")) {
+		t.Error("a key other than trustabl.run_id does not start a run")
+	}
+	if !rules.PredRepoOtelLabelsInitialized(true, attr("trustabl.run_id")) {
+		t.Error("trustabl.run_id written by hand starts a run")
+	}
+	if rules.PredRepoOtelLabelsImplemented(true, attr("trustabl.run_id", "trustabl.exit_reason")) {
+		t.Error("a repo with tools needs a tool-span key too")
+	}
+	if !rules.PredRepoOtelLabelsImplemented(true, attr("trustabl.run_id", "trustabl.exit_reason", "trustabl.tool.input_fp")) {
+		t.Error("run end plus a tool-span key is implemented")
+	}
+	if !rules.PredRepoOtelLabelsImplemented(true, attr("trustabl.exit_reason", "trustabl.tool.attempt")) {
+		t.Error("trustabl.tool.attempt counts as a tool-span key")
 	}
 }
